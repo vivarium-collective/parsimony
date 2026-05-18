@@ -138,8 +138,13 @@ pub struct VoxelFieldStats {
     pub active_cells: usize,
     /// L0 tiles allocated as `Dense` (have explicit per-cell storage).
     pub dense_l0_tiles: usize,
-    /// L0 tiles allocated as `Constant(non-bg)`.
+    /// L0 tiles allocated as `Constant(non-bg)` (rare in canonical
+    /// form — pruning normally promotes them to L1Slot::Tile).
     pub constant_l0_tiles: usize,
+    /// L1 slots holding non-background tile values (`L1Slot::Tile(v)`,
+    /// `v != bg`) — these represent uniformly-filled 8³ regions
+    /// without any L0 allocation.
+    pub tile_l1_slots: usize,
     /// L1 tiles allocated (have a `Vec<L1Slot>`).
     pub l1_tiles: usize,
     /// Root entries where `RootEntry::Tile(non-bg)` — entire 128³ region constant.
@@ -379,7 +384,7 @@ impl VoxelField {
     /// *before* that line (`7`), not the cell starting on it. Returns
     /// an empty range (`hi < lo` on some axis) if the aabb has zero or
     /// negative extent on that axis.
-    fn aabb_to_cell_range(&self, aabb: Aabb) -> (CellCoord, CellCoord) {
+    pub fn aabb_to_cell_range(&self, aabb: Aabb) -> (CellCoord, CellCoord) {
         let rel_min = aabb.min - self.origin;
         let rel_max = aabb.max - self.origin;
         let lo = CellCoord {
@@ -1043,8 +1048,10 @@ impl VoxelField {
     // ---------- diagnostics ----------
 
     pub fn stats(&self) -> VoxelFieldStats {
+        let bg = self.background;
         let mut dense_l0 = 0usize;
         let mut const_l0 = 0usize;
+        let mut tile_l1 = 0usize;
         let mut const_root = 0usize;
         let mut l1_tiles = 0usize;
         let mut bytes = std::mem::size_of::<Self>();
@@ -1060,13 +1067,20 @@ impl VoxelField {
                     bytes += std::mem::size_of::<L1Tile>();
                     bytes += l1.slots.capacity() * std::mem::size_of::<L1Slot>();
                     for slot in l1.slots.iter() {
-                        if let L1Slot::Child(l0) = slot {
-                            bytes += std::mem::size_of::<L0Tile>();
-                            match l0.as_ref() {
-                                L0Tile::Constant(_) => const_l0 += 1,
-                                L0Tile::Dense { .. } => {
-                                    dense_l0 += 1;
-                                    bytes += L0_SIZE * std::mem::size_of::<Cell>();
+                        match slot {
+                            L1Slot::Tile(v) => {
+                                if *v != bg {
+                                    tile_l1 += 1;
+                                }
+                            }
+                            L1Slot::Child(l0) => {
+                                bytes += std::mem::size_of::<L0Tile>();
+                                match l0.as_ref() {
+                                    L0Tile::Constant(_) => const_l0 += 1,
+                                    L0Tile::Dense { .. } => {
+                                        dense_l0 += 1;
+                                        bytes += L0_SIZE * std::mem::size_of::<Cell>();
+                                    }
                                 }
                             }
                         }
@@ -1078,6 +1092,7 @@ impl VoxelField {
             active_cells: self.active_cells,
             dense_l0_tiles: dense_l0,
             constant_l0_tiles: const_l0,
+            tile_l1_slots: tile_l1,
             l1_tiles,
             constant_root_tiles: const_root,
             memory_bytes: bytes,
@@ -1452,6 +1467,65 @@ fn expand_uniform_region<F: FnMut(CellCoord, Cell)>(
             }
         }
     }
+}
+
+/// Voxelize any parry3d shape that implements [`PointQuery`] into
+/// `field`, marking cells whose centre is inside the shape with
+/// `Cell::new(compartment, 0, 0)`. Works for analytical primitives
+/// ([`parry3d::shape::Ball`], [`parry3d::shape::Capsule`],
+/// [`parry3d::shape::Cuboid`]) directly, and for [`TriMesh`](parry3d::shape::TriMesh)
+/// once the mesh has been configured for in/out queries — see
+/// [`prepare_trimesh_for_voxelize`] for the recipe.
+///
+/// Only cells whose centre lies within `bounds` are considered —
+/// typically pass `shape.local_aabb()` (with an optional dilation) to
+/// skip empty space.
+///
+/// World-space here is identical to shape-local: the caller is expected
+/// to either pre-transform the shape's vertices or transform `bounds`
+/// and `field.origin()` consistently.
+///
+/// [`PointQuery`]: parry3d::query::PointQuery
+pub fn voxelize_trimesh<S: parry3d::query::PointQuery + ?Sized>(
+    field: &mut VoxelField,
+    shape: &S,
+    compartment: CompartmentId,
+    bounds: Aabb,
+) {
+    let (lo, hi) = field.aabb_to_cell_range(bounds);
+    if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
+        return;
+    }
+    let value = Cell::new(compartment, 0, 0);
+    for cz in lo.z..=hi.z {
+        for cy in lo.y..=hi.y {
+            for cx in lo.x..=hi.x {
+                let coord = CellCoord::new(cx, cy, cz);
+                let centre = field.cell_center(coord);
+                if shape.contains_local_point(&centre) {
+                    field.put(coord, value);
+                }
+            }
+        }
+    }
+}
+
+/// Configure a parry3d [`TriMesh`](parry3d::shape::TriMesh) for in/out
+/// queries via [`voxelize_trimesh`]. parry3d's `TriMesh` doesn't
+/// support point-in-mesh tests out of the box — it needs **oriented**
+/// flag and pseudo-normals. This helper applies the standard flags
+/// (`ORIENTED | DELETE_DEGENERATE_TRIANGLES | FIX_INTERNAL_EDGES`).
+/// Use this on freshly-built or freshly-loaded triangle meshes before
+/// voxelization.
+pub fn prepare_trimesh_for_voxelize(
+    mesh: &mut parry3d::shape::TriMesh,
+) -> Result<(), parry3d::shape::TopologyError> {
+    use parry3d::shape::TriMeshFlags;
+    mesh.set_flags(
+        TriMeshFlags::ORIENTED
+            | TriMeshFlags::DELETE_DEGENERATE_TRIANGLES
+            | TriMeshFlags::FIX_INTERNAL_EDGES,
+    )
 }
 
 fn count_active_in_l1(l1: &L1Tile, bg: Cell) -> usize {
@@ -2000,5 +2074,97 @@ mod tests {
             Cell::new(1, 0, 0),
         );
         assert_eq!(f.active_cells(), 27);
+    }
+
+    // ---------- mesh voxelization ----------
+
+    #[test]
+    fn voxelize_ball_interior() {
+        // Use the analytical Ball directly — it implements PointQuery and
+        // doesn't need the TriMesh orientation dance.
+        let mut f = VoxelField::new(0.25);
+        let ball = parry3d::shape::Ball::new(1.0);
+        let bounds = aabb((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5));
+        voxelize_trimesh(&mut f, &ball, 1, bounds);
+        assert_eq!(
+            f.sample(p(0.0, 0.0, 0.0)).compartment,
+            1,
+            "centre of ball should be interior"
+        );
+        assert_eq!(f.sample(p(1.4, 1.4, 1.4)).compartment, 0);
+        // (4/3)π r³ ≈ 4.19; cells of size 0.25³ ≈ 0.0156; n ≈ 268.
+        let n = f.active_cells();
+        assert!(
+            (200..350).contains(&n),
+            "expected ~268 active cells, got {n}"
+        );
+    }
+
+    #[test]
+    fn voxelize_respects_bounds() {
+        let mut f = VoxelField::new(1.0);
+        let ball = parry3d::shape::Ball::new(5.0);
+        let bounds = aabb((0.0, 0.0, 0.0), (5.0, 5.0, 5.0));
+        voxelize_trimesh(&mut f, &ball, 7, bounds);
+        assert_eq!(f.sample(p(1.0, 1.0, 1.0)).compartment, 7);
+        assert_eq!(f.sample(p(-1.0, -1.0, -1.0)).compartment, 0);
+    }
+
+    #[test]
+    fn voxelize_trimesh_with_oriented_flag() {
+        // A real TriMesh — verify that prepare_trimesh_for_voxelize
+        // enables in/out queries.
+        let ball = parry3d::shape::Ball::new(2.0);
+        let (vertices, indices) = ball.to_trimesh(20, 20);
+        let mut mesh = parry3d::shape::TriMesh::new(vertices, indices).expect("trimesh");
+        prepare_trimesh_for_voxelize(&mut mesh).expect("orient");
+
+        let mut f = VoxelField::new(0.25);
+        voxelize_trimesh(
+            &mut f,
+            &mesh,
+            3,
+            aabb((-2.5, -2.5, -2.5), (2.5, 2.5, 2.5)),
+        );
+        assert_eq!(
+            f.sample(p(0.0, 0.0, 0.0)).compartment,
+            3,
+            "centre of trimesh ball should be interior"
+        );
+        // A point just outside the radius should be default.
+        assert_eq!(f.sample(p(2.4, 0.0, 0.0)).compartment, 0);
+    }
+
+    #[test]
+    fn voxelized_large_ball_compacts_under_prune() {
+        // A large ball voxelized cell-by-cell produces many Dense L0 tiles.
+        // After prune(), interior 8³ tiles (uniformly compartment-1) get
+        // promoted to L1Slot::Tile, leaving only the boundary band as Dense.
+        let mut f = VoxelField::new(1.0);
+        let ball = parry3d::shape::Ball::new(30.0);
+        voxelize_trimesh(
+            &mut f,
+            &ball,
+            1,
+            aabb((-32.0, -32.0, -32.0), (32.0, 32.0, 32.0)),
+        );
+        let before = f.stats();
+        f.prune();
+        let after = f.stats();
+        // Curved surface → most tiles straddle the boundary. We expect ~30-40%
+        // of dense tiles to collapse (fully-interior tiles only).
+        assert!(
+            after.dense_l0_tiles < before.dense_l0_tiles,
+            "prune should reduce dense tile count; before={}, after={}",
+            before.dense_l0_tiles,
+            after.dense_l0_tiles
+        );
+        let collapsed = before.dense_l0_tiles - after.dense_l0_tiles;
+        assert!(
+            after.tile_l1_slots >= collapsed,
+            "every collapsed Dense tile should become an L1Slot::Tile"
+        );
+        // Sanity: queries still work after prune.
+        assert!(f.sample(p(0.0, 0.0, 0.0)).compartment == 1);
     }
 }

@@ -26,6 +26,6 @@ pub use index::{SpatialIndex, SpatialIndexExt};
 pub use qbvh::{QbvhConfig, QbvhIndex};
 pub use query::{IndexError, IndexStats, Ray, Sphere};
 pub use voxel::{
-    Cell, CellCoord, CellFlags, CompartmentId, VoxelField, VoxelFieldStats, MEMBRANE_INNER,
-    MEMBRANE_OUTER, OCCUPIED, SURFACE,
+    prepare_trimesh_for_voxelize, voxelize_trimesh, Cell, CellCoord, CellFlags, CompartmentId,
+    VoxelField, VoxelFieldStats, MEMBRANE_INNER, MEMBRANE_OUTER, OCCUPIED, SURFACE,
 };

@@ -7,6 +7,7 @@ description = "Sparse hierarchical multiscale spatial structures for parsimony"
 
 [dependencies]
 nalgebra = { workspace = true }
+parry3d = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 wide = { workspace = true }
