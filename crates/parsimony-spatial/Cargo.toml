@@ -7,11 +7,11 @@ description = "Sparse hierarchical multiscale spatial structures for parsimony"
 
 [dependencies]
 nalgebra = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 wide = { workspace = true }
 
 [dev-dependencies]
-rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 criterion = { workspace = true }
 

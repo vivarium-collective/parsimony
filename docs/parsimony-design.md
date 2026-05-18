@@ -313,38 +313,51 @@ trait if a specific workload demands it.
 A three-level sparse grid in the style of OpenVDB:
 
 ```
-root: HashMap<TileCoord, Box<L1Tile>>
-L1:   dense 16³ cells, each either a value or Some(Box<L0Tile>)
-L0:   dense 8³ cells of values
+root: HashMap<RootCoord, Box<L1Tile>>
+L1:   Vec<Option<Box<L0Tile>>>[4096]    (dense 16³ children, heap-resident)
+L0:   [Cell; 512]                       (dense 8³ cells, 2 KB)
 ```
 
-Total addressable space is `(16 * 8)³ = 128³` per root-coordinate, and
-the root map is sparse — empty regions cost zero memory. Inactive cells
-carry default values (e.g. "exterior"); active cells carry compartment
-IDs, distance-to-surface bytes, or occupancy bits.
+A single root coordinate covers `(16 × 8)³ = 128³` cells. The root
+hashmap is sparse — empty regions cost zero memory. L1 tiles allocate
+L0 children lazily; L0 tiles are freed automatically when their last
+non-default cell is overwritten back to [`Cell::DEFAULT`].
 
-**Why three levels and these sizes**: 128 is enough to cover an E. coli
-cell at 1 Å resolution per leaf with a single root tile (10 µm / 8 Å ≈
-1250 leaf voxels along the long axis ≈ ~10 root tiles). The
-fan-out fits comfortably in L1 cache lines for traversal.
+**Cell** (`u16 + u8 + u8 = 4 bytes`): `compartment` (0 = exterior),
+`flags` bitfield (`OCCUPIED`, `SURFACE`, `MEMBRANE_INNER`,
+`MEMBRANE_OUTER`, room for more), `distance` (quantized 0..255).
 
-The voxel field is built once from the recipe's compartment definitions
-(mesh-voxelize → flood-fill → label) and is read-mostly during
-placement. Mutability is required for occupancy tracking when we want
-to maintain a "free space" probability map.
+**Per-tile aggregation** drives multi-scale rejection: each L0 tile
+tracks `active_count` (non-default cells), each L1 tile tracks
+`active_l0_count`. Region queries like
+[`is_region_default`](crate::voxel::VoxelField::is_region_default)
+prune at the highest level where the answer is unambiguous — a 200-nm
+ribosome cluster never has to scan individual 5-nm cells in regions
+known to be empty. This is the multiscale-grid story committed in §3
+principle 1.
 
-**Operations:**
+**Operations (delivered in Phase 1d):**
 
-- `sample(p) -> Cell` — fast point query (root hash + L1 index + L0
-  index, branchless).
-- `iter_tiles_in(aabb)` — efficient bulk iteration for sweeps.
-- `mark_occupied(aabb)` — incremental update when an instance is
-  placed.
-- `find_free_point(near, rng) -> Option<Vec3>` — biased sampling.
+- `sample(p) / set(p, cell)` — world-point read/write.
+- `get(c) / put(c, cell)` — direct cell-coord access.
+- `mark_aabb(aabb, cell)` — fill a box.
+- `mark_occupied / clear_occupied / mark_compartment(aabb, ...)` — bulk flag/id ops.
+- `is_region_default(aabb) -> bool` — pruning region query.
+- `any_cell_with_flags(aabb, mask) -> bool` — flag region query.
+- `is_region_free(aabb) -> bool` — placement-loop convenience (no OCCUPIED in region).
+- `is_l0_active(c) / is_l1_active(c)` — hierarchical activity probes.
+- `iter_active_cells / iter_active_cells_in(aabb)` — visitor iteration.
+- `find_free_point(near, radius, rng, attempts)` — rejection sampling.
+- `bounds()` — AABB enclosing all written cells.
+
+**Coordinate math:** cell coords are signed `i32`. Negative coords
+work via arithmetic shift (`>>` floors) and two's-complement masking
+(`-1 & 0xF == 15`). `root = cell >> 7`; L1 sub-index =
+`(cell >> 3) & 0xF`; L0 sub-index = `cell & 0x7`.
 
 **Why this and not OpenVDB itself**: OpenVDB is C++, GPL-incompatible
-in places, and ports to Rust are immature. The structure we need is
-simple enough to implement in ~600 LOC and tune to our queries.
+in places, and Rust ports are immature. The structure we need is
+~750 LOC and tuned to our queries.
 
 ### 6.5 Multiscale, naturally
 

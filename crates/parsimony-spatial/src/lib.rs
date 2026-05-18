@@ -10,18 +10,22 @@
 //!   and free-space sampling. Three-level sparse hierarchical grid
 //!   (Phase 1d, not yet implemented).
 //!
-//! Phase 1b′ status: 4-wide SIMD [`QbvhIndex`] with native incremental
-//! ops (insert/remove/update all O(log₄ n), no rebuild during steady-
-//! state edits). [`BruteIndex`] is retained as the correctness oracle.
+//! Phase 1d status: + [`VoxelField`] — sparse hierarchical multiscale
+//! voxel grid for compartment classification and free-space sampling.
 
 pub mod aabb;
 pub mod brute;
 pub mod index;
 pub mod qbvh;
 pub mod query;
+pub mod voxel;
 
 pub use aabb::Aabb;
 pub use brute::BruteIndex;
 pub use index::{SpatialIndex, SpatialIndexExt};
 pub use qbvh::{QbvhConfig, QbvhIndex};
 pub use query::{IndexError, IndexStats, Ray, Sphere};
+pub use voxel::{
+    Cell, CellCoord, CellFlags, CompartmentId, VoxelField, VoxelFieldStats, MEMBRANE_INNER,
+    MEMBRANE_OUTER, OCCUPIED, SURFACE,
+};
