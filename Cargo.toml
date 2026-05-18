@@ -34,3 +34,4 @@ rayon = "1"
 criterion = "0.5"
 indexmap = { version = "2", features = ["serde"] }
 ordered-float = { version = "4", features = ["serde"] }
+wide = "0.7"
