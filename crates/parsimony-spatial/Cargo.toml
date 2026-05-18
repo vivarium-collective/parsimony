@@ -16,5 +16,5 @@ rand_xoshiro = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
-name = "bvh"
+name = "qbvh"
 harness = false

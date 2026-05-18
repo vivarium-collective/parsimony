@@ -22,7 +22,8 @@
 //!   leaf in its parent's slot).
 //! - **Remove**: swap-remove from the leaf, refit. If the leaf becomes
 //!   empty its parent's SoA slot is reset to the sentinel; the empty
-//!   leaf is kept in storage and reclaimed on the next [`rebuild`](Self::rebuild).
+//!   leaf (and any empty internal-node ancestor) is freed via cascading
+//!   `detach_empty`, so 0-child internals never linger in the tree.
 //! - **Update**: replace AABB in place, refit leaf and ancestors.
 //!
 //! Every edit is O(log₄ n). No O(n log n) rebuild penalty during
@@ -34,8 +35,6 @@
 //! node, binary-split the prim slice via SAH, then sub-binary-split
 //! each half (skipped when a half is already leaf-sized), producing up
 //! to 4 partitions per internal node.
-//!
-//! [Self::rebuild]: QbvhIndex::rebuild
 
 use std::collections::HashMap;
 

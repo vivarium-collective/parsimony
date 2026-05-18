@@ -282,29 +282,31 @@ the spatial index.
 
 ```rust
 pub trait SpatialIndex {
-    fn insert(&mut self, uid: u64, aabb: Aabb) -> NodeRef;
-    fn remove(&mut self, uid: u64);
-    fn update(&mut self, uid: u64, aabb: Aabb);  // for moves
-    fn query_aabb<'a>(&'a self, q: Aabb) -> impl Iterator<Item = u64> + 'a;
-    fn query_sphere<'a>(&'a self, c: Vec3, r: f32) -> impl Iterator<Item = u64> + 'a;
+    fn insert(&mut self, uid: u64, aabb: Aabb) -> Result<(), IndexError>;
+    fn remove(&mut self, uid: u64) -> Result<(), IndexError>;
+    fn update(&mut self, uid: u64, aabb: Aabb) -> Result<(), IndexError>;
+    fn query_aabb<F: FnMut(u64)>(&self, q: &Aabb, visit: F);
+    fn query_sphere<F: FnMut(u64)>(&self, q: &Sphere, visit: F);
     fn len(&self) -> usize;
-    fn stats(&self) -> IndexStats;  // depth, fill factor, etc.
+    fn stats(&self) -> IndexStats;
 }
 ```
 
-Phase 1 implements at least two backings, behind this trait:
+Production implementation: **`QbvhIndex`** — 4-wide SIMD BVH with SoA
+storage (`f32x4` per axis), native O(log₄ n) incremental
+insert/remove/update via leaf-splitting and cascading `detach_empty`,
+top-down SAH build, manual rebuild on quality degradation. Patterned on
+`parry3d::partitioning::Qbvh` but self-owning.
 
-- **`BvhIndex`** — top-down BVH with SAH heuristic, refit-on-move,
-  rebuild when refit quality degrades past a threshold. Closely
-  patterned on `parry3d::partitioning::Qbvh`. Best general-purpose
-  performer for non-uniform instance distributions.
-- **`HierGridIndex`** — sparse hierarchical voxel grid (see §6.4),
-  doubling as a SpatialIndex by storing instance UIDs at the smallest
-  containing tile. Cheaper inserts, faster broad-phase for uniform
-  distributions, more predictable cache behavior.
+`BruteIndex` is retained as the correctness oracle (used in tests and
+benchmarks; not a production option).
 
-We benchmark both against the cKDTree-rebuild-each-query approach
-cellPACK uses, on real ingredient distributions.
+Originally the design called for a second backing (`HierGridIndex`) as
+a hedge against tree-based indices being slow on uniform distributions.
+The QBVH benchmarks closed that risk — query throughput is 70–2000× over
+brute, and the mixed edit+query (dynamics) workload is 4–83× faster than
+a binary-BVH baseline. A grid backend can be added later behind the same
+trait if a specific workload demands it.
 
 ### 6.4 `VoxelField` — sparse hierarchical grid
 
@@ -354,23 +356,24 @@ boundary refinement. We never quantize the world to one resolution.
 
 The `SpatialIndex` adapts automatically — instances live at whatever
 AABB they have. A 17 Å sphere and a 200 nm ribosome cluster share the
-same tree; the BVH's branching prevents cross-scale pollution.
+same tree; the QBVH's SAH-driven branching prevents cross-scale
+pollution.
 
 ### 6.6 Phase 1 deliverable
 
-`parsimony-spatial` standalone, exporting both traits and at least one
-implementation of each, with:
+`parsimony-spatial` standalone, exporting both traits and the
+implementations, with:
 
-- Unit tests for correctness against `parry3d` and brute force on
-  randomized inputs.
-- Microbenchmarks (Criterion): single insert, bulk build, sphere
-  query, AABB query, at sizes `10³` → `10⁶` instances.
+- Unit tests for correctness against `BruteIndex` (the oracle) on
+  randomized inputs and high-churn edit+query workloads.
+- Microbenchmarks (Criterion): bulk build, incremental insert, AABB
+  query, sphere query, mixed edit+query at 10² → 10⁶ instances.
 - A correctness harness loading `cellpack/examples/recipes/v2/*.json`,
   building the voxel field over each compartment, and validating
   in/out classification matches the Python reference (within voxel
   resolution).
-- A `compare_kdtree` example mirroring cellPACK's collision-test
-  workload to give us a single ratio number.
+- A `compare_kdtree` example mirroring cellPACK's broad-phase workload
+  for a single comparison ratio.
 
 No placement, no recipe-level packing. Just the structures.
 
@@ -637,22 +640,34 @@ comparison.
 
 ## 14. Roadmap
 
-### Phase 0 — design (now)
+### Phase 0 — design (done 2026-05-18)
 
-This document. Workspace skeleton (`Cargo.toml`, empty crate stubs)
-follows once the design is approved.
+This document. Workspace skeleton.
 
 ### Phase 1 — spatial structures prototype
 
-`parsimony-spatial` crate. `SpatialIndex` trait with `BvhIndex` and
-`HierGridIndex` impls. `VoxelField` (3-level sparse hierarchical).
-Correctness tests against `parry3d` and brute force. Criterion
-benchmarks. A `compare_kdtree` example reproducing cellPACK's
-broad-phase workload for direct comparison.
+`parsimony-spatial` crate. Decomposed into sub-passes:
+
+- **1a** *(done)* — AABB, `Sphere`, `Ray`, `SpatialIndex` trait,
+  `BruteIndex` reference impl.
+- **1b′** *(done; supersedes 1b/1c)* — `QbvhIndex`, 4-wide SIMD BVH with
+  native O(log₄ n) incremental ops via `wide::f32x4`. Correctness vs.
+  `BruteIndex`, 3000-op churn invariants. Bench numbers: 1.4–1.8× over
+  binary BVH on queries, 4–83× over binary BVH on the dynamics-shaped
+  mixed edit+query workload, 70–2000× over brute. Originally planned
+  binary `BvhIndex` (1b) and `HierGridIndex` (1c) were collapsed into
+  this single QBVH pass; the brute oracle is the only retained baseline.
+- **1d** *(next)* — `VoxelField` (3-level sparse hierarchical OpenVDB-
+  inspired voxel field) for compartment classification and free-space
+  sampling.
+- **1e** — `compare_kdtree` example mirroring cellPACK's broad-phase,
+  plus a mesh in/out correctness harness against cellPACK's voxelize-
+  and-flood-fill on `peroxisome.json`.
 
 **Done when:** all queries pass correctness, benchmarks show ≥2× over
-the cKDTree-rebuild-each-query baseline at 10⁴ instances, voxel field
-classifies the cellPACK `peroxisome.json` mesh correctly.
+the cKDTree-rebuild-each-query baseline at 10⁴ instances (already
+exceeded), voxel field classifies the cellPACK `peroxisome.json` mesh
+correctly.
 
 ### Phase 2 — core packer MVP
 
