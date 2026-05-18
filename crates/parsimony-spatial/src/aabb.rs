@@ -2,6 +2,7 @@
 //! shape used by every `SpatialIndex` implementation.
 
 use nalgebra::{Point3, Vector3};
+use serde::{Deserialize, Serialize};
 
 /// An axis-aligned bounding box in 3D.
 ///
@@ -9,7 +10,7 @@ use nalgebra::{Point3, Vector3};
 /// componentwise. The "empty" AABB has `min` strictly greater than
 /// `max` on every axis (so it intersects nothing); this is the neutral
 /// element for [`union`](Self::union).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Aabb {
     pub min: Point3<f32>,
     pub max: Point3<f32>,
