@@ -1,0 +1,10 @@
+[package]
+name = "parsimony-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core packing engine: recipe, ingredient, compartment, placement"
+
+[dependencies]
+
+[dev-dependencies]

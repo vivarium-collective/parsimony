@@ -1,0 +1,10 @@
+[package]
+name = "parsimony-spatial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sparse hierarchical multiscale spatial structures for parsimony"
+
+[dependencies]
+
+[dev-dependencies]

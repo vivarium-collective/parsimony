@@ -1,0 +1,10 @@
+[package]
+name = "parsimony-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-language benchmarks: parsimony vs cellPACK Python"
+
+[dependencies]
+
+[dev-dependencies]
