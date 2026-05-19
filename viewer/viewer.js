@@ -1672,7 +1672,7 @@ function applyKeyboardMotion(dt) {
   const panYt   = (heldKeys.has("ArrowUp")    ? 1 : 0) - (heldKeys.has("ArrowDown") ? 1 : 0);
   const zoomt   = (heldKeys.has("PageUp")     ? 1 : 0) - (heldKeys.has("PageDown")  ? 1 : 0);
   // Rotation: Q/E yaw, W/S pitch, A/D roll (3 axes).
-  const yawt    = (heldKeys.has("KeyE") ? 1 : 0) - (heldKeys.has("KeyQ") ? 1 : 0);
+  const yawt    = (heldKeys.has("KeyQ") ? 1 : 0) - (heldKeys.has("KeyE") ? 1 : 0);
   const pitcht  = (heldKeys.has("KeyW") ? 1 : 0) - (heldKeys.has("KeyS") ? 1 : 0);
   const rollt   = (heldKeys.has("KeyD") ? 1 : 0) - (heldKeys.has("KeyA") ? 1 : 0);
 
