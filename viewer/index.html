@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>parsimony viewer</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #161b22;
+      --panel-2: #1f2630;
+      --text: #d6dde3;
+      --text-dim: #8a96a3;
+      --accent: #ffb169;
+      --border: #2a313c;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      overflow: hidden;
+    }
+    #app {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      grid-template-rows: auto 1fr auto;
+      grid-template-areas: "header header" "sidebar canvas" "footer footer";
+      height: 100vh;
+    }
+    header {
+      grid-area: header;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    header h1 {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0;
+      letter-spacing: 0.02em;
+    }
+    header .file-row { display: flex; gap: 8px; align-items: center; }
+    header .hint { color: var(--text-dim); font-size: 11.5px; }
+    button, label.btn, input[type="file"]::file-selector-button {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover, label.btn:hover { border-color: var(--accent); }
+    input[type="file"] {
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+    #canvas-wrap {
+      grid-area: canvas;
+      position: relative;
+      overflow: hidden;
+    }
+    canvas { display: block; outline: none; }
+    #drop-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(20, 30, 45, 0.85);
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.1s;
+      z-index: 10;
+    }
+    #drop-overlay.active { opacity: 1; }
+    #sidebar {
+      grid-area: sidebar;
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      padding: 12px 14px;
+      overflow-y: auto;
+    }
+    #sidebar-toggle { display: none; }
+    #sidebar h2 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin: 12px 0 6px;
+      font-weight: 600;
+    }
+    #sidebar h2:first-child { margin-top: 0; }
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 0;
+      cursor: pointer;
+      user-select: none;
+    }
+    .legend-row .swatch {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    .legend-row .name { flex: 1; }
+    .legend-row .count { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .legend-row.off .swatch { opacity: 0.2; }
+    .legend-row.off .name { color: var(--text-dim); text-decoration: line-through; }
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 4px 0;
+    }
+    .slider-row label { width: 60px; color: var(--text-dim); }
+    .slider-row input[type="range"] { flex: 1; }
+    .slider-row .value { font-variant-numeric: tabular-nums; color: var(--text-dim); width: 50px; text-align: right; }
+    #status {
+      font-size: 11.5px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+    #status .num { color: var(--text); font-variant-numeric: tabular-nums; }
+    footer {
+      grid-area: footer;
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      padding: 4px 14px;
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex;
+      gap: 18px;
+      justify-content: flex-end;
+    }
+    footer .stat { font-variant-numeric: tabular-nums; }
+    .toggle-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 4px 8px;
+    }
+    .toggle-grid label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>parsimony viewer</h1>
+      <div class="file-row">
+        <label for="demo-picker" style="color:var(--text-dim); font-size:11.5px;">demo</label>
+        <select id="demo-picker" style="background: var(--panel-2); color: var(--text); border:1px solid var(--border); padding: 3px 8px; border-radius: 4px; font-family: inherit; font-size:12px; min-width: 200px;">
+          <option value="">— pick one —</option>
+        </select>
+        <span class="hint">·</span>
+        <label class="btn" for="file-input">load .pack.json</label>
+        <input type="file" id="file-input" accept=".pack.json,.json" hidden>
+        <span class="hint">or drop anywhere</span>
+      </div>
+      <div style="flex:1"></div>
+      <button id="reset-view">reset view</button>
+    </header>
+
+    <div id="canvas-wrap">
+      <div id="drop-overlay">drop .simularium to load</div>
+      <button id="sidebar-toggle" title="show/hide panel">hide</button>
+    </div>
+
+    <aside id="sidebar">
+      <h2>file</h2>
+      <div id="status">no file loaded</div>
+
+      <h2>ingredients</h2>
+      <div id="legend">
+        <div style="color: var(--text-dim); font-size: 12px;">load a file to populate</div>
+      </div>
+
+      <h2>meshes</h2>
+      <div class="slider-row" title="Higher = coarser LODs picked sooner (less memory). Lower = fine LODs picked sooner (more detail, more memory).">
+        <label>LOD px</label>
+        <input type="range" id="mesh-budget" min="1" max="12" step="0.5" value="4">
+        <span class="value" id="mesh-budget-value">4.0</span>
+      </div>
+      <div id="mesh-loading-status" style="color: var(--text-dim); font-size: 11.5px; margin-top: 4px;">no file loaded</div>
+
+      <h2>display</h2>
+      <div class="toggle-grid">
+        <label><input type="checkbox" id="toggle-bbox" checked> bounding box</label>
+        <label><input type="checkbox" id="toggle-axes" checked> axes</label>
+        <label><input type="checkbox" id="toggle-bg-grid" checked> ground grid</label>
+        <label><input type="checkbox" id="toggle-spin"> auto-spin</label>
+      </div>
+
+      <h2>style</h2>
+      <div class="toggle-grid">
+        <label><input type="radio" name="style" value="standard" checked> standard</label>
+        <label><input type="radio" name="style" value="goodsell"> Goodsell</label>
+      </div>
+      <div class="slider-row" id="outline-row" style="display:none;">
+        <label>outline px</label>
+        <input type="range" id="outline-width" min="0" max="4" step="0.25" value="1.5">
+        <span class="value" id="outline-width-value">1.5</span>
+      </div>
+
+      <h2>cross-section</h2>
+      <div class="slider-row">
+        <label>axis</label>
+        <select id="slice-axis" style="flex:1; background: var(--panel-2); color: var(--text); border:1px solid var(--border); padding: 2px 6px; border-radius: 3px;">
+          <option value="">none</option>
+          <option value="x">x</option>
+          <option value="y">y</option>
+          <option value="z">z</option>
+        </select>
+      </div>
+      <div class="slider-row">
+        <label>plane</label>
+        <input type="range" id="slice-pos" min="-1" max="1" step="0.005" value="0">
+        <span class="value" id="slice-pos-value">0.00</span>
+      </div>
+      <div class="slider-row">
+        <label>flip</label>
+        <input type="checkbox" id="slice-flip">
+      </div>
+    </aside>
+
+    <footer>
+      <span class="stat" id="stat-placements">— placements</span>
+      <span class="stat" id="stat-types">— types</span>
+      <span class="stat" id="stat-fps">— fps</span>
+    </footer>
+  </div>
+
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

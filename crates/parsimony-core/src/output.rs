@@ -1,11 +1,192 @@
-//! Output writers — [`Snapshot`] → JSON in either a debug-friendly
-//! transform-list format or the Simularium format consumed by the
-//! `cellpack.allencell.org` viewer.
+//! Output writers — [`Snapshot`] → JSON in one of three formats:
+//!
+//! - **`parsimony.pack.v1`** ([`write_pack_json`]) is the *primary*
+//!   format. Native to parsimony, drives the local three.js viewer.
+//!   Carries everything the renderer needs: full compartment
+//!   hierarchy, per-ingredient shape descriptors (sphere /
+//!   multi-sphere / mesh with mesh URL), per-instance position +
+//!   quaternion rotation. Designed to grow with dynamics frames,
+//!   instance-specific overrides, etc.
+//! - **`transforms`** ([`write_transforms_json`]) is a flat
+//!   transform list, kept around as a stable debug-friendly export
+//!   for downstream tooling.
+//! - **Simularium** ([`write_simularium_json`]) is an *optional*
+//!   export for users who want to load packs into
+//!   `cellpack.allencell.org`. Lossy by construction (everything
+//!   becomes a sphere with `displayType: "SPHERE"`); not the source
+//!   of truth.
 
 use serde_json::{json, Value};
 
+use crate::ingredient::IngredientShape;
 use crate::placement::Snapshot;
 use crate::recipe::Recipe;
+
+/// parsimony's native pack format. Single JSON document; the
+/// `format` field is the discriminator so future revs can co-exist.
+///
+/// Schema:
+///
+/// ```text
+/// {
+///   "format": "parsimony.pack.v1",
+///   "recipe_name": "...",
+///   "seed": <u64>,
+///   "bounds": { "min": [x,y,z], "max": [x,y,z] },
+///   "compartments": [
+///     { "id": 0, "name": "space", "parent": null, "kind": "box",
+///       "bounds": { ... } },
+///     { "id": 1, "name": "cell",  "parent": 0,    "kind": "sphere",
+///       "center": [...], "radius": ... },
+///     // ... or kind: "capsule" | "mesh"
+///   ],
+///   "ingredients": [
+///     { "id": 0, "name": "...", "color": [r,g,b],
+///       "shape": { "kind": "sphere", "radius": ... } },
+///     { "id": 1, "name": "...", "color": [r,g,b],
+///       "shape": { "kind": "multi_sphere",
+///                  "spheres": [{ "offset": [...], "radius": ... }, ...],
+///                  "enclosing_radius": ... } },
+///     { "id": 2, "name": "...", "color": [r,g,b],
+///       "shape": { "kind": "mesh", "url": "examples/.../x.obj",
+///                  "enclosing_radius": ... } },
+///   ],
+///   "placements": [
+///     { "uid": 0, "ingredient": 1, "compartment": 1,
+///       "position": [x,y,z],
+///       "rotation": [w,x,y,z] }   // unit quaternion, w first
+///   ]
+/// }
+/// ```
+pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
+    // Compartments — flatten with parent ids so the viewer can
+    // rebuild the hierarchy.
+    let compartments: Vec<Value> = recipe
+        .compartments
+        .iter()
+        .enumerate()
+        .map(|(id, (name, c))| {
+            let parent = c
+                .parent
+                .map(|p| Value::from(p as u64))
+                .unwrap_or(Value::Null);
+            let kind = match &c.kind {
+                crate::compartment::CompartmentKind::Box(bb) => json!({
+                    "kind": "box",
+                    "bounds": {
+                        "min": [bb.min.x, bb.min.y, bb.min.z],
+                        "max": [bb.max.x, bb.max.y, bb.max.z],
+                    },
+                }),
+                crate::compartment::CompartmentKind::Sphere { center, radius } => json!({
+                    "kind": "sphere",
+                    "center": [center.x, center.y, center.z],
+                    "radius": radius,
+                }),
+                crate::compartment::CompartmentKind::Capsule { a, b, radius } => json!({
+                    "kind": "capsule",
+                    "a": [a.x, a.y, a.z],
+                    "b": [b.x, b.y, b.z],
+                    "radius": radius,
+                }),
+                crate::compartment::CompartmentKind::Mesh(m) => json!({
+                    "kind": "mesh",
+                    "bounds": {
+                        "min": [m.aabb.min.x, m.aabb.min.y, m.aabb.min.z],
+                        "max": [m.aabb.max.x, m.aabb.max.y, m.aabb.max.z],
+                    },
+                }),
+            };
+            // Merge kind block into outer object.
+            let mut obj = json!({
+                "id": id as u64,
+                "name": name,
+                "parent": parent,
+            });
+            if let Value::Object(extra) = kind {
+                if let Value::Object(o) = &mut obj {
+                    for (k, v) in extra {
+                        o.insert(k, v);
+                    }
+                }
+            }
+            obj
+        })
+        .collect();
+
+    let ingredients: Vec<Value> = recipe
+        .ingredients
+        .iter()
+        .enumerate()
+        .map(|(id, (name, ing))| {
+            let shape = match &ing.shape {
+                IngredientShape::SingleSphere { radius } => json!({
+                    "kind": "sphere",
+                    "radius": radius,
+                }),
+                IngredientShape::MultiSphere { spheres } => {
+                    let s: Vec<Value> = spheres
+                        .iter()
+                        .map(|s| json!({
+                            "offset": [s.offset.x, s.offset.y, s.offset.z],
+                            "radius": s.radius,
+                        }))
+                        .collect();
+                    json!({
+                        "kind": "multi_sphere",
+                        "spheres": s,
+                        "enclosing_radius": ing.shape.enclosing_radius(),
+                    })
+                }
+                IngredientShape::Mesh { .. } => {
+                    let lods: Vec<Value> = ing
+                        .mesh_lods
+                        .iter()
+                        .map(|l| json!({ "url": l.url, "voxel_size": l.voxel_size }))
+                        .collect();
+                    json!({
+                        "kind": "mesh",
+                        "lods": lods,
+                        "enclosing_radius": ing.shape.enclosing_radius(),
+                    })
+                }
+            };
+            json!({
+                "id": id as u64,
+                "name": name,
+                "color": ing.color,
+                "shape": shape,
+            })
+        })
+        .collect();
+
+    let placements: Vec<Value> = snapshot
+        .placements
+        .iter()
+        .map(|p| {
+            json!({
+                "uid": p.instance_uid,
+                "ingredient": p.ingredient_id,
+                "compartment": p.compartment_id,
+                "position": [p.position.x, p.position.y, p.position.z],
+                "rotation": [p.rotation.w, p.rotation.i, p.rotation.j, p.rotation.k],
+            })
+        })
+        .collect();
+
+    json!({
+        "format": "parsimony.pack.v1",
+        "recipe_name": snapshot.recipe_name,
+        "seed": snapshot.seed,
+        "bounds": {
+            "min": [recipe.bounding_box.min.x, recipe.bounding_box.min.y, recipe.bounding_box.min.z],
+            "max": [recipe.bounding_box.max.x, recipe.bounding_box.max.y, recipe.bounding_box.max.z],
+        },
+        "compartments": compartments,
+        "ingredients": ingredients,
+        "placements": placements,
+    })
+}
 
 /// Debug-friendly format: one entry per placement with explicit fields.
 pub fn write_transforms_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
@@ -74,10 +255,7 @@ pub fn write_simularium_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
             id.to_string(),
             json!({
                 "name": name,
-                "geometry": {
-                    "displayType": "SPHERE",
-                    "color": hex,
-                }
+                "geometry": { "displayType": "SPHERE", "color": hex },
             }),
         );
     }

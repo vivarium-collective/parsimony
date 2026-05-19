@@ -1,0 +1,62 @@
+{
+    "name": "blood_plasma",
+    "version": "0.1.0",
+    "format_version": "2.1-parsimony",
+    "description": "A demo of mesh-ingredient packing using real protein structures from the PDB. Each ingredient is a Van der Waals surface mesh computed by scripts/pdb_to_mesh.py at ~1.5 Å resolution. The mix is loosely inspired by blood-plasma composition (with GroEL as a stand-in for a large rare cytoplasmic complex). Counts are scaled for visualization, not biological accuracy — see the comments in the report for the real concentrations.",
+    "bounding_box": [
+        [-350, -350, -350],
+        [350, 350, 350]
+    ],
+    "objects": {
+        "groel": {
+            "type": "mesh",
+            "color": [0.45, 0.75, 0.95],
+            "mesh_path": "../pdb_meshes/1aon_groel.obj",
+            "proxy_voxel_size": 14.0
+        },
+        "albumin": {
+            "type": "mesh",
+            "color": [0.95, 0.62, 0.35],
+            "mesh_path": "../pdb_meshes/1ao6_albumin.obj",
+            "proxy_voxel_size": 7.0
+        },
+        "antibody": {
+            "type": "mesh",
+            "color": [0.55, 0.85, 0.45],
+            "mesh_path": "../pdb_meshes/1igy_antibody.obj",
+            "proxy_voxel_size": 8.0
+        },
+        "hemoglobin": {
+            "type": "mesh",
+            "color": [0.85, 0.35, 0.35],
+            "mesh_path": "../pdb_meshes/1hho_hemoglobin.obj",
+            "proxy_voxel_size": 5.0
+        },
+        "transferrin": {
+            "type": "mesh",
+            "color": [0.80, 0.55, 0.85],
+            "mesh_path": "../pdb_meshes/1a8e_transferrin.obj",
+            "proxy_voxel_size": 5.0
+        },
+        "lysozyme": {
+            "type": "mesh",
+            "color": [0.95, 0.85, 0.45],
+            "mesh_path": "../pdb_meshes/1aki.obj",
+            "proxy_voxel_size": 3.5
+        }
+    },
+    "composition": {
+        "space": {
+            "regions": {
+                "interior": [
+                    { "object": "groel",       "count": 4   },
+                    { "object": "albumin",     "count": 60  },
+                    { "object": "antibody",    "count": 40  },
+                    { "object": "hemoglobin",  "count": 80  },
+                    { "object": "transferrin", "count": 50  },
+                    { "object": "lysozyme",    "count": 150 }
+                ]
+            }
+        }
+    }
+}

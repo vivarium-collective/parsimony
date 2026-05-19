@@ -70,7 +70,8 @@ struct RawObject {
     #[serde(default)]
     segments: Option<Vec<RawCylinderSegment>>,
     /// `mesh`: path to an OBJ file (resolved relative to the recipe
-    /// file's parent directory).
+    /// file's parent directory). Legacy single-LOD form; modern
+    /// recipes should use `mesh_lods`.
     #[serde(default)]
     mesh_path: Option<String>,
     /// `mesh`: voxel size for generating the sphere-tree proxy. If
@@ -78,7 +79,23 @@ struct RawObject {
     /// tree under a few hundred spheres for reasonable mesh sizes).
     #[serde(default)]
     proxy_voxel_size: Option<f32>,
+    /// `mesh`: multi-LOD pyramid. Each entry has a `path` (OBJ,
+    /// resolved relative to the recipe) and the `voxel_size` it was
+    /// generated at (drives the renderer's LOD selection). Order
+    /// coarse → fine. If both `mesh_path` and `mesh_lods` are set,
+    /// `mesh_lods` wins; the collision proxy uses the finest entry.
+    #[serde(default)]
+    mesh_lods: Option<Vec<RawMeshLod>>,
     // (remaining cellPACK fields ignored until needed)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawMeshLod {
+    /// OBJ file path, resolved relative to the recipe's directory.
+    path: String,
+    /// Voxel size (Å) the mesh was generated at — used by the viewer
+    /// to pick which LOD to fetch at a given zoom level.
+    voxel_size: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +253,11 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
     let mut ingredients: IndexMap<String, Ingredient> = IndexMap::new();
     for (name, obj) in &resolved_objects {
         let typ = obj.type_name.as_deref().unwrap_or("");
+        // For Mesh ingredients we remember the LOD pyramid so the
+        // viewer can fetch the right resolution per zoom level. URLs
+        // are resolved to project-root-relative paths so an http
+        // server serving the project root can deliver them.
+        let mut mesh_lods: Vec<crate::ingredient::MeshLod> = Vec::new();
         let shape = match typ {
             "single_sphere" => {
                 let Some(r) = obj.radius else {
@@ -315,17 +337,64 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
                 IngredientShape::multi_cylinder(&segs)
             }
             "mesh" => {
-                let Some(rel_path) = obj.mesh_path.as_ref() else {
-                    return Err(RecipeError::InvalidObject {
-                        name: name.clone(),
-                        message: "mesh requires `mesh_path`".into(),
-                    });
-                };
-                let full = match recipe_dir {
-                    Some(dir) => dir.join(rel_path),
-                    None => std::path::PathBuf::from(rel_path),
-                };
-                let mut trimesh = crate::ingredient::obj::load_trimesh(&full)
+                // Determine LOD set. Prefer `mesh_lods`; fall back
+                // to the legacy single `mesh_path` (treated as one
+                // LOD at the proxy resolution).
+                let resolved_lods: Vec<(std::path::PathBuf, f32, String)> =
+                    if let Some(raw_lods) = obj.mesh_lods.as_ref() {
+                        if raw_lods.is_empty() {
+                            return Err(RecipeError::InvalidObject {
+                                name: name.clone(),
+                                message: "mesh_lods must contain at least one entry".into(),
+                            });
+                        }
+                        raw_lods
+                            .iter()
+                            .map(|lod| {
+                                let full = match recipe_dir {
+                                    Some(dir) => dir.join(&lod.path),
+                                    None => std::path::PathBuf::from(&lod.path),
+                                };
+                                let url = resolve_mesh_url(&full);
+                                (full, lod.voxel_size, url)
+                            })
+                            .collect()
+                    } else if let Some(rel_path) = obj.mesh_path.as_ref() {
+                        let full = match recipe_dir {
+                            Some(dir) => dir.join(rel_path),
+                            None => std::path::PathBuf::from(rel_path),
+                        };
+                        let url = resolve_mesh_url(&full);
+                        // Without explicit LODs, the legacy
+                        // `proxy_voxel_size` doubles as the LOD
+                        // descriptor; if absent we leave it as 1.0
+                        // and the viewer falls back to "always use
+                        // this one".
+                        let voxel_size = obj.proxy_voxel_size.unwrap_or(1.0);
+                        vec![(full, voxel_size, url)]
+                    } else {
+                        return Err(RecipeError::InvalidObject {
+                            name: name.clone(),
+                            message: "mesh requires `mesh_path` or `mesh_lods`".into(),
+                        });
+                    };
+
+                // Record LOD URLs (coarse → fine ordering preserved
+                // from input).
+                mesh_lods = resolved_lods
+                    .iter()
+                    .map(|(_, vs, url)| crate::ingredient::MeshLod {
+                        url: url.clone(),
+                        voxel_size: *vs,
+                    })
+                    .collect();
+
+                // The collision proxy uses the FINEST LOD (last
+                // entry in the array). Load it.
+                let (full, _, _) = resolved_lods
+                    .last()
+                    .expect("resolved_lods non-empty checked above");
+                let mut trimesh = crate::ingredient::obj::load_trimesh(full)
                     .map_err(|e| RecipeError::InvalidObject {
                         name: name.clone(),
                         message: format!("failed to load mesh `{}`: {e}", full.display()),
@@ -368,6 +437,7 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
                     .principal_vector
                     .map(|v| nalgebra::Vector3::new(v[0], v[1], v[2]))
                     .unwrap_or_else(|| nalgebra::Vector3::new(0.0, 0.0, 1.0)),
+                mesh_lods,
             },
         );
     }
@@ -447,6 +517,17 @@ fn resolve_object(
     Ok(())
 }
 
+/// Map an OBJ path (relative to the recipe) into a URL suitable for
+/// downstream renderers. Prefer a path relative to the current
+/// working directory (so an http server rooted there can serve it);
+/// fall back to canonicalised absolute.
+fn resolve_mesh_url(full: &std::path::Path) -> String {
+    let absolute = std::fs::canonicalize(full).unwrap_or_else(|_| full.to_path_buf());
+    let cwd = std::env::current_dir().ok();
+    let stripped = cwd.and_then(|c| absolute.strip_prefix(&c).ok().map(|p| p.to_path_buf()));
+    stripped.unwrap_or(absolute).to_string_lossy().into_owned()
+}
+
 fn merge_object(parent: RawObject, child: RawObject) -> RawObject {
     RawObject {
         type_name: child.type_name.or(parent.type_name),
@@ -463,6 +544,7 @@ fn merge_object(parent: RawObject, child: RawObject) -> RawObject {
         segments: child.segments.or(parent.segments),
         mesh_path: child.mesh_path.or(parent.mesh_path),
         proxy_voxel_size: child.proxy_voxel_size.or(parent.proxy_voxel_size),
+        mesh_lods: child.mesh_lods.or(parent.mesh_lods),
     }
 }
 

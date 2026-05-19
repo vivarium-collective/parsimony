@@ -36,7 +36,8 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the projection
 
 def render(input_path: str, output_path: str, title: str,
            azim: float, elev: float, alpha: float,
-           slice_axis: str | None = None, slice_thickness: float = 50.0) -> None:
+           slice_axis: str | None = None, slice_thickness: float = 50.0,
+           legend_top: int = 20) -> None:
     with open(input_path) as f:
         doc = json.load(f)
 
@@ -72,6 +73,31 @@ def render(input_path: str, output_path: str, title: str,
     # ~half the rendered axes are content, so points-per-unit ≈ that.
     points_per_unit = (figure_inches * 72.0 * 0.5) / max(world_extent, 1.0)
 
+    # Pre-rank types by abundance so we know which deserve the legend.
+    top_tids = set(
+        sorted(grouped.keys(), key=lambda t: -len(grouped[t]))[:max(legend_top, 0)]
+    )
+
+    def maybe_label(tid: int, count: int) -> str | None:
+        if legend_top <= 0 or tid not in top_tids:
+            return None
+        name = type_meta.get(tid, {}).get("name", f"type_{tid}")
+        return f"{name} ({count})"
+
+    def add_legend(ax) -> None:
+        if legend_top <= 0:
+            return
+        # Suppress the auto-generated "+ N more" overflow by passing
+        # explicit handles/labels = only the labeled artists.
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            return
+        n_total = len(grouped)
+        shown = len(handles)
+        title = None if shown >= n_total else f"top {shown} of {n_total} types"
+        ax.legend(handles, labels, loc="upper right", fontsize=8,
+                  framealpha=0.9, title=title, title_fontsize=8)
+
     if slice_axis is not None:
         axis_idx = {"x": 0, "y": 1, "z": 2}[slice_axis]
         plot_axes = [i for i in (0, 1, 2) if i != axis_idx]
@@ -86,7 +112,6 @@ def render(input_path: str, output_path: str, title: str,
             if len(arr) == 0:
                 continue
             total_in_slice += len(arr)
-            name = type_meta.get(tid, {}).get("name", f"type_{tid}")
             color = type_meta.get(tid, {}).get("color", "#888888")
             marker_radius_pts = arr[:, 3] * points_per_unit_2d
             sizes = np.clip(marker_radius_pts ** 2, 4.0, 8000.0)
@@ -94,7 +119,7 @@ def render(input_path: str, output_path: str, title: str,
                 arr[:, plot_axes[0]], arr[:, plot_axes[1]],
                 s=sizes, c=color, alpha=alpha,
                 edgecolors="none",
-                label=f"{name} ({len(arr)})",
+                label=maybe_label(tid, len(arr)),
             )
         ax.set_xlabel(labels[plot_axes[0]])
         ax.set_ylabel(labels[plot_axes[1]])
@@ -103,7 +128,7 @@ def render(input_path: str, output_path: str, title: str,
             f"  ({total_in_slice} placements visible)"
         )
         ax.set_aspect("equal")
-        ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+        add_legend(ax)
         plt.tight_layout()
         plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
         plt.close()
@@ -114,7 +139,6 @@ def render(input_path: str, output_path: str, title: str,
     ax = fig.add_subplot(111, projection="3d")
     for tid, pts in sorted(grouped.items()):
         arr = np.array(pts)
-        name = type_meta.get(tid, {}).get("name", f"type_{tid}")
         color = type_meta.get(tid, {}).get("color", "#888888")
         # matplotlib's scatter `s` is in points². Convert each sphere's
         # world-radius into screen radius (in points) before squaring.
@@ -124,7 +148,7 @@ def render(input_path: str, output_path: str, title: str,
             arr[:, 0], arr[:, 1], arr[:, 2],
             s=sizes, c=color, alpha=alpha,
             edgecolors="none",
-            label=f"{name} ({len(pts)})",
+            label=maybe_label(tid, len(pts)),
         )
 
     ax.set_xlabel("x")
@@ -134,7 +158,7 @@ def render(input_path: str, output_path: str, title: str,
     ax.view_init(elev=elev, azim=azim)
     # Keep aspect ratio honest (3D plots default to a stretched cube).
     ax.set_box_aspect((1, 1, 1))
-    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    add_legend(ax)
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close()
@@ -153,9 +177,12 @@ def main() -> int:
                     help="render a 2D slice perpendicular to this axis instead of full 3D")
     ap.add_argument("--slice-thickness", type=float, default=50.0,
                     help="slab thickness around 0 (world units) when --slice is set")
+    ap.add_argument("--legend-top", type=int, default=20,
+                    help="legend shows top-N most-abundant types only (default 20); "
+                         "0 disables the legend entirely.")
     args = ap.parse_args()
     render(args.input, args.output, args.title, args.azim, args.elev, args.alpha,
-           args.slice, args.slice_thickness)
+           args.slice, args.slice_thickness, args.legend_top)
     return 0
 
 

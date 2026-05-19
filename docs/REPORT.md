@@ -56,27 +56,6 @@ One pack run exercises `single_sphere`, `single_cube`, `single_cylinder`,
 all going through the same QBVH + clearance-grid pipeline. The 100%
 success rate means every loop iteration committed a placement.
 
-### `ecoli_starter` — capsule cell with surface lipids
-
-![ecoli_starter slice through z=0](img/ecoli_slice.png)
-
-```
-recipe: ecoli_starter (5 ingredient types, 5 directives, 6360 instances requested)
-packed: 6360/6360 instances in 553.42ms  (100%)
-  ribosome              200/200   (multi_sphere, 30S+50S subunits)
-  rna_polymerase        100/100   (single_sphere, radius 8)
-  groel                  60/60    (single_sphere, radius 7)
-  soluble_enzyme       1000/1000  (single_sphere, radius 3)
-  lipid                5000/5000  (single_sphere, on capsule surface)
-```
-
-Slice through z=0 of the E. coli starter recipe — a capsule
-compartment (the orange-tan lipid outline traces the membrane) with
-ribosomes, polymerases, GroEL, and soluble enzymes packed in the
-interior. 6,360 placements, 100% success, all inside the capsule, no
-overlaps, lipids exactly on the surface (verified by integration tests
-`ecoli_lipids_on_capsule_surface` and `ecoli_interior_proteins_inside_cell`).
-
 ### `spheres_in_a_box` — strict vs loose bounds
 
 cellPACK's classic dense-packing benchmark, run both ways.
@@ -99,6 +78,66 @@ matches their density within rounding. The default behaviour is
 strict — sphere fully inside box — which is biology-correct (relevant
 when the bounding box represents a real container rather than just
 the simulation domain).
+
+### `blood_plasma` — real PDB protein meshes
+
+![blood_plasma](img/blood_plasma.png)
+
+```
+recipe: blood_plasma (6 ingredient types, 6 directives, 384 instances requested)
+packed: 384/384 instances in 692ms  (100%)
+  lysozyme     150/150   (1AKI — small antibacterial enzyme, ~30 Å)
+  hemoglobin    80/80    (1HHO — α₂β₂ tetramer, ~55 Å)
+  albumin       60/60    (1AO6 — primary plasma carrier, ~80 Å)
+  transferrin   50/50    (1A8E — iron transport, ~60 Å)
+  antibody      40/40    (1IGY — Y-shape IgG, ~150 Å)
+  groel          4/4     (1AON — 14-mer chaperonin, ~200 Å)
+```
+
+Mixed real protein structures fetched from RCSB and converted to Van
+der Waals surface meshes by `scripts/pdb_to_mesh.py` (marching-cubes
+on an SDF grid). Demonstrates parsimony's mesh-ingredient pipeline
+end-to-end with structures that are decidedly *not* sphere-shaped —
+the Y-armed antibody and the hollow GroEL barrel both pack cleanly.
+
+### `mycoplasma_genitalium` (full) — translated from the Maritan et al. recipe
+
+![mycoplasma full cell](img/mycoplasma_full.png)
+![mycoplasma slice z=0](img/mycoplasma_full_slice.png)
+
+```
+recipe: mycoplasma_genitalium (643 ingredient types, 643 directives, 41,623 instances requested)
+        546 interior species + 96 surface species + 1 synthetic lipid head
+        22,624 interior placements + 10,999 surface placements + 8,000 lipids
+```
+
+Translated from [ccsb-scripps/MycoplasmaGenitalium](https://github.com/ccsb-scripps/MycoplasmaGenitalium)
+(the cellPACK data backing Maritan, Singla, Autin, Karr, Covert,
+Olson & Goodsell, *J Mol Biol* 2022, "Building Structural Models of
+a Whole Mycoplasma Cell"). The translator `scripts/translate_mycoplasma.py`
+walks their JSON recipe, finds the structure file for every species,
+batch-converts them to Van der Waals meshes via
+`scripts/pdb_to_mesh.py` (marching cubes on an atomic SDF at 2.5 Å
+resolution), and emits a parsimony recipe.
+
+- **Interior**: 546 cytoplasmic species placed inside the cell sphere.
+- **Surface**: 96 membrane proteins placed on the cell-sphere boundary
+  via parsimony's Surface region (with `principal_vector` alignment
+  to surface normals).
+- **Membrane**: 8,000 lipid head groups as a synthetic Surface
+  ingredient — area-weighted random distribution traces the
+  membrane in renders. Replaces the atomic-detail lipid bilayer
+  the Maritan publication uses; the trade-off is visual readability
+  for ingredient count.
+- **Cell**: a 2,000 Å sphere compartment (Mycoplasma genitalium is
+  ~150–200 nm diameter; the larger sphere gives the proteins room).
+- **Skipped**: 41 species had no structure file in the cellPACK
+  proteins/ folder (their PDB IDs were unresolved by Maritan's
+  pipeline).
+
+The DNA/RNA chromosome from `LatticeNucleoids/` is not included
+yet — it's a constrained-polymer problem, not a packing problem,
+and warrants its own pipeline.
 
 ---
 
@@ -135,20 +174,6 @@ user    0m12.162s
 sys     0m21.620s
 ```
 
-Three parsimony runs on `ecoli_starter` (5 ingredient types, 6360
-instances, capsule compartment with surface lipids):
-
-```
-seed=1: 6360/6360 in 567.75ms  attempts 6391, success 99.5%
-seed=2: 6360/6360 in 575.12ms  attempts 6388, success 99.6%
-seed=3: 6360/6360 in 539.74ms  attempts 6395, success 99.5%
-```
-
-That's **~11,300 placements/sec** including a 5000-instance surface
-membrane sweep — cellPACK doesn't have this recipe to compare
-against directly (it's parsimony-format), but the throughput is
-consistent with the spheres_in_a_box numbers.
-
 ### Where the speed comes from
 
 The 2 900× isn't an accident. cellPACK is Python with NumPy hot loops;
@@ -173,7 +198,7 @@ matter at least as much:
   no extraneous overlap tolerance.
 
 The throughput leaves comfortable headroom for the bigger recipes
-that will follow (Mycoplasma, whole E. coli with 10⁴+ ribosomes).
+that will follow (Mycoplasma's ~9 M atoms, etc.).
 The clearance grid currently caps at 500 cells per axis (≈ 500 MB
 worst case f32 storage) — that becomes the next bottleneck before
 the algorithm does.
@@ -296,17 +321,12 @@ clean.
 |---|---|---|
 | `parsimony-spatial` (lib) | 87 | AABB, brute index, QBVH, voxel field, mesh voxeliser, queries |
 | `parsimony-core` (lib) | 34 | recipe loader, compartments, placer unit tests, output schema |
-| `parsimony-core` tests/ `ecoli_starter.rs` | 5 | E. coli end-to-end: 100% packed, lipids on surface, proteins inside, ribosomes have rotations, no overlaps |
 | `parsimony-core` tests/ `shape_zoo.rs` | 3 | every shape type present, ≥90% packed, no overlaps |
 | `parsimony-core` tests/ `spheres_in_a_box.rs` | 7 | loads cellPACK recipe, no overlaps, within bounds, deterministic, simularium + transforms output well-formed |
 
 Selected test names (full list runnable via `cargo test --release`):
 
 ```
-ecoli_packs_everything                           (100% in <1s)
-ecoli_lipids_on_capsule_surface                  (|signed_distance| < 1e-2)
-ecoli_interior_proteins_inside_cell              (every proxy sphere inside)
-ecoli_no_overlaps_in_interior                    (O(n²) pairwise)
 shape_zoo_packs_everything                       (>=90%)
 shape_zoo_no_overlaps                            (across all 6 shape types)
 shape_zoo_includes_every_shape_type              (sphere + multi + mesh)
@@ -361,6 +381,33 @@ success rate (every iteration commits a placement). See the per-demo
 
 ---
 
+## GPU foundation (Phase 4 — in flight)
+
+`crates/parsimony-gpu/` exists. wgpu 23 backend, one compute pipeline:
+`clearance_update.wgsl` ports the CPU clearance-grid update to the
+GPU. One workgroup per placement (64 threads cooperating on the
+affected cell range), `atomicMin` on the f32 bit-pattern of the
+distance value (sound because the grid never stores negative
+numbers).
+
+Oracle test `gpu_matches_cpu_oracle` cross-checks: 64 random
+placements onto a 32³ grid via the GPU pipeline match the CPU
+reference (`cpu_update` in the same crate, byte-equivalent to
+`parsimony-core/src/clearance_grid.rs::update_for_placement`) to
+within FP noise. Passes on the test machine's GPU; will skip
+gracefully if no adapter is available.
+
+Next on this path:
+- Wire `GpuClearanceGrid` into the placer behind a `--gpu` flag so
+  the Mycoplasma 33,623-placement pack can use it for the load-time
+  proxy voxelisation. Benchmark against the current 82 s.
+- Move per-directive `valid_cells` filter to GPU (one prefix-sum +
+  compact pass per directive).
+- Eventually: collision queries via parallel sphere-tree-vs-sphere-
+  tree against a GPU-resident QBVH.
+
+---
+
 ## What's still deferred
 
 These are real gaps relative to cellPACK, but discrete features we can
@@ -412,6 +459,10 @@ uv run scripts/render_simularium.py /tmp/x.simularium docs/img/x.png \
 
 # Open this report in a browser (uv tool run grip, ephemeral venv)
 ./scripts/view_report.sh
+
+# Pack and view a recipe in the local three.js viewer
+./scripts/view_pack.sh                           # shape_zoo demo
+./scripts/view_pack.sh path/to/recipe.json       # any recipe
 ```
 
 ---
@@ -429,9 +480,16 @@ crates/parsimony-core/       # recipe loader, ingredients, compartments, placer,
   src/output.rs                # Simularium + transforms emitters
 crates/parsimony-cli/        # parsimony pack
 crates/parsimony-bench/      # compare-with-cellpack
-examples/recipes/            # ecoli_starter.json, shape_zoo.json
-examples/meshes/             # sphere.obj (for mesh-ingredient demo)
+examples/recipes/            # shape_zoo.json, blood_plasma.json, mycoplasma.json, pdb_proteins.json
+examples/meshes/             # sphere.obj (toy mesh-ingredient demo)
+examples/pdb_meshes/         # generated Van der Waals meshes (1AKI, 1AON, 1HHO, 1IGY, 1AO6, 1A8E)
+examples/pdb_meshes/mycoplasma/ # batch-generated meshes for the mycoplasma recipe
+examples/pdb_cache/          # downloaded raw PDBs (gitignore as desired)
 docs/                        # this report, parsimony-design.md, img/*.png
-scripts/render_simularium.py # PNG renderer used to produce the demo images
+viewer/                      # local three.js sphere-packing viewer (HTML + JS)
+scripts/render_simularium.py # static PNG renderer used to produce report images
+scripts/pdb_to_mesh.py       # PDB/CIF → Van der Waals OBJ mesh (uv-managed)
+scripts/translate_mycoplasma.py # cellPACK Maritan recipe → parsimony recipe
 scripts/view_report.sh       # opens this report in the best available viewer
+scripts/view_pack.sh         # packs a recipe and opens it in the viewer
 ```

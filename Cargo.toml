@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/parsimony-spatial",
     "crates/parsimony-core",
+    "crates/parsimony-gpu",
     "crates/parsimony-cli",
     "crates/parsimony-bench",
 ]
@@ -16,6 +17,7 @@ repository = "https://github.com/prismofeverything/parsimony"
 [workspace.dependencies]
 parsimony-spatial = { path = "crates/parsimony-spatial" }
 parsimony-core    = { path = "crates/parsimony-core" }
+parsimony-gpu     = { path = "crates/parsimony-gpu" }
 parsimony-cli     = { path = "crates/parsimony-cli" }
 parsimony-bench   = { path = "crates/parsimony-bench" }
 
@@ -38,3 +40,5 @@ indexmap = { version = "2", features = ["serde"] }
 ordered-float = { version = "4", features = ["serde"] }
 wide = "0.7"
 tempfile = "3"
+wgpu = "23"
+bytemuck = { version = "1.16", features = ["derive"] }

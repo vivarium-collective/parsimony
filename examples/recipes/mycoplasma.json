@@ -1,0 +1,1521 @@
+{
+  "name": "mycoplasma_genitalium",
+  "version": "0.1.0",
+  "format_version": "2.1-parsimony",
+  "description": "Mycoplasma genitalium recipe translated from ccsb-scripps/MycoplasmaGenitalium (Maritan et al., JMB 2022). 29 interior + 19 surface species. Each protein ingredient is a Van der Waals surface mesh built from the corresponding PDB/CIF by scripts/translate_mycoplasma.py. The cell is approximated as a 2000 \u00c5 sphere compartment with surface lipid placements as a synthetic bilayer.",
+  "bounding_box": [
+    [
+      -2050.0,
+      -2050.0,
+      -2050.0
+    ],
+    [
+      2050.0,
+      2050.0,
+      2050.0
+    ]
+  ],
+  "objects": {
+    "tRNA-aminoacylated": {
+      "type": "mesh",
+      "color": [
+        0.85,
+        0.35,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA-aminoacylated.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA-aminoacylated.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA-aminoacylated.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA-aminoacylated.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_270_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.62,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_270_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_270_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_270_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_270_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_271_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_271_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_271_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_271_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_271_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "tRNA": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/tRNA.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_009_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.85,
+        0.65
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_009_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_009_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_009_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_009_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_007_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.75,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_007_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_007_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_007_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_007_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_008_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.55,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_008_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_008_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_008_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_008_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_275_TETRAMER": {
+      "type": "mesh",
+      "color": [
+        0.8,
+        0.55,
+        0.85
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_275_TETRAMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_275_TETRAMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_275_TETRAMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_275_TETRAMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_024_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.55,
+        0.75
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_024_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_024_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_024_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_024_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_450_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.75,
+        0.55,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_450_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_450_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_450_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_450_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_258_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.85,
+        0.35,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_258_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_258_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_258_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_258_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_233_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.62,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_233_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_233_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_233_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_233_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_373_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_373_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_373_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_373_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_373_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_324_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_324_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_324_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_324_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_324_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_235_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.85,
+        0.65
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_235_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_235_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_235_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_235_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_374_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.55,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_374_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_374_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_374_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_374_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_236_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.8,
+        0.55,
+        0.85
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_236_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_236_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_236_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_236_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_022_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.55,
+        0.75
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_022_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_022_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_022_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_022_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_088_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.75,
+        0.55,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_088_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_088_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_088_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_088_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_196_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.85,
+        0.35,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_196_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_196_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_196_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_196_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_424_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.62,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_424_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_424_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_424_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_424_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_151_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_151_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_151_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_151_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_151_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_087_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_087_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_087_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_087_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_087_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_090_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.85,
+        0.65
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_090_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_090_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_090_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_090_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_093_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.75,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_093_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_093_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_093_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_093_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_481_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.55,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_481_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_481_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_481_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_481_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_006_DIMER": {
+      "type": "mesh",
+      "color": [
+        0.8,
+        0.55,
+        0.85
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_006_DIMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_006_DIMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_006_DIMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_006_DIMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_150_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.55,
+        0.75
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_150_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_150_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_150_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_150_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_005_DIMER": {
+      "type": "mesh",
+      "color": [
+        0.75,
+        0.55,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_005_DIMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_005_DIMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_005_DIMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_005_DIMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_086_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.75,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_086_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_086_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_086_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_086_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_095_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.55,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_095_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_095_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_095_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_095_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_028_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.62,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_028_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_028_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_028_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_028_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_405_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_405_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_405_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_405_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_405_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_403_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.85,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_403_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_403_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_403_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_403_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_294_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.85,
+        0.65
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_294_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_294_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_294_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_294_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_267_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.75,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_267_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_267_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_267_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_267_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_452_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.55,
+        0.55,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_452_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_452_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_452_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_452_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_457_HEXAMER": {
+      "type": "mesh",
+      "color": [
+        0.8,
+        0.55,
+        0.85
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_457_HEXAMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_457_HEXAMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_457_HEXAMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_457_HEXAMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_130_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.55,
+        0.75
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_130_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_130_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_130_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_130_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_212_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.75,
+        0.55,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_212_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_212_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_212_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_212_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_331_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.85,
+        0.35,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_331_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_331_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_331_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_331_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_281_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.62,
+        0.35
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_281_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_281_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_281_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_281_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_524_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.85,
+        0.65
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_524_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_524_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_524_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_524_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_279_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.45,
+        0.75,
+        0.95
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_279_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_279_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_279_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_279_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_348_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.8,
+        0.55,
+        0.85
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_348_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_348_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_348_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_348_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_316_DIMER": {
+      "type": "mesh",
+      "color": [
+        0.95,
+        0.55,
+        0.75
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_316_DIMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_316_DIMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_316_DIMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_316_DIMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "MG_404_MONOMER": {
+      "type": "mesh",
+      "color": [
+        0.75,
+        0.55,
+        0.45
+      ],
+      "proxy_voxel_size": 6.25,
+      "mesh_lods": [
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_404_MONOMER.lod0.obj",
+          "voxel_size": 16.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_404_MONOMER.lod1.obj",
+          "voxel_size": 8.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_404_MONOMER.lod2.obj",
+          "voxel_size": 4.0
+        },
+        {
+          "path": "../pdb_meshes/mycoplasma/MG_404_MONOMER.lod3.obj",
+          "voxel_size": 2.5
+        }
+      ]
+    },
+    "lipid_head": {
+      "type": "single_sphere",
+      "color": [
+        0.96,
+        0.86,
+        0.55
+      ],
+      "radius": 5.0,
+      "principal_vector": [
+        0,
+        0,
+        1
+      ]
+    }
+  },
+  "composition": {
+    "space": {
+      "regions": {
+        "interior": [
+          "cell"
+        ]
+      }
+    },
+    "cell": {
+      "compartment": {
+        "kind": "sphere",
+        "center": [
+          0,
+          0,
+          0
+        ],
+        "radius": 2000.0
+      },
+      "regions": {
+        "interior": [
+          {
+            "object": "tRNA-aminoacylated",
+            "count": 1151
+          },
+          {
+            "object": "MG_270_MONOMER",
+            "count": 751
+          },
+          {
+            "object": "MG_271_MONOMER",
+            "count": 631
+          },
+          {
+            "object": "tRNA",
+            "count": 502
+          },
+          {
+            "object": "MG_009_MONOMER",
+            "count": 324
+          },
+          {
+            "object": "MG_007_MONOMER",
+            "count": 320
+          },
+          {
+            "object": "MG_008_MONOMER",
+            "count": 297
+          },
+          {
+            "object": "MG_275_TETRAMER",
+            "count": 284
+          },
+          {
+            "object": "MG_024_MONOMER",
+            "count": 256
+          },
+          {
+            "object": "MG_450_MONOMER",
+            "count": 237
+          },
+          {
+            "object": "MG_258_MONOMER",
+            "count": 232
+          },
+          {
+            "object": "MG_233_MONOMER",
+            "count": 222
+          },
+          {
+            "object": "MG_373_MONOMER",
+            "count": 221
+          },
+          {
+            "object": "MG_324_MONOMER",
+            "count": 218
+          },
+          {
+            "object": "MG_235_MONOMER",
+            "count": 211
+          },
+          {
+            "object": "MG_374_MONOMER",
+            "count": 205
+          },
+          {
+            "object": "MG_236_MONOMER",
+            "count": 204
+          },
+          {
+            "object": "MG_022_MONOMER",
+            "count": 197
+          },
+          {
+            "object": "MG_088_MONOMER",
+            "count": 190
+          },
+          {
+            "object": "MG_196_MONOMER",
+            "count": 188
+          },
+          {
+            "object": "MG_424_MONOMER",
+            "count": 187
+          },
+          {
+            "object": "MG_151_MONOMER",
+            "count": 182
+          },
+          {
+            "object": "MG_087_MONOMER",
+            "count": 170
+          },
+          {
+            "object": "MG_090_MONOMER",
+            "count": 169
+          },
+          {
+            "object": "MG_093_MONOMER",
+            "count": 167
+          },
+          {
+            "object": "MG_481_MONOMER",
+            "count": 167
+          },
+          {
+            "object": "MG_006_DIMER",
+            "count": 161
+          },
+          {
+            "object": "MG_150_MONOMER",
+            "count": 160
+          },
+          {
+            "object": "MG_005_DIMER",
+            "count": 160
+          }
+        ],
+        "surface": [
+          {
+            "object": "MG_086_MONOMER",
+            "count": 374
+          },
+          {
+            "object": "MG_095_MONOMER",
+            "count": 366
+          },
+          {
+            "object": "MG_028_MONOMER",
+            "count": 167
+          },
+          {
+            "object": "MG_405_MONOMER",
+            "count": 152
+          },
+          {
+            "object": "MG_403_MONOMER",
+            "count": 125
+          },
+          {
+            "object": "MG_294_MONOMER",
+            "count": 124
+          },
+          {
+            "object": "MG_267_MONOMER",
+            "count": 92
+          },
+          {
+            "object": "MG_452_MONOMER",
+            "count": 83
+          },
+          {
+            "object": "MG_457_HEXAMER",
+            "count": 77
+          },
+          {
+            "object": "MG_130_MONOMER",
+            "count": 54
+          },
+          {
+            "object": "MG_212_MONOMER",
+            "count": 52
+          },
+          {
+            "object": "MG_331_MONOMER",
+            "count": 48
+          },
+          {
+            "object": "MG_281_MONOMER",
+            "count": 46
+          },
+          {
+            "object": "MG_524_MONOMER",
+            "count": 42
+          },
+          {
+            "object": "MG_279_MONOMER",
+            "count": 40
+          },
+          {
+            "object": "MG_348_MONOMER",
+            "count": 37
+          },
+          {
+            "object": "MG_316_DIMER",
+            "count": 35
+          },
+          {
+            "object": "MG_404_MONOMER",
+            "count": 35
+          },
+          {
+            "object": "lipid_head",
+            "count": 8000
+          }
+        ]
+      }
+    }
+  }
+}

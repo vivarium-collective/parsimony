@@ -55,10 +55,31 @@ impl IngredientShape {
     pub fn enclosing_radius(&self) -> f32 {
         match self {
             IngredientShape::SingleSphere { radius } => *radius,
-            IngredientShape::MultiSphere { spheres } | IngredientShape::Mesh { proxies: spheres, .. } => spheres
+            IngredientShape::MultiSphere { spheres } => spheres
                 .iter()
                 .map(|s| s.offset.norm() + s.radius)
                 .fold(0.0_f32, f32::max),
+            IngredientShape::Mesh { proxies, trimesh } => {
+                // Use the max of (proxy bounding-sphere) and (vertex
+                // bounding-sphere). Proxies undershoot the actual
+                // mesh in two failure modes: (a) empty when the
+                // marching-cubes surface doesn't enclose interior
+                // voxels (open / thin meshes), and (b) too-small
+                // when the proxy voxelization only captures a
+                // sub-region of an elongated molecule. The vertex
+                // bounding sphere is correct in both cases — it's
+                // derived from the rendered geometry itself.
+                let from_proxies = proxies
+                    .iter()
+                    .map(|s| s.offset.norm() + s.radius)
+                    .fold(0.0_f32, f32::max);
+                let from_vertices = trimesh
+                    .vertices()
+                    .iter()
+                    .map(|v| v.coords.norm())
+                    .fold(0.0_f32, f32::max);
+                from_proxies.max(from_vertices)
+            }
         }
     }
 
@@ -176,6 +197,16 @@ pub struct CylinderSegment {
     pub radius: f32,
 }
 
+/// One level of detail for a mesh ingredient. `voxel_size` is the
+/// nominal world-units resolution the LOD was generated at; the
+/// viewer uses it to pick which LOD to fetch given a screen-space
+/// pixel budget. Ordered coarse → fine in `Ingredient::mesh_lods`.
+#[derive(Debug, Clone)]
+pub struct MeshLod {
+    pub url: String,
+    pub voxel_size: f32,
+}
+
 /// An ingredient species.
 #[derive(Debug, Clone)]
 pub struct Ingredient {
@@ -190,6 +221,11 @@ pub struct Ingredient {
     /// the surface normal when this ingredient is placed in a Surface
     /// region. Default `(0, 0, 1)`. cellPACK convention.
     pub principal_vector: Vector3<f32>,
+    /// For `IngredientShape::Mesh` ingredients: the LOD pyramid
+    /// (sorted coarse → fine) that downstream renderers can fetch.
+    /// Empty for non-mesh shapes. A single-LOD recipe lands here as
+    /// a one-element vec.
+    pub mesh_lods: Vec<MeshLod>,
 }
 
 /// Sphere-tree generators for analytical shape primitives + a mesh

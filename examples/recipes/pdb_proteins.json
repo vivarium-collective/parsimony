@@ -1,0 +1,34 @@
+{
+    "name": "pdb_proteins",
+    "version": "0.1.0",
+    "format_version": "2.1-parsimony",
+    "description": "Demonstrates parsimony's mesh-ingredient pipeline end-to-end with real protein structures. Meshes are Van der Waals surfaces generated from RCSB PDBs by scripts/pdb_to_mesh.py: 1AKI is hen egg-white lysozyme (small enzyme, ~45 Å), 1AON is GroEL, the bacterial 14-subunit chaperonin (large hollow barrel, ~200 Å). Box is 600 Å, mixing dozens of small enzymes with a handful of big chaperones.",
+    "bounding_box": [
+        [-300, -300, -300],
+        [300, 300, 300]
+    ],
+    "objects": {
+        "lysozyme": {
+            "type": "mesh",
+            "color": [0.95, 0.75, 0.35],
+            "mesh_path": "../pdb_meshes/1aki.obj",
+            "proxy_voxel_size": 4.0
+        },
+        "groel": {
+            "type": "mesh",
+            "color": [0.45, 0.75, 0.95],
+            "mesh_path": "../pdb_meshes/1aon_groel.obj",
+            "proxy_voxel_size": 12.0
+        }
+    },
+    "composition": {
+        "space": {
+            "regions": {
+                "interior": [
+                    { "object": "groel",    "count": 8 },
+                    { "object": "lysozyme", "count": 200 }
+                ]
+            }
+        }
+    }
+}

@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use parsimony_core::{
-    write_simularium_json, write_transforms_json, GreedyRandomPlacer, PlacerConfig, Recipe,
+    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
+    PlacerConfig, Recipe,
 };
 
 #[derive(Debug, Parser)]
@@ -65,7 +66,14 @@ struct PackArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Format {
+    /// parsimony's native pack format (parsimony.pack.v1). This is
+    /// what the local three.js viewer consumes; new rendering
+    /// features land here first. Default for .pack / .json output.
+    Pack,
+    /// Optional Simularium export for the cellpack.allencell.org
+    /// viewer. Lossy by construction (sphere-only).
     Simularium,
+    /// Legacy flat transform list. Stable, debug-friendly.
     Transforms,
 }
 
@@ -130,6 +138,7 @@ fn run_pack(args: PackArgs) -> Result<()> {
 
     let format = resolve_format(&args);
     let json = match format {
+        Format::Pack => write_pack_json(&out.snapshot, &recipe),
         Format::Simularium => write_simularium_json(&out.snapshot, &recipe),
         Format::Transforms => write_transforms_json(&out.snapshot, &recipe),
     };
@@ -143,6 +152,7 @@ fn run_pack(args: PackArgs) -> Result<()> {
             args.out.display(),
             pretty.len(),
             match format {
+                Format::Pack => "parsimony.pack.v1",
                 Format::Simularium => "Simularium",
                 Format::Transforms => "transform-list",
             }
@@ -157,6 +167,8 @@ fn resolve_format(args: &PackArgs) -> Format {
     }
     match args.out.extension().and_then(|s| s.to_str()) {
         Some("simularium") => Format::Simularium,
-        _ => Format::Transforms,
+        // Everything else (incl. .pack, .json, no extension) →
+        // parsimony's native format. The viewer expects this.
+        _ => Format::Pack,
     }
 }

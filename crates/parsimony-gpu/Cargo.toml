@@ -1,0 +1,19 @@
+[package]
+name = "parsimony-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU acceleration for parsimony's clearance-grid update and collision queries"
+
+[dependencies]
+parsimony-spatial = { workspace = true }
+parsimony-core = { workspace = true }
+nalgebra = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = "0.4"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
