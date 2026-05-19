@@ -4,6 +4,7 @@
 //! See `docs/parsimony-design.md` §§ 5, 7, 8, 9, 10 for the design.
 
 pub mod compartment;
+pub(crate) mod clearance_grid;
 pub mod ingredient;
 pub mod output;
 pub mod placement;

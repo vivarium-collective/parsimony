@@ -36,6 +36,15 @@ struct Args {
     /// Skip cellpack — only run parsimony and report its numbers.
     #[arg(long)]
     skip_cellpack: bool,
+
+    /// Tell parsimony to use strict bounding-box containment (sphere
+    /// fully inside). The default for the comparison is loose mode
+    /// (cellPACK's semantics — sphere centre inside, may protrude),
+    /// since otherwise we'd be comparing two different physical
+    /// constraints. Pass this flag if you want to highlight that
+    /// difference.
+    #[arg(long)]
+    strict_bounds: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +53,7 @@ fn main() -> Result<()> {
     // Run parsimony first (it's fast).
     let psy_cfg = ParsimonyConfig {
         seed: args.seed,
+        loose_bounds: !args.strict_bounds,
         ..Default::default()
     };
     eprintln!("running parsimony…");

@@ -54,6 +54,13 @@ struct PackArgs {
     /// Quiet — suppress per-ingredient stats.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Use cellPACK-style loose root containment — centre inside the
+    /// bounding box, sphere may protrude at the edge. Off by default
+    /// (parsimony requires the whole sphere inside the box). Named
+    /// compartments are always strict regardless of this flag.
+    #[arg(long)]
+    loose_bounds: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -90,8 +97,12 @@ fn run_pack(args: PackArgs) -> Result<()> {
         );
     }
 
+    let placer_config = PlacerConfig {
+        strict_bounds: !args.loose_bounds,
+        ..PlacerConfig::default()
+    };
     let t = Instant::now();
-    let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+    let placer = GreedyRandomPlacer::new(&recipe, placer_config);
     let out = placer.pack(args.seed);
     let elapsed = t.elapsed();
 

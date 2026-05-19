@@ -1,25 +1,37 @@
-//! Greedy random placer. For each placement directive, attempt up to
-//! `jitter_attempts` random points in the target compartment and
-//! place the instance if there's no collision with already-packed
-//! instances. The original cellPACK algorithm, simplified.
+//! Greedy random placer. For each placement directive, pick a candidate
+//! point and attempt to place an instance there if no collision; repeat
+//! until every directive is either done or stuck.
 //!
-//! Collision is sphere-vs-sphere: the QBVH broad-phase narrows
-//! candidates by AABB, and we tighten with the exact sphere distance
-//! test. Phase 2 MVP supports only `SingleSphere` ingredients; once
-//! sphere-tree representations land we'll swap in proper tree-vs-tree
-//! collision behind the same outer loop.
+//! cellPACK's algorithm, simplified along three axes:
+//!
+//! - **Per-directive valid-cell lists.** Each Interior directive owns
+//!   a `Vec<u32>` of grid-cell indices where this ingredient's
+//!   enclosing radius currently fits (cell clearance ≥ required, cell
+//!   centre fits the compartment, not inside a child compartment).
+//!   Sampling picks a random index from this list; stale entries (cells
+//!   whose clearance dropped since the last rebuild) get swap-removed.
+//!   When the list empties and rebuilding doesn't refill it, the
+//!   directive is stuck. This is cellPACK's `allIngrPts` mechanism.
+//!
+//! - **Sphere-tree collision** via QBVH broad-phase plus exact
+//!   centre-distance vs sum-of-radii in the inner loop. Multi-sphere
+//!   ingredients (ribosomes, etc.) carry every proxy sphere through.
+//!
+//! - **Surface placement** falls back to uniform-random sampling on
+//!   the compartment boundary, since cells on a 2D manifold don't map
+//!   well onto a 3D clearance grid. A small consecutive-rejection
+//!   counter detects when the surface is full.
 
 use indexmap::IndexMap;
 use nalgebra::{Point3, Quaternion, UnitQuaternion};
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use parsimony_spatial::{
-    Aabb, Cell, CellCoord, QbvhIndex, Sphere, SpatialIndex, VoxelField, OCCUPIED as VOXEL_OCCUPIED,
-};
+use parsimony_spatial::{Aabb, QbvhIndex, Sphere, SpatialIndex};
 
-use crate::compartment::align_to_normal;
-use crate::ingredient::IngredientShape;
+use crate::clearance_grid::ClearanceGrid;
+use crate::compartment::{Compartment, align_to_normal};
+use crate::ingredient::{Ingredient, IngredientShape};
 use crate::placement::{Placement, Snapshot};
 use crate::recipe::{PlacementDirective, Recipe, RegionKind};
 
@@ -35,6 +47,12 @@ fn random_rotation<R: Rng>(rng: &mut R) -> UnitQuaternion<f32> {
     UnitQuaternion::new_normalize(q)
 }
 
+/// Cap on consecutive surface-placement rejections before a Surface
+/// directive is declared stuck. Surface placements use uniform random
+/// sampling on the compartment boundary (no per-cell filtering), so the
+/// cap needs to be generous enough to survive transient crowding.
+const SURFACE_REJECTION_CAP: u32 = 500;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PlacerConfig {
     /// Hard cap on per-instance placement attempts; overrides the
@@ -42,17 +60,19 @@ pub struct PlacerConfig {
     pub max_attempts_per_instance: u32,
     /// Default `jitter_attempts` for ingredients that don't specify one.
     pub default_jitter_attempts: u32,
-    /// Use the [`VoxelField`](parsimony_spatial::VoxelField) for a fast
-    /// broad-phase rejection step before the (more expensive) sphere-
-    /// tree collision test. The voxel field tracks occupied AABBs at a
-    /// coarse resolution; if `is_region_free` says the candidate's
-    /// AABB is already touching marked cells, skip the QBVH query.
-    pub use_voxel_assist: bool,
-    /// Cell size of the voxel-assist field, in world units. `None`
-    /// means autodetect from the recipe (smallest ingredient radius
-    /// divided by 2, clamped to at least 1.0). Smaller cells give
-    /// tighter rejection but cost more memory and update time.
-    pub voxel_cell_size: Option<f32>,
+    /// Override for the clearance-grid cell size, in world units.
+    /// `None` means autodetect from the recipe (largest ingredient
+    /// radius divided by 8, clamped to ≥ 0.5).
+    pub clearance_cell_size: Option<f32>,
+    /// Whether the root compartment (the simulation bounding box) is
+    /// a physical container that fully encloses every placement.
+    /// Defaults to `true` (biology-correct: spheres entirely inside
+    /// the box). Set to `false` for cellPACK-style "centre inside
+    /// box, sphere may protrude at the edge" — used by the
+    /// compare-with-cellpack bench so the apples-to-apples density
+    /// match is recoverable. Named compartments (capsule, sphere,
+    /// mesh) are always strict regardless of this flag.
+    pub strict_bounds: bool,
 }
 
 impl Default for PlacerConfig {
@@ -60,8 +80,8 @@ impl Default for PlacerConfig {
         Self {
             max_attempts_per_instance: 200,
             default_jitter_attempts: 20,
-            use_voxel_assist: true,
-            voxel_cell_size: None,
+            clearance_cell_size: None,
+            strict_bounds: true,
         }
     }
 }
@@ -136,79 +156,48 @@ impl<'a> GreedyRandomPlacer<'a> {
         let mut next_uid: u64 = 0;
         let mut stats = PlacerStats::default();
 
-        // Voxel-assist field: a coarse occupancy grid we mark on each
-        // placement. Used as a fast `is_region_free` pre-check before
-        // the (more expensive) QBVH sphere-tree query. cellPACK does
-        // an equivalent thing with its `distToClosestSurf` grid — we
-        // get the same hot-path speedup, which lets us afford many
-        // more attempts per big-sphere placement and significantly
-        // narrows the dense-recipe gap.
-        let voxel_cell_size = self.config.voxel_cell_size.unwrap_or_else(|| {
-            let min_r = self
-                .recipe
-                .ingredients
-                .values()
-                .map(|i| i.shape.enclosing_radius())
-                .fold(f32::INFINITY, f32::min);
-            (min_r * 0.5).max(1.0)
+        let max_required_radius = self
+            .recipe
+            .ingredients
+            .values()
+            .map(|i| i.shape.enclosing_radius())
+            .fold(0.0_f32, f32::max);
+        let cell_size = self.config.clearance_cell_size.unwrap_or_else(|| {
+            // Cell size = max ingredient radius / 8. Smallest ingredient
+            // sees ~1 cell of clearance, biggest ~8 — enough resolution
+            // to filter candidates by size. `ClearanceGrid::new` will
+            // raise this if needed to keep memory bounded.
+            (max_required_radius / 8.0).max(0.5)
         });
-        let mut voxel: Option<VoxelField> = if self.config.use_voxel_assist {
-            Some(VoxelField::new(voxel_cell_size))
-        } else {
-            None
-        };
-        let voxel_mark = Cell::new(0, VOXEL_OCCUPIED, 0);
+        let mut clearance = ClearanceGrid::new(self.recipe.bounding_box, cell_size);
 
-        // Stochastic interleaved placement, matching cellPACK's
-        // `pickIngredient`: at each step pick a directive weighted by
-        // remaining count. Big ingredients keep getting attempts
-        // throughout the run while space is gradually filling, instead
-        // of getting drained first or last. Significantly closer to
-        // cellPACK's output on dense recipes.
         let directives: Vec<&PlacementDirective> = self.recipe.directives.iter().collect();
         let mut remaining: Vec<u32> = directives.iter().map(|d| d.count).collect();
-        let mut consecutive_rejections: Vec<u32> = vec![0; directives.len()];
         let mut per_ingredient_attempts: Vec<u64> = vec![0; directives.len()];
         let mut per_ingredient_placed: Vec<usize> = vec![0; directives.len()];
+        let mut surface_rejections: Vec<u32> = vec![0; directives.len()];
+        let mut stuck: Vec<bool> = vec![false; directives.len()];
         let total_requested: u32 = remaining.iter().sum();
         stats.requested = total_requested as usize;
 
-        // Cap on consecutive rejections per directive before we declare
-        // it stuck. Counter resets on every successful placement, so a
-        // directive with `N` instances effectively gets up to `N * cap`
-        // attempts at sparse success rates. With voxel-assist the
-        // per-attempt cost is small (one `is_region_free` query, O(8
-        // tiles) for typical ingredient sizes), so we can afford big
-        // numbers here.
-        let has_voxel = voxel.is_some();
-        let rejection_threshold = |dir_idx: usize| -> u32 {
-            let ingredient = self
-                .recipe
-                .ingredients
-                .get(&directives[dir_idx].ingredient)
-                .expect("known ingredient");
-            let base = ingredient
-                .jitter_attempts
-                .max(self.config.default_jitter_attempts)
-                .min(self.config.max_attempts_per_instance);
-            if has_voxel {
-                base.saturating_mul(1_000)
-            } else {
-                base.saturating_mul(50)
-            }
-        };
+        // Per-directive valid-cell lists (cellPACK's `allIngrPts`).
+        // Initial pass: scan the compartment AABB and keep cells where
+        // the ingredient's enclosing sphere fits with `radius`
+        // clearance from every forbidden surface. Empty for Surface
+        // directives.
+        let mut valid_cells: Vec<Vec<u32>> = directives
+            .iter()
+            .map(|d| self.build_valid_cells(d, &clearance))
+            .collect();
 
         loop {
-            // cellPACK's default `pickIngredient`: uniform random pick
-            // over directives that still have something to place (and
-            // haven't hit their rejection threshold). This gives big
-            // ingredients a fair share of attempts throughout the run
-            // — weighting by remaining count would bias toward
-            // high-count small ingredients and starve the big ones.
+            // Uniform-random pick over live directives — matches
+            // cellPACK's default `pickIngredient`. Weighting by count
+            // would starve big ingredients of attempts while filling
+            // with abundant small ones; uniform gives every ingredient
+            // a fair share throughout the run.
             let live: Vec<usize> = (0..directives.len())
-                .filter(|&i| {
-                    remaining[i] > 0 && consecutive_rejections[i] < rejection_threshold(i)
-                })
+                .filter(|&i| remaining[i] > 0 && !stuck[i])
                 .collect();
             if live.is_empty() {
                 break;
@@ -223,22 +212,43 @@ impl<'a> GreedyRandomPlacer<'a> {
             per_ingredient_attempts[dir_idx] += 1;
             stats.total_attempts += 1;
 
-            // Sample position and rotation depending on the directive's
-            // region. Interior: uniform sample in the compartment
-            // (rejecting points inside child compartments); rotation
-            // is random for multi-sphere ingredients. Surface: sample
-            // on the compartment's boundary; rotation aligns the
-            // ingredient's `principal_vector` with the outward normal.
             let (pos, rotation) = match directive.region {
                 RegionKind::Interior => {
-                    let Some(pos) = sample_interior_excluding_children(
+                    let children_of_compartment: Vec<&Compartment> = compartment
+                        .children
+                        .iter()
+                        .filter_map(|&id| {
+                            self.recipe.compartments.get_index(id as usize).map(|(_, c)| c)
+                        })
+                        .collect();
+                    let mut pos = sample_from_valid_cells(
+                        &mut valid_cells[dir_idx],
+                        &clearance,
                         compartment,
-                        &self.recipe.compartments,
+                        &children_of_compartment,
                         enclosing_radius,
+                        self.config.strict_bounds,
                         &mut rng,
-                        16,
-                    ) else {
-                        consecutive_rejections[dir_idx] = rejection_threshold(dir_idx);
+                    );
+                    if pos.is_none() {
+                        // List empty: rebuild once before giving up.
+                        // Lazy stale-removal during sampling keeps the
+                        // list pruned across placements, but on
+                        // emptiness we do a full pass — catches cells
+                        // we never sampled directly.
+                        valid_cells[dir_idx] = self.build_valid_cells(directive, &clearance);
+                        pos = sample_from_valid_cells(
+                            &mut valid_cells[dir_idx],
+                            &clearance,
+                            compartment,
+                            &children_of_compartment,
+                            enclosing_radius,
+                            self.config.strict_bounds,
+                            &mut rng,
+                        );
+                    }
+                    let Some(pos) = pos else {
+                        stuck[dir_idx] = true;
                         continue;
                     };
                     let rot = if ingredient.shape.needs_rotation() {
@@ -255,46 +265,45 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
             };
 
-            let candidate_aabb = Aabb::from_sphere(pos, enclosing_radius);
-
-            // Voxel pre-check: marks union of placed spheres; if any
-            // cell in the candidate's AABB is OCCUPIED, skip.
-            if let Some(vf) = &voxel
-                && !vf.is_region_free(candidate_aabb)
+            // Surface placements don't go through the clearance grid,
+            // so we still need a strict QBVH collision check for
+            // those. Interior placements were picked from a cell whose
+            // clearance ≥ radius and jittered within the cell's
+            // slack — the grid + slack-bounded jitter mathematically
+            // guarantee no overlap, so we skip the QBVH check.
+            if matches!(directive.region, RegionKind::Surface)
+                && self.collides_with_existing(
+                    &ingredient.shape,
+                    pos,
+                    rotation,
+                    &index,
+                    &shapes_by_uid,
+                    &centers_by_uid,
+                    &rotations_by_uid,
+                )
             {
-                consecutive_rejections[dir_idx] =
-                    consecutive_rejections[dir_idx].saturating_add(1);
-                continue;
-            }
-
-            // Precise sphere-tree collision check (handles multi-sphere).
-            if self.collides_with_existing(
-                &ingredient.shape,
-                pos,
-                rotation,
-                &index,
-                &shapes_by_uid,
-                &centers_by_uid,
-                &rotations_by_uid,
-            ) {
-                consecutive_rejections[dir_idx] = consecutive_rejections[dir_idx].saturating_add(1);
+                surface_rejections[dir_idx] = surface_rejections[dir_idx].saturating_add(1);
+                if surface_rejections[dir_idx] >= SURFACE_REJECTION_CAP {
+                    stuck[dir_idx] = true;
+                }
                 continue;
             }
 
             // Place it.
             let uid = next_uid;
             next_uid += 1;
-            let aabb = candidate_aabb;
-            index.insert(uid, aabb).expect("uid collision");
+            let candidate_aabb = Aabb::from_sphere(pos, enclosing_radius);
+            index.insert(uid, candidate_aabb).expect("uid collision");
             shapes_by_uid.push(&ingredient.shape);
             centers_by_uid.push(pos);
             rotations_by_uid.push(rotation);
 
-            if let Some(vf) = &mut voxel {
-                // Mark every proxy sphere of the placed ingredient.
-                for (c, r) in ingredient.shape.world_spheres(pos, rotation) {
-                    mark_sphere_cells(vf, c, r, voxel_mark);
-                }
+            // One pass marks both occupancy (clearance = 0 inside each
+            // sphere) and distance for cells in range. Every proxy
+            // sphere of the placed ingredient gets its own update so
+            // multi-sphere ingredients are tracked accurately.
+            for (c, r) in ingredient.shape.world_spheres(pos, rotation) {
+                clearance.update_for_placement(c, r, max_required_radius);
             }
             snapshot.placements.push(Placement {
                 instance_uid: uid,
@@ -305,7 +314,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                 rotation,
             });
             remaining[dir_idx] -= 1;
-            consecutive_rejections[dir_idx] = 0;
+            surface_rejections[dir_idx] = 0;
             per_ingredient_placed[dir_idx] += 1;
             stats.placed += 1;
             stats.successful_attempts += 1;
@@ -326,7 +335,7 @@ impl<'a> GreedyRandomPlacer<'a> {
     /// QBVH broad-phase narrows to candidates whose enclosing spheres
     /// could overlap; inside, we walk every proxy-sphere pair across
     /// the candidate and the hit instance and reject on any
-    /// center-distance <= sum-of-radii.
+    /// centre-distance ≤ sum-of-radii.
     #[allow(clippy::too_many_arguments)]
     fn collides_with_existing(
         &self,
@@ -358,13 +367,11 @@ impl<'a> GreedyRandomPlacer<'a> {
             let other_shape = shapes[other_idx];
             let other_center = centers[other_idx];
             let other_rotation = rotations[other_idx];
-            // Fast outer cull: enclosing-sphere distance check.
             let outer_d2 = (candidate_pos - other_center).norm_squared();
             let outer_r = candidate_r + other_shape.enclosing_radius();
             if outer_d2 > outer_r * outer_r {
                 return;
             }
-            // Tree-vs-tree.
             for (oc, or_) in other_shape.world_spheres(other_center, other_rotation) {
                 for (cc, cr) in &candidate_spheres {
                     let dx = cc.x - oc.x;
@@ -381,62 +388,176 @@ impl<'a> GreedyRandomPlacer<'a> {
         });
         collision
     }
+
+    /// Build the valid-cell list for one directive: every grid cell
+    /// inside the compartment's AABB (inset by the ingredient radius)
+    /// whose stored clearance is at least the required cell count AND
+    /// whose centre passes the compartment's shape-fit test AND isn't
+    /// inside a child compartment. Empty for Surface directives.
+    fn build_valid_cells(
+        &self,
+        directive: &PlacementDirective,
+        grid: &ClearanceGrid,
+    ) -> Vec<u32> {
+        if matches!(directive.region, RegionKind::Surface) {
+            return Vec::new();
+        }
+        let ingredient = self.recipe.ingredients.get(&directive.ingredient).unwrap();
+        let compartment = self.recipe.compartments.get(&directive.compartment).unwrap();
+        build_valid_cells_for(
+            grid,
+            ingredient,
+            compartment,
+            &self.recipe.compartments,
+            self.config.strict_bounds,
+        )
+    }
 }
 
-/// Sample a point inside `compartment` that's *not* inside any of its
-/// child compartments. Up to `attempts` retries; returns `None` if all
-/// samples landed inside children (or the compartment is too small for
-/// the required clearance).
-fn sample_interior_excluding_children<R: Rng>(
-    compartment: &crate::compartment::Compartment,
-    all_compartments: &IndexMap<String, crate::compartment::Compartment>,
-    radius: f32,
-    rng: &mut R,
-    attempts: usize,
-) -> Option<Point3<f32>> {
-    if compartment.children.is_empty() {
-        return compartment.kind.sample_interior_for_sphere(radius, rng);
+/// Build the valid-cell list for one Interior directive. A cell is
+/// kept iff its centre has at least `radius` clearance to every
+/// existing sphere surface (the grid's stored f32 value), at least
+/// `compartment_cutoff` signed distance into its host compartment,
+/// and at least `radius` outside every child compartment. The
+/// `compartment_cutoff` differs between the root simulation domain
+/// (cellPACK-style loose semantics when `strict_bounds == false`:
+/// cutoff = 0, only the centre must be inside) and named compartments
+/// (always strict: cutoff = radius, full sphere fits). The grid is
+/// authoritative for the sphere-clearance check — sampling combined
+/// with slack-bounded jitter then keeps placements collision-free
+/// without a downstream QBVH check.
+fn build_valid_cells_for(
+    grid: &ClearanceGrid,
+    ingredient: &Ingredient,
+    compartment: &Compartment,
+    all_compartments: &IndexMap<String, Compartment>,
+    strict_bounds: bool,
+) -> Vec<u32> {
+    let radius = ingredient.shape.enclosing_radius();
+    let is_root_domain = compartment.parent.is_none();
+    let compartment_cutoff = if is_root_domain && !strict_bounds {
+        0.0
+    } else {
+        radius
+    };
+
+    let bb = compartment.kind.aabb();
+    let inset_min = Point3::new(
+        bb.min.x + compartment_cutoff,
+        bb.min.y + compartment_cutoff,
+        bb.min.z + compartment_cutoff,
+    );
+    let inset_max = Point3::new(
+        bb.max.x - compartment_cutoff,
+        bb.max.y - compartment_cutoff,
+        bb.max.z - compartment_cutoff,
+    );
+    let lo = grid.point_to_cell(inset_min);
+    let hi = grid.point_to_cell(inset_max);
+    let lo_x = lo[0].max(0);
+    let lo_y = lo[1].max(0);
+    let lo_z = lo[2].max(0);
+    let hi_x = hi[0].min(grid.dims[0] as i32 - 1);
+    let hi_y = hi[1].min(grid.dims[1] as i32 - 1);
+    let hi_z = hi[2].min(grid.dims[2] as i32 - 1);
+    if lo_x > hi_x || lo_y > hi_y || lo_z > hi_z {
+        return Vec::new();
     }
-    let child_compartments: Vec<&crate::compartment::Compartment> = compartment
+
+    let children: Vec<&Compartment> = compartment
         .children
         .iter()
         .filter_map(|&id| all_compartments.get_index(id as usize).map(|(_, c)| c))
         .collect();
-    for _ in 0..attempts {
-        let p = compartment.kind.sample_interior_for_sphere(radius, rng)?;
-        let inside_child = child_compartments.iter().any(|c| c.kind.contains(p));
-        if !inside_child {
-            return Some(p);
-        }
-    }
-    None
-}
 
-/// Mark cells inside a sphere (not its AABB) — only cells whose centres
-/// lie within `radius` of `center`. Avoids the 47% over-mark of the
-/// corner region you get from `mark_aabb`, which would otherwise
-/// produce false-positive rejections in the placer's pre-check.
-fn mark_sphere_cells(voxel: &mut VoxelField, center: Point3<f32>, radius: f32, mark: Cell) {
-    let aabb = Aabb::from_sphere(center, radius);
-    let (lo, hi) = voxel.aabb_to_cell_range(aabb);
-    if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
-        return;
-    }
-    let r2 = radius * radius;
-    for cz in lo.z..=hi.z {
-        for cy in lo.y..=hi.y {
-            for cx in lo.x..=hi.x {
-                let coord = CellCoord::new(cx, cy, cz);
-                let c = voxel.cell_center(coord);
-                let dx = c.x - center.x;
-                let dy = c.y - center.y;
-                let dz = c.z - center.z;
-                if dx * dx + dy * dy + dz * dz <= r2 {
-                    voxel.put(coord, mark);
+    let stride_y = grid.dims[0];
+    let stride_z = grid.dims[0] * grid.dims[1];
+    let mut list = Vec::new();
+    for cz in lo_z..=hi_z {
+        let row_base_z = cz as usize * stride_z;
+        for cy in lo_y..=hi_y {
+            let row_base = row_base_z + cy as usize * stride_y;
+            for cx in lo_x..=hi_x {
+                let i = row_base + cx as usize;
+                if grid.clearance[i] < radius {
+                    continue;
                 }
+                let centre = grid.cell_centre([cx, cy, cz]);
+                if compartment.kind.signed_distance(centre) < compartment_cutoff {
+                    continue;
+                }
+                // Cell must be outside every child by at least `radius`:
+                // `signed_distance` is positive inside, so `-sd >= radius`
+                // means "outside the child by ≥ radius".
+                if children
+                    .iter()
+                    .any(|c| -c.kind.signed_distance(centre) < radius)
+                {
+                    continue;
+                }
+                list.push(i as u32);
             }
         }
     }
+    list
+}
+
+/// Pick a random entry from a valid-cell list, return a sub-cell-
+/// jittered world point at that cell. Jitter is slack-bounded — its
+/// worst-case Euclidean displacement stays within the cell's smallest
+/// clearance margin (sphere surfaces, compartment boundary, child
+/// boundaries), so the jittered point is provably ≥ `radius` from
+/// every forbidden surface. That bound is what makes Interior
+/// placements collision-free without a downstream QBVH check. Stale
+/// entries (clearance dropped below `radius` since the list was
+/// built) get popped lazily. Returns `None` only when the list is
+/// empty.
+fn sample_from_valid_cells<R: Rng>(
+    list: &mut Vec<u32>,
+    grid: &ClearanceGrid,
+    compartment: &Compartment,
+    children: &[&Compartment],
+    radius: f32,
+    strict_bounds: bool,
+    rng: &mut R,
+) -> Option<Point3<f32>> {
+    let half = grid.cell_size * 0.5;
+    let inv_sqrt_3 = 0.577_350_26_f32;
+    let is_root_domain = compartment.parent.is_none();
+    let compartment_cutoff = if is_root_domain && !strict_bounds {
+        0.0
+    } else {
+        radius
+    };
+    while !list.is_empty() {
+        let idx_in_list = rng.gen_range(0..list.len());
+        let cell_idx = list[idx_in_list];
+        let cell_clearance = grid.clearance[cell_idx as usize];
+        if cell_clearance < radius {
+            list.swap_remove(idx_in_list);
+            continue;
+        }
+        let centre = grid.cell_centre_flat(cell_idx);
+        let sphere_slack = cell_clearance - radius;
+        let compartment_slack = compartment.kind.signed_distance(centre) - compartment_cutoff;
+        let mut min_slack = sphere_slack.min(compartment_slack);
+        for child in children {
+            let child_slack = -child.kind.signed_distance(centre) - radius;
+            if child_slack < min_slack {
+                min_slack = child_slack;
+            }
+        }
+        let max_per_axis = (min_slack * inv_sqrt_3).min(half);
+        if max_per_axis > 1e-6 {
+            return Some(Point3::new(
+                centre.x + rng.gen_range(-max_per_axis..max_per_axis),
+                centre.y + rng.gen_range(-max_per_axis..max_per_axis),
+                centre.z + rng.gen_range(-max_per_axis..max_per_axis),
+            ));
+        }
+        return Some(centre);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -493,6 +614,9 @@ mod tests {
 
     #[test]
     fn all_placements_inside_bounding_box() {
+        // Default PlacerConfig has `strict_bounds: true` — spheres
+        // must fit fully inside the box (biology-correct semantics).
+        // The loose mode is exercised by `loose_bounds_allows_protrusion`.
         let recipe = Recipe::from_json_str(SPHERES_IN_A_BOX_TINY).unwrap();
         let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
         let out = placer.pack(0xACE5);
@@ -507,6 +631,49 @@ mod tests {
                     && p.position.z - r >= aabb.min.z - 1e-3
                     && p.position.z + r <= aabb.max.z + 1e-3,
                 "placement {:?} extends outside bounding box {:?}",
+                p.position,
+                aabb,
+            );
+        }
+    }
+
+    #[test]
+    fn loose_bounds_allows_protrusion() {
+        // With strict_bounds=false the root compartment uses cellPACK's
+        // loose semantics — centres inside the box, sphere may
+        // protrude at the edge. Verifying: at least one centre lands
+        // within `radius` of an edge (which would fail strict-fit).
+        let recipe = Recipe::from_json_str(SPHERES_IN_A_BOX_TINY).unwrap();
+        let cfg = PlacerConfig {
+            strict_bounds: false,
+            ..PlacerConfig::default()
+        };
+        let placer = GreedyRandomPlacer::new(&recipe, cfg);
+        let out = placer.pack(0xC0DE);
+        let r = 10.0_f32;
+        let aabb = recipe.bounding_box;
+        let any_protrusion = out.snapshot.placements.iter().any(|p| {
+            p.position.x - r < aabb.min.x
+                || p.position.x + r > aabb.max.x
+                || p.position.y - r < aabb.min.y
+                || p.position.y + r > aabb.max.y
+                || p.position.z - r < aabb.min.z
+                || p.position.z + r > aabb.max.z
+        });
+        assert!(
+            any_protrusion,
+            "loose bounds should allow at least one protrusion in a tight-pack recipe"
+        );
+        // But centres must still be inside the box.
+        for p in &out.snapshot.placements {
+            assert!(
+                p.position.x >= aabb.min.x - 1e-3
+                    && p.position.x <= aabb.max.x + 1e-3
+                    && p.position.y >= aabb.min.y - 1e-3
+                    && p.position.y <= aabb.max.y + 1e-3
+                    && p.position.z >= aabb.min.z - 1e-3
+                    && p.position.z <= aabb.max.z + 1e-3,
+                "centre {:?} outside box {:?} even with loose bounds",
                 p.position,
                 aabb,
             );
@@ -530,12 +697,10 @@ mod tests {
 
     #[test]
     fn places_multi_sphere_ingredients() {
-        use crate::recipe::Recipe;
         let recipe = Recipe::from_json_str(DUMBBELLS_IN_A_BOX).unwrap();
         let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
         let out = placer.pack(0xC0DE);
         assert!(!out.snapshot.placements.is_empty(), "expected some dumbbells placed");
-        // Each placement should have a non-identity rotation (since shape needs_rotation()).
         let any_rotated = out.snapshot.placements.iter().any(|p| {
             (p.rotation.w - 1.0).abs() > 1e-6
         });
@@ -562,7 +727,6 @@ mod tests {
 
     #[test]
     fn places_into_nested_capsule_with_surface_region() {
-        use crate::recipe::Recipe;
         let recipe = Recipe::from_json_str(NESTED_CAPSULE).unwrap();
         assert_eq!(recipe.compartments.len(), 2, "space + cell");
         let cell = &recipe.compartments["cell"];
@@ -571,14 +735,11 @@ mod tests {
         let out = placer.pack(0xC0DE);
         assert!(out.snapshot.placements.len() > 50, "expected most placements to fit");
 
-        // Every placement should be associated with the cell compartment.
         for p in &out.snapshot.placements {
             let comp = recipe.compartments.get_index(p.compartment_id as usize).unwrap().1;
             assert_eq!(comp.name, "cell");
         }
 
-        // Surface placements (the lipid ingredient) should sit on the
-        // capsule boundary — signed distance ≈ 0.
         for p in &out.snapshot.placements {
             let ing = recipe.ingredients.get_index(p.ingredient_id as usize).unwrap().1;
             if ing.name == "lipid" {
@@ -602,17 +763,14 @@ mod tests {
 
     #[test]
     fn multi_sphere_no_overlaps() {
-        use crate::recipe::Recipe;
         let recipe = Recipe::from_json_str(DUMBBELLS_IN_A_BOX).unwrap();
         let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
         let out = placer.pack(0xFADE);
-        // Collect every world-space proxy sphere across every placement.
         let mut all_spheres: Vec<(Point3<f32>, f32)> = Vec::new();
         for p in &out.snapshot.placements {
             let ing = recipe.ingredients.get_index(p.ingredient_id as usize).unwrap().1;
             all_spheres.extend(ing.shape.world_spheres(p.position, p.rotation));
         }
-        // O(n²) all-pairs distance check.
         for i in 0..all_spheres.len() {
             for j in (i + 1)..all_spheres.len() {
                 let (ca, ra) = all_spheres[i];

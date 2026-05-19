@@ -127,6 +127,50 @@ mod kind_serde {
 }
 
 impl CompartmentKind {
+    /// Signed distance from `p` to the compartment boundary. Positive
+    /// when `p` is inside (and equal to the distance to the nearest
+    /// boundary point), negative when outside, zero on the boundary.
+    /// Used both for sphere-fit checks (`fits_sphere`) and to bound
+    /// jitter in the placer (jittering by more than this distance
+    /// would push the sphere outside).
+    pub fn signed_distance(&self, p: Point3<f32>) -> f32 {
+        match self {
+            CompartmentKind::Box(aabb) => {
+                // Per-axis "distance to the nearer face" can be negative
+                // when `p` lies outside. Taking the min yields the
+                // signed distance for inside points (positive = min
+                // face distance) and a sound negative bound for outside
+                // points (any axis being out makes the min negative).
+                let dx = (p.x - aabb.min.x).min(aabb.max.x - p.x);
+                let dy = (p.y - aabb.min.y).min(aabb.max.y - p.y);
+                let dz = (p.z - aabb.min.z).min(aabb.max.z - p.z);
+                dx.min(dy).min(dz)
+            }
+            CompartmentKind::Sphere { center, radius } => {
+                radius - (p - center).norm()
+            }
+            CompartmentKind::Capsule { a, b, radius } => {
+                -capsule_signed_distance(p, *a, *b, *radius)
+            }
+            CompartmentKind::Mesh(m) => {
+                use parry3d::query::PointQuery;
+                let proj = m.trimesh.project_local_point(&p, true);
+                let d = (p - proj.point).norm();
+                if m.trimesh.contains_local_point(&p) {
+                    d
+                } else {
+                    -d
+                }
+            }
+        }
+    }
+
+    /// True iff a sphere of radius `r` centred at `p` is fully inside
+    /// the compartment.
+    pub fn fits_sphere(&self, p: Point3<f32>, r: f32) -> bool {
+        self.signed_distance(p) >= r
+    }
+
     /// True iff `p` is inside the compartment.
     pub fn contains(&self, p: Point3<f32>) -> bool {
         match self {

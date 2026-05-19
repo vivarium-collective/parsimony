@@ -58,7 +58,34 @@ struct RawObject {
     /// Surface-alignment axis for membrane-anchored ingredients.
     #[serde(default)]
     principal_vector: Option<[f32; 3]>,
+    /// `single_cube`: full side lengths along each axis (cellPACK
+    /// stores `edges`; we accept `size` for clarity).
+    #[serde(default)]
+    size: Option<[f32; 3]>,
+    /// `single_cylinder`: length of cylinder along local Z axis.
+    #[serde(default)]
+    length: Option<f32>,
+    /// `multi_cylinder`: list of segments, each a `(start, end,
+    /// radius)` capsule axis in ingredient-local space.
+    #[serde(default)]
+    segments: Option<Vec<RawCylinderSegment>>,
+    /// `mesh`: path to an OBJ file (resolved relative to the recipe
+    /// file's parent directory).
+    #[serde(default)]
+    mesh_path: Option<String>,
+    /// `mesh`: voxel size for generating the sphere-tree proxy. If
+    /// absent, defaults to `mesh_aabb_diagonal / 16` (keeps the proxy
+    /// tree under a few hundred spheres for reasonable mesh sizes).
+    #[serde(default)]
+    proxy_voxel_size: Option<f32>,
     // (remaining cellPACK fields ignored until needed)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawCylinderSegment {
+    start: [f32; 3],
+    end: [f32; 3],
+    radius: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +113,9 @@ enum RawCompartmentSpec {
     Box { min: [f32; 3], max: [f32; 3] },
     Sphere { center: [f32; 3], radius: f32 },
     Capsule { a: [f32; 3], b: [f32; 3], radius: f32 },
+    /// Triangle mesh compartment. `mesh_path` is resolved relative
+    /// to the recipe file's parent directory.
+    Mesh { mesh_path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,13 +178,18 @@ pub struct Recipe {
 impl Recipe {
     pub fn from_json_str(src: &str) -> Result<Self, RecipeError> {
         let raw: RawRecipe = serde_json::from_str(src)?;
-        resolve(raw)
+        resolve(raw, None)
     }
 
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, RecipeError> {
-        let src = std::fs::read_to_string(path.as_ref())
+        let path = path.as_ref();
+        let src = std::fs::read_to_string(path)
             .map_err(|e| RecipeError::Io(e.to_string()))?;
-        Self::from_json_str(&src)
+        let raw: RawRecipe = serde_json::from_str(&src)?;
+        // Mesh-ingredient paths in the recipe are resolved relative to
+        // the recipe file's parent directory.
+        let base = path.parent().map(|p| p.to_path_buf());
+        resolve(raw, base.as_deref())
     }
 }
 
@@ -184,7 +219,7 @@ pub enum RecipeError {
 
 // ---------- resolution ----------
 
-fn resolve(raw: RawRecipe) -> Result<Recipe, RecipeError> {
+fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recipe, RecipeError> {
     let bounding_box = Aabb::new(
         nalgebra::Point3::new(raw.bounding_box[0][0], raw.bounding_box[0][1], raw.bounding_box[0][2]),
         nalgebra::Point3::new(raw.bounding_box[1][0], raw.bounding_box[1][1], raw.bounding_box[1][2]),
@@ -236,6 +271,81 @@ fn resolve(raw: RawRecipe) -> Result<Recipe, RecipeError> {
                     })
                     .collect();
                 IngredientShape::MultiSphere { spheres }
+            }
+            "single_cube" => {
+                let Some(size) = obj.size else {
+                    return Err(RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: "single_cube requires `size` (3-element side lengths)".into(),
+                    });
+                };
+                let half = nalgebra::Vector3::new(size[0] * 0.5, size[1] * 0.5, size[2] * 0.5);
+                IngredientShape::cube(half)
+            }
+            "single_cylinder" => {
+                let Some(length) = obj.length else {
+                    return Err(RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: "single_cylinder requires `length`".into(),
+                    });
+                };
+                let Some(radius) = obj.radius else {
+                    return Err(RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: "single_cylinder requires `radius`".into(),
+                    });
+                };
+                IngredientShape::cylinder(length, radius)
+            }
+            "multi_cylinder" => {
+                let Some(segments) = obj.segments.as_ref() else {
+                    return Err(RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: "multi_cylinder requires `segments`".into(),
+                    });
+                };
+                let segs: Vec<crate::ingredient::CylinderSegment> = segments
+                    .iter()
+                    .map(|s| crate::ingredient::CylinderSegment {
+                        start: nalgebra::Point3::new(s.start[0], s.start[1], s.start[2]),
+                        end: nalgebra::Point3::new(s.end[0], s.end[1], s.end[2]),
+                        radius: s.radius,
+                    })
+                    .collect();
+                IngredientShape::multi_cylinder(&segs)
+            }
+            "mesh" => {
+                let Some(rel_path) = obj.mesh_path.as_ref() else {
+                    return Err(RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: "mesh requires `mesh_path`".into(),
+                    });
+                };
+                let full = match recipe_dir {
+                    Some(dir) => dir.join(rel_path),
+                    None => std::path::PathBuf::from(rel_path),
+                };
+                let mut trimesh = crate::ingredient::obj::load_trimesh(&full)
+                    .map_err(|e| RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: format!("failed to load mesh `{}`: {e}", full.display()),
+                    })?;
+                // Configure for in/out point queries — required by the
+                // sphere-tree voxeliser.
+                parsimony_spatial::prepare_trimesh_for_voxelize(&mut trimesh)
+                    .map_err(|e| RecipeError::InvalidObject {
+                        name: name.clone(),
+                        message: format!("mesh orient: {e}"),
+                    })?;
+                let voxel_size = obj.proxy_voxel_size.unwrap_or_else(|| {
+                    let a = trimesh.local_aabb();
+                    let extents = a.maxs - a.mins;
+                    (extents.x.powi(2) + extents.y.powi(2) + extents.z.powi(2)).sqrt() / 16.0
+                });
+                IngredientShape::mesh_with_voxelised_proxies(
+                    std::sync::Arc::new(trimesh),
+                    voxel_size,
+                )
             }
             "" => continue,
             _ => {
@@ -293,6 +403,7 @@ fn resolve(raw: RawRecipe) -> Result<Recipe, RecipeError> {
         &ingredients,
         &mut compartments,
         &mut directives,
+        recipe_dir,
     )?;
 
     Ok(Recipe {
@@ -347,6 +458,11 @@ fn merge_object(parent: RawObject, child: RawObject) -> RawObject {
         positions: child.positions.or(parent.positions),
         radii: child.radii.or(parent.radii),
         principal_vector: child.principal_vector.or(parent.principal_vector),
+        size: child.size.or(parent.size),
+        length: child.length.or(parent.length),
+        segments: child.segments.or(parent.segments),
+        mesh_path: child.mesh_path.or(parent.mesh_path),
+        proxy_voxel_size: child.proxy_voxel_size.or(parent.proxy_voxel_size),
     }
 }
 
@@ -359,6 +475,7 @@ fn walk_composition(
     ingredients: &IndexMap<String, Ingredient>,
     compartments: &mut IndexMap<String, Compartment>,
     directives: &mut Vec<PlacementDirective>,
+    recipe_dir: Option<&std::path::Path>,
 ) -> Result<(), RecipeError> {
     let entry = raw_comp
         .get(entry_name)
@@ -389,6 +506,33 @@ fn walk_composition(
                 b: nalgebra::Point3::new(b[0], b[1], b[2]),
                 radius: *radius,
             },
+            RawCompartmentSpec::Mesh { mesh_path } => {
+                let full = match recipe_dir {
+                    Some(dir) => dir.join(mesh_path),
+                    None => std::path::PathBuf::from(mesh_path),
+                };
+                let mut trimesh = crate::ingredient::obj::load_trimesh(&full).map_err(|e| {
+                    RecipeError::InvalidComposition {
+                        name: entry_name.to_string(),
+                        message: format!("failed to load mesh `{}`: {e}", full.display()),
+                    }
+                })?;
+                parsimony_spatial::prepare_trimesh_for_voxelize(&mut trimesh).map_err(|e| {
+                    RecipeError::InvalidComposition {
+                        name: entry_name.to_string(),
+                        message: format!("mesh orient: {e}"),
+                    }
+                })?;
+                let aabb_local = trimesh.local_aabb();
+                let aabb = parsimony_spatial::Aabb::new(
+                    nalgebra::Point3::new(aabb_local.mins.x, aabb_local.mins.y, aabb_local.mins.z),
+                    nalgebra::Point3::new(aabb_local.maxs.x, aabb_local.maxs.y, aabb_local.maxs.z),
+                );
+                CompartmentKind::Mesh(Box::new(crate::compartment::MeshCompartment {
+                    trimesh,
+                    aabb,
+                }))
+            }
         };
         compartments.insert(
             entry_name.to_string(),
@@ -489,6 +633,7 @@ fn walk_composition(
                             ingredients,
                             compartments,
                             directives,
+                            recipe_dir,
                         )?;
                     }
                     RawRegionEntry::Inline { object, count, molarity, priority } => {
@@ -534,6 +679,7 @@ fn walk_composition_region(
     ingredients: &IndexMap<String, Ingredient>,
     compartments: &mut IndexMap<String, Compartment>,
     directives: &mut Vec<PlacementDirective>,
+    recipe_dir: Option<&std::path::Path>,
 ) -> Result<(), RecipeError> {
     let entry = raw_comp
         .get(entry_name)
@@ -582,6 +728,7 @@ fn walk_composition_region(
             ingredients,
             compartments,
             directives,
+            recipe_dir,
         )?;
     }
 
@@ -811,5 +958,165 @@ mod tests {
         let r = Recipe::from_json_str(src).unwrap();
         assert_eq!(r.directives.len(), 1);
         assert_eq!(r.directives[0].count, 5);
+    }
+
+    #[test]
+    fn loads_single_cube() {
+        let src = r#"{
+            "bounding_box": [[0,0,0],[100,100,100]],
+            "objects": {
+                "block": { "type": "single_cube", "size": [10, 10, 10] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": [ { "object": "block", "count": 1 } ] } }
+            }
+        }"#;
+        let r = Recipe::from_json_str(src).unwrap();
+        let s = &r.ingredients["block"].shape;
+        // Cube expands to a MultiSphere with eight octant spheres.
+        let n = match s {
+            IngredientShape::MultiSphere { spheres } => spheres.len(),
+            _ => panic!("expected MultiSphere"),
+        };
+        assert_eq!(n, 8, "expected 2×2×2 = 8 proxy spheres for cube");
+        // Enclosing radius: octant centre at half_extent/2 from origin
+        // plus per-sphere radius (= ‖h‖/2); total = ‖h‖ = the cube's
+        // half-diagonal. For a 10³ cube that's 5·√3 ≈ 8.66.
+        let er = s.enclosing_radius();
+        let expected = (75.0_f32).sqrt();
+        assert!(
+            (er - expected).abs() < 1e-4,
+            "got {er}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn loads_single_cylinder() {
+        let src = r#"{
+            "bounding_box": [[0,0,0],[100,100,100]],
+            "objects": {
+                "rod": { "type": "single_cylinder", "length": 20, "radius": 3 }
+            },
+            "composition": {
+                "space": { "regions": { "interior": [ { "object": "rod", "count": 1 } ] } }
+            }
+        }"#;
+        let r = Recipe::from_json_str(src).unwrap();
+        let s = &r.ingredients["rod"].shape;
+        let n = match s {
+            IngredientShape::MultiSphere { spheres } => spheres.len(),
+            _ => panic!("expected MultiSphere"),
+        };
+        // length 20, radius 3 → ceil(20/3) = 7 intervals, 8 spheres.
+        assert_eq!(n, 8);
+        // Enclosing radius: endpoint at (0,0,10) plus radius 3 = 13.
+        let er = s.enclosing_radius();
+        assert!((er - 13.0).abs() < 1e-4, "got {er}");
+    }
+
+    #[test]
+    fn loads_multi_cylinder() {
+        let src = r#"{
+            "bounding_box": [[0,0,0],[100,100,100]],
+            "objects": {
+                "chain": {
+                    "type": "multi_cylinder",
+                    "segments": [
+                        { "start": [0, 0, 0], "end": [0, 0, 10], "radius": 2 },
+                        { "start": [0, 0, 10], "end": [5, 0, 14], "radius": 2 }
+                    ]
+                }
+            },
+            "composition": {
+                "space": { "regions": { "interior": [ { "object": "chain", "count": 1 } ] } }
+            }
+        }"#;
+        let r = Recipe::from_json_str(src).unwrap();
+        let s = &r.ingredients["chain"].shape;
+        let n = match s {
+            IngredientShape::MultiSphere { spheres } => spheres.len(),
+            _ => panic!("expected MultiSphere"),
+        };
+        // Segment 1 (len 10, radius 2): 5 intervals → 6 spheres.
+        // Segment 2 (len √41 ≈ 6.4, radius 2): 4 intervals → 5 spheres.
+        // Total: 11 spheres.
+        assert!(n >= 9 && n <= 12, "got {n} spheres");
+    }
+
+    #[test]
+    fn loads_mesh_compartment_from_local_obj() {
+        let mesh_path = "/home/pattern/code/cellpack/cellpack/tests/geometry/sphere.obj";
+        if !std::path::Path::new(mesh_path).exists() {
+            eprintln!("skipping: cellpack sphere.obj not at expected path");
+            return;
+        }
+        // Quoted JSON values must escape backslashes; the path is
+        // POSIX-clean here so we can inline directly.
+        let src = format!(
+            r#"{{
+                "bounding_box": [[-2,-2,-2],[2,2,2]],
+                "objects": {{
+                    "marker": {{ "type": "single_sphere", "radius": 0.05 }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{ "kind": "mesh", "mesh_path": "{mesh_path}" }},
+                        "regions": {{
+                            "surface": [ {{ "object": "marker", "count": 5 }} ]
+                        }}
+                    }}
+                }}
+            }}"#
+        );
+        let r = Recipe::from_json_str(&src).expect("load");
+        assert_eq!(r.compartments.len(), 2, "space + cell");
+        let cell = &r.compartments["cell"];
+        assert!(
+            matches!(cell.kind, CompartmentKind::Mesh(_)),
+            "cell should be a mesh compartment"
+        );
+        // Verify mesh compartment can sample a surface point and the
+        // point is roughly on the mesh (within voxel scale).
+        let mut rng = rand::thread_rng();
+        for _ in 0..10 {
+            let (p, n) = cell.kind.sample_surface(&mut rng);
+            assert!(p.coords.norm().is_finite());
+            assert!(n.norm() > 0.5, "normal should be near-unit length");
+        }
+    }
+
+    #[test]
+    fn loads_mesh_ingredient_from_local_obj() {
+        // Use cellpack's local sphere.obj (tessellated unit sphere).
+        let mesh_path = "/home/pattern/code/cellpack/cellpack/tests/geometry/sphere.obj";
+        if !std::path::Path::new(mesh_path).exists() {
+            eprintln!("skipping: cellpack sphere.obj not at expected path");
+            return;
+        }
+        let src = format!(
+            r#"{{
+                "bounding_box": [[0,0,0],[100,100,100]],
+                "objects": {{
+                    "mesh_ball": {{
+                        "type": "mesh",
+                        "mesh_path": "{mesh_path}",
+                        "proxy_voxel_size": 0.2
+                    }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": [ {{ "object": "mesh_ball", "count": 1 }} ] }} }}
+                }}
+            }}"#
+        );
+        let r = Recipe::from_json_str(&src).unwrap();
+        let s = &r.ingredients["mesh_ball"].shape;
+        match s {
+            IngredientShape::Mesh { trimesh, proxies } => {
+                assert!(!proxies.is_empty(), "mesh proxies should be non-empty");
+                assert!(trimesh.indices().len() > 100);
+            }
+            _ => panic!("expected Mesh shape"),
+        }
     }
 }

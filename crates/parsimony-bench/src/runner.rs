@@ -104,6 +104,10 @@ pub fn run_cellpack(recipe: &Path, out_dir: &Path, config: &CellpackConfig) -> R
 pub struct ParsimonyConfig {
     pub binary: PathBuf,
     pub seed: u64,
+    /// Pass `--loose-bounds` to parsimony. cellPACK's default root
+    /// containment is loose (centre-in-box only), so an apples-to-
+    /// apples density comparison needs this on.
+    pub loose_bounds: bool,
 }
 
 impl Default for ParsimonyConfig {
@@ -113,6 +117,7 @@ impl Default for ParsimonyConfig {
                 "/home/pattern/code/parsimony/target/release/parsimony",
             ),
             seed: 0,
+            loose_bounds: false,
         }
     }
 }
@@ -131,13 +136,17 @@ pub fn run_parsimony(
     std::fs::create_dir_all(out_dir)?;
     let out_path = out_dir.join("parsimony_out.simularium");
     let t = Instant::now();
-    let output = Command::new(&config.binary)
-        .arg("pack")
+    let mut cmd = Command::new(&config.binary);
+    cmd.arg("pack")
         .arg(recipe)
         .arg("--out")
         .arg(&out_path)
         .arg("--seed")
-        .arg(config.seed.to_string())
+        .arg(config.seed.to_string());
+    if config.loose_bounds {
+        cmd.arg("--loose-bounds");
+    }
+    let output = cmd
         .output()
         .with_context(|| format!("running {}", config.binary.display()))?;
     let elapsed = t.elapsed();

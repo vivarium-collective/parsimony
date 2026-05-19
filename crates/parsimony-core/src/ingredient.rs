@@ -1,24 +1,28 @@
-//! Ingredients — the molecular species being packed. v0.1 supports
-//! `single_sphere` only; `multi_sphere`, `single_cube`, `single_cylinder`,
-//! `mesh`, and `grow` (fibers) come later.
+//! Ingredients — the molecular species being packed.
+//!
+//! Shape representations:
+//! - `SingleSphere` — one sphere
+//! - `MultiSphere` — a sphere-tree (cellPACK's "packing representation")
+//! - `Mesh` — a triangle mesh + sphere-tree proxies for fast broad-phase
+//!
+//! `Cube`, `Cylinder`, and `MultiCylinder` recipe types convert to
+//! `MultiSphere` at recipe-load time via the [`shape_helpers`] sphere
+//! tree generators — same downstream pipeline, just a different
+//! geometric source.
+
+use std::sync::Arc;
 
 use nalgebra::{Point3, UnitQuaternion, Vector3};
+use parry3d::shape::TriMesh;
 use serde::{Deserialize, Serialize};
 
 use crate::recipe::PackingMode;
 
-fn default_principal_vector() -> Vector3<f32> {
-    Vector3::new(0.0, 0.0, 1.0)
-}
-
 /// Stable handle for an ingredient within a [`Recipe`](crate::Recipe).
-/// `u32` rather than `usize` to keep [`Placement`](crate::Placement)
-/// compact.
 pub type IngredientId = u32;
 
-/// One sphere of a multi-sphere proxy: an offset relative to the
-/// ingredient's local origin (transformed by the ingredient's rotation
-/// on placement) plus a radius.
+/// One sphere of a multi-sphere proxy: an offset (in ingredient-local
+/// space, rotated with the ingredient on placement) plus a radius.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ProxySphere {
     pub offset: Vector3<f32>,
@@ -28,25 +32,30 @@ pub struct ProxySphere {
 /// Shape representation used for collision testing. cellPACK calls
 /// this the "packing representation" — a small set of spheres that
 /// approximate the ingredient's volume for fast tree-vs-tree overlap
-/// tests. Real-world ingredients use 10–100 spheres; we support
-/// arbitrary counts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// tests.
+#[derive(Debug, Clone)]
 pub enum IngredientShape {
     /// A single sphere of given radius.
     SingleSphere { radius: f32 },
-    /// A multi-sphere proxy — a list of `(offset, radius)` spheres
-    /// rigidly attached to the ingredient's local frame.
+    /// A multi-sphere proxy.
     MultiSphere { spheres: Vec<ProxySphere> },
+    /// A triangle mesh, with a sphere-tree proxy for fast collision.
+    /// The full mesh is retained for later use (exact collision,
+    /// rendering, mesh-surface sampling).
+    Mesh {
+        trimesh: Arc<TriMesh>,
+        proxies: Vec<ProxySphere>,
+    },
 }
 
 impl IngredientShape {
-    /// Maximum world-space distance from the ingredient's center to
+    /// Maximum world-space distance from the ingredient's centre to
     /// any point on its surface, at any rotation. Used to construct
     /// broad-phase AABBs and bounding-sphere queries.
     pub fn enclosing_radius(&self) -> f32 {
         match self {
             IngredientShape::SingleSphere { radius } => *radius,
-            IngredientShape::MultiSphere { spheres } => spheres
+            IngredientShape::MultiSphere { spheres } | IngredientShape::Mesh { proxies: spheres, .. } => spheres
                 .iter()
                 .map(|s| s.offset.norm() + s.radius)
                 .fold(0.0_f32, f32::max),
@@ -54,15 +63,17 @@ impl IngredientShape {
     }
 
     /// True iff this ingredient's geometry actually depends on rotation
-    /// (a single sphere does not; a multi-sphere with more than one
-    /// proxy sphere does).
+    /// (a single sphere does not; sphere-trees and meshes do).
     pub fn needs_rotation(&self) -> bool {
-        matches!(self, IngredientShape::MultiSphere { spheres } if spheres.len() > 1)
+        match self {
+            IngredientShape::SingleSphere { .. } => false,
+            IngredientShape::MultiSphere { spheres } => spheres.len() > 1,
+            IngredientShape::Mesh { .. } => true,
+        }
     }
 
-    /// Iterate world-space `(center, radius)` for every proxy sphere of
-    /// this ingredient instance, given the instance's `position` and
-    /// `rotation`.
+    /// Iterate world-space `(centre, radius)` for every proxy sphere
+    /// of this ingredient instance.
     pub fn world_spheres<'a>(
         &'a self,
         position: Point3<f32>,
@@ -74,6 +85,43 @@ impl IngredientShape {
             rotation,
             index: 0,
         }
+    }
+
+    /// Construct a sphere-tree representation of an axis-aligned cube
+    /// of given half-extents. Returns a `MultiSphere` with 8 spheres
+    /// at the octant centres (±h/2 on each axis), radius = the
+    /// smallest half-extent. Conservative coverage — the cube's
+    /// corners extend slightly past the proxies, but the inscribed
+    /// box of each octant is fully covered.
+    pub fn cube(half_extents: Vector3<f32>) -> Self {
+        IngredientShape::MultiSphere {
+            spheres: shape_helpers::cube_proxies(half_extents),
+        }
+    }
+
+    /// Construct a sphere-tree for a cylinder of given length and
+    /// radius along the local Z axis. Returns a `MultiSphere` with a
+    /// chain of overlapping spheres of `radius` spaced along the axis.
+    pub fn cylinder(length: f32, radius: f32) -> Self {
+        IngredientShape::MultiSphere {
+            spheres: shape_helpers::cylinder_proxies(length, radius),
+        }
+    }
+
+    /// Construct a sphere-tree from a chain of cylinder segments in
+    /// the ingredient's local frame.
+    pub fn multi_cylinder(segments: &[CylinderSegment]) -> Self {
+        IngredientShape::MultiSphere {
+            spheres: shape_helpers::multi_cylinder_proxies(segments),
+        }
+    }
+
+    /// Construct a `Mesh` shape from a triangle mesh, with proxy
+    /// spheres generated by voxelising the mesh interior at the given
+    /// voxel size.
+    pub fn mesh_with_voxelised_proxies(trimesh: Arc<TriMesh>, voxel_size: f32) -> Self {
+        let proxies = shape_helpers::voxelise_mesh_to_proxies(&trimesh, voxel_size);
+        IngredientShape::Mesh { trimesh, proxies }
     }
 }
 
@@ -105,25 +153,230 @@ impl<'a> Iterator for WorldSphereIter<'a> {
                     None
                 }
             }
+            IngredientShape::Mesh { proxies, .. } => {
+                if self.index < proxies.len() {
+                    let s = &proxies[self.index];
+                    self.index += 1;
+                    Some((self.position + self.rotation * s.offset, s.radius))
+                } else {
+                    None
+                }
+            }
         }
     }
 }
 
-/// An ingredient species. Variants for conformational cycles
-/// (ATP synthase E/T/O) and ligand-bound forms come later — see
-/// `docs/parsimony-design.md` §5.2.1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One segment of a multi-cylinder ingredient: a capsule axis from
+/// `start` to `end` (both in ingredient-local space) with a uniform
+/// `radius`.
+#[derive(Debug, Clone, Copy)]
+pub struct CylinderSegment {
+    pub start: Point3<f32>,
+    pub end: Point3<f32>,
+    pub radius: f32,
+}
+
+/// An ingredient species.
+#[derive(Debug, Clone)]
 pub struct Ingredient {
     pub name: String,
     pub shape: IngredientShape,
-    /// Display color (`[r, g, b]`, each in 0..=1). Passed through to output.
+    /// Display colour (`[r, g, b]`, each in 0..=1).
     pub color: [f32; 3],
     /// Max placement attempts per individual instance before giving up.
     pub jitter_attempts: u32,
     pub packing_mode: PackingMode,
-    /// Direction (in ingredient-local space) that should align with the
-    /// surface normal when this ingredient is placed in a Surface
+    /// Direction (in ingredient-local space) that should align with
+    /// the surface normal when this ingredient is placed in a Surface
     /// region. Default `(0, 0, 1)`. cellPACK convention.
-    #[serde(default = "default_principal_vector")]
     pub principal_vector: Vector3<f32>,
+}
+
+/// Sphere-tree generators for analytical shape primitives + a mesh
+/// voxeliser. All in their own module to keep `IngredientShape`
+/// declarations clean.
+pub mod shape_helpers {
+    use super::*;
+    use parry3d::query::PointQuery;
+
+    /// 2×2×2 sphere lattice covering a cube of half-extents `h`.
+    /// Spheres sit at the eight octant centres `(±hx/2, ±hy/2, ±hz/2)`
+    /// with radius `‖h‖/2` — half the cube's space-diagonal. With
+    /// that radius each octant-sphere tangentially reaches both the
+    /// origin and the matching cube corner, so the union fully
+    /// covers the cube interior. The proxy's enclosing-sphere radius
+    /// matches the cube's geometric enclosing radius (= the
+    /// half-diagonal), so broad-phase queries don't over-claim
+    /// outside the cube either. Per-pair sphere checks downstream
+    /// remain cheap (at most 8×8 = 64 pairs between two cubes).
+    pub fn cube_proxies(h: Vector3<f32>) -> Vec<ProxySphere> {
+        let r = h.norm() * 0.5;
+        let mut spheres = Vec::with_capacity(8);
+        for sx in [-1.0_f32, 1.0] {
+            for sy in [-1.0_f32, 1.0] {
+                for sz in [-1.0_f32, 1.0] {
+                    spheres.push(ProxySphere {
+                        offset: Vector3::new(sx * h.x * 0.5, sy * h.y * 0.5, sz * h.z * 0.5),
+                        radius: r,
+                    });
+                }
+            }
+        }
+        spheres
+    }
+
+    /// Chain of overlapping spheres along the local Z axis for a
+    /// cylinder of given length and radius. Sphere spacing equals
+    /// `radius` so each pair overlaps by 50%.
+    pub fn cylinder_proxies(length: f32, radius: f32) -> Vec<ProxySphere> {
+        let half = length * 0.5;
+        // Number of intervals along the axis; spacing = radius (50%
+        // overlap). Always at least 2 spheres (endpoints) so a very
+        // short cylinder still has interior coverage.
+        let n = ((length / radius).ceil() as usize).max(1);
+        let mut spheres = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let z = -half + length * t;
+            spheres.push(ProxySphere {
+                offset: Vector3::new(0.0, 0.0, z),
+                radius,
+            });
+        }
+        spheres
+    }
+
+    /// Concatenated cylinder chain — one sphere-chain per segment.
+    pub fn multi_cylinder_proxies(segments: &[CylinderSegment]) -> Vec<ProxySphere> {
+        let mut spheres = Vec::new();
+        for seg in segments {
+            let dir = seg.end - seg.start;
+            let length = dir.norm();
+            if length < 1e-6 {
+                spheres.push(ProxySphere {
+                    offset: seg.start.coords,
+                    radius: seg.radius,
+                });
+                continue;
+            }
+            let n = ((length / seg.radius).ceil() as usize).max(1);
+            for i in 0..=n {
+                let t = i as f32 / n as f32;
+                let p = seg.start + dir * t;
+                spheres.push(ProxySphere {
+                    offset: p.coords,
+                    radius: seg.radius,
+                });
+            }
+        }
+        spheres
+    }
+
+    /// Voxelise the mesh interior on a uniform grid of `voxel_size`
+    /// cells, return one proxy sphere per interior cell (centre =
+    /// cell centre, radius = `voxel_size · √3 / 2` so the sphere
+    /// covers the cell volume). Grid is the mesh's local AABB.
+    /// Requires the mesh to already be configured for in/out queries
+    /// (`parsimony_spatial::prepare_trimesh_for_voxelize`).
+    pub fn voxelise_mesh_to_proxies(trimesh: &TriMesh, voxel_size: f32) -> Vec<ProxySphere> {
+        let aabb = trimesh.local_aabb();
+        let min = aabb.mins;
+        let max = aabb.maxs;
+        let nx = (((max.x - min.x) / voxel_size).ceil() as usize).max(1);
+        let ny = (((max.y - min.y) / voxel_size).ceil() as usize).max(1);
+        let nz = (((max.z - min.z) / voxel_size).ceil() as usize).max(1);
+        // Sphere radius covers the voxel diagonal so the union of
+        // proxies covers the voxelised interior with no gaps.
+        let r = voxel_size * 0.5 * 3.0_f32.sqrt();
+        let mut spheres = Vec::new();
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    let p = Point3::new(
+                        min.x + (ix as f32 + 0.5) * voxel_size,
+                        min.y + (iy as f32 + 0.5) * voxel_size,
+                        min.z + (iz as f32 + 0.5) * voxel_size,
+                    );
+                    if trimesh.contains_local_point(&p) {
+                        spheres.push(ProxySphere {
+                            offset: p.coords,
+                            radius: r,
+                        });
+                    }
+                }
+            }
+        }
+        spheres
+    }
+}
+
+/// Minimal Wavefront OBJ loader. Reads `v` (vertex) and `f` (face)
+/// lines, ignoring textures/normals/groups. Triangulates polygonal
+/// faces with a fan from the first vertex. Negative face indices
+/// (relative to current vertex count) are supported per the OBJ spec.
+pub mod obj {
+    use std::path::Path;
+
+    use nalgebra::Point3;
+    use parry3d::shape::TriMesh;
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum ObjError {
+        #[error("io: {0}")]
+        Io(#[from] std::io::Error),
+        #[error("trimesh: {0}")]
+        TriMesh(String),
+        #[error("no triangles parsed from `{0}`")]
+        Empty(String),
+    }
+
+    pub fn load_trimesh(path: &Path) -> Result<TriMesh, ObjError> {
+        let text = std::fs::read_to_string(path)?;
+        let mut vertices: Vec<Point3<f32>> = Vec::new();
+        let mut indices: Vec<[u32; 3]> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("v ") {
+                let parts: Vec<f32> = line[2..]
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if parts.len() >= 3 {
+                    vertices.push(Point3::new(parts[0], parts[1], parts[2]));
+                }
+            } else if line.starts_with("f ") {
+                let face: Vec<u32> = line[2..]
+                    .split_whitespace()
+                    .filter_map(|tok| {
+                        let v_str = tok.split('/').next()?;
+                        let i: i32 = v_str.parse().ok()?;
+                        let idx = if i > 0 {
+                            (i - 1) as i64
+                        } else {
+                            // OBJ negative indices reference from the end
+                            // of the current vertex list.
+                            vertices.len() as i64 + i as i64
+                        };
+                        if idx >= 0 && (idx as usize) < vertices.len() {
+                            Some(idx as u32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if face.len() < 3 {
+                    continue;
+                }
+                // Fan triangulation.
+                for i in 1..face.len() - 1 {
+                    indices.push([face[0], face[i], face[i + 1]]);
+                }
+            }
+        }
+        if indices.is_empty() {
+            return Err(ObjError::Empty(path.display().to_string()));
+        }
+        TriMesh::new(vertices, indices)
+            .map_err(|e| ObjError::TriMesh(format!("{e:?}")))
+    }
 }

@@ -1,0 +1,62 @@
+{
+    "name": "shape_zoo",
+    "version": "0.1.0",
+    "format_version": "2.1-parsimony",
+    "description": "Exercises every ingredient shape parsimony supports: single sphere, single cube, single cylinder, multi-cylinder, multi-sphere, and an OBJ-loaded mesh. A small bounding box keeps the pack dense enough that all five shape kinds interact through the same QBVH + clearance-grid pipeline. The mesh path resolves relative to this recipe file.",
+    "bounding_box": [
+        [-50, -50, -50],
+        [50, 50, 50]
+    ],
+    "objects": {
+        "tiny_ball": {
+            "type": "single_sphere",
+            "color": [0.8, 0.3, 0.3],
+            "radius": 1.5
+        },
+        "block": {
+            "type": "single_cube",
+            "color": [0.3, 0.6, 0.9],
+            "size": [4, 4, 4]
+        },
+        "rod": {
+            "type": "single_cylinder",
+            "color": [0.9, 0.7, 0.3],
+            "length": 10,
+            "radius": 1.0
+        },
+        "bent_rod": {
+            "type": "multi_cylinder",
+            "color": [0.5, 0.8, 0.3],
+            "segments": [
+                { "start": [0, 0, -4], "end": [0, 0, 0], "radius": 1.0 },
+                { "start": [0, 0, 0], "end": [3, 0, 3], "radius": 1.0 }
+            ]
+        },
+        "dumbbell": {
+            "type": "multi_sphere",
+            "color": [0.7, 0.4, 0.8],
+            "positions": [[-2, 0, 0], [2, 0, 0]],
+            "radii": [1.5, 1.5]
+        },
+        "mesh_blob": {
+            "type": "mesh",
+            "color": [0.4, 0.9, 0.9],
+            "mesh_path": "../meshes/sphere.obj",
+            "proxy_voxel_size": 1.0
+        }
+    },
+    "composition": {
+        "space": {
+            "regions": {
+                "interior": [
+                    { "object": "tiny_ball", "count": 200 },
+                    { "object": "block",     "count": 50 },
+                    { "object": "rod",       "count": 50 },
+                    { "object": "bent_rod",  "count": 30 },
+                    { "object": "dumbbell",  "count": 50 },
+                    { "object": "mesh_blob", "count": 20 }
+                ]
+            }
+        }
+    }
+}
