@@ -8,6 +8,7 @@ description = "Core packing engine: recipe, ingredient, compartment, placement"
 [dependencies]
 parsimony-spatial = { workspace = true }
 nalgebra = { workspace = true }
+parry3d = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -6,8 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use parsimony_core::{
-    write_simularium_json, write_transforms_json, GreedyRandomPlacer, IngredientShape,
-    PlacerConfig, Recipe,
+    write_simularium_json, write_transforms_json, GreedyRandomPlacer, PlacerConfig, Recipe,
 };
 
 const CELLPACK_RECIPE: &str =
@@ -70,9 +69,7 @@ fn no_overlaps_in_packing() {
     let mut pairs: Vec<(f32, nalgebra::Point3<f32>)> = Vec::new();
     for p in &out.snapshot.placements {
         let ing = recipe.ingredients.get_index(p.ingredient_id as usize).unwrap().1;
-        let r = match ing.shape {
-            IngredientShape::SingleSphere { radius } => radius,
-        };
+        let r = ing.shape.enclosing_radius();
         pairs.push((r, p.position));
     }
     let n = pairs.len();
@@ -104,9 +101,7 @@ fn all_inside_bounding_box() {
     let bb = recipe.bounding_box;
     for p in &out.snapshot.placements {
         let ing = recipe.ingredients.get_index(p.ingredient_id as usize).unwrap().1;
-        let r = match ing.shape {
-            IngredientShape::SingleSphere { radius } => radius,
-        };
+        let r = ing.shape.enclosing_radius();
         assert!(
             p.position.x - r >= bb.min.x - 1e-3
                 && p.position.x + r <= bb.max.x + 1e-3

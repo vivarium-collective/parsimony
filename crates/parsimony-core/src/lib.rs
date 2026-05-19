@@ -11,7 +11,7 @@ pub mod placer;
 pub mod recipe;
 
 pub use compartment::{Compartment, CompartmentId, CompartmentKind};
-pub use ingredient::{Ingredient, IngredientId, IngredientShape};
+pub use ingredient::{Ingredient, IngredientId, IngredientShape, ProxySphere};
 pub use output::{write_simularium_json, write_transforms_json};
 pub use placement::{Op, Placement, ReplaceChange, Snapshot, VariantId};
 pub use placer::{GreedyRandomPlacer, PlacerConfig, PlacerOutcome, PlacerStats};

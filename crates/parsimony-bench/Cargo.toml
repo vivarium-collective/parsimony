@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Cross-language benchmarks: parsimony vs cellPACK Python"
 
+[[bin]]
+name = "compare-with-cellpack"
+path = "src/bin/compare_with_cellpack.rs"
+
 [dependencies]
+parsimony-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]

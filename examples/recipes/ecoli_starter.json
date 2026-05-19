@@ -1,0 +1,68 @@
+{
+    "name": "ecoli_starter",
+    "version": "0.1.0",
+    "format_version": "2.1-parsimony",
+    "description": "Phase 3 E. coli starter. Capsule cell ~2 µm × 1 µm. Five ingredient types: ribosome (multi-sphere, 30S+50S), RNA polymerase, GroEL, a representative soluble enzyme, membrane lipid (placed on the capsule surface). Counts are scaled down from real E. coli (~10⁴ ribosomes per cell) so the recipe runs in seconds.",
+    "bounding_box": [
+        [-1100, -600, -600],
+        [1100, 600, 600]
+    ],
+    "objects": {
+        "ribosome": {
+            "type": "multi_sphere",
+            "color": [0.8, 0.4, 0.2],
+            "positions": [
+                [0, 0, 7],
+                [0, 0, -7]
+            ],
+            "radii": [12, 10]
+        },
+        "rna_polymerase": {
+            "type": "single_sphere",
+            "color": [0.3, 0.6, 0.9],
+            "radius": 8
+        },
+        "groel": {
+            "type": "single_sphere",
+            "color": [0.9, 0.9, 0.3],
+            "radius": 7
+        },
+        "soluble_enzyme": {
+            "type": "single_sphere",
+            "color": [0.5, 0.7, 0.4],
+            "radius": 3
+        },
+        "lipid": {
+            "type": "single_sphere",
+            "color": [0.95, 0.85, 0.6],
+            "radius": 1,
+            "principal_vector": [0, 0, 1]
+        }
+    },
+    "composition": {
+        "space": {
+            "regions": {
+                "interior": ["cell"]
+            }
+        },
+        "cell": {
+            "compartment": {
+                "kind": "capsule",
+                "a": [-700, 0, 0],
+                "b": [700, 0, 0],
+                "radius": 400
+            },
+            "regions": {
+                "interior": [
+                    { "object": "ribosome", "count": 200 },
+                    { "object": "rna_polymerase", "count": 100 },
+                    { "object": "groel", "count": 60 },
+                    { "object": "soluble_enzyme", "count": 1000 }
+                ],
+                "surface": [
+                    { "object": "lipid", "count": 5000 }
+                ]
+            }
+        }
+    }
+}

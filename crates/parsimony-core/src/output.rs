@@ -4,7 +4,6 @@
 
 use serde_json::{json, Value};
 
-use crate::ingredient::IngredientShape;
 use crate::placement::Snapshot;
 use crate::recipe::Recipe;
 
@@ -102,9 +101,7 @@ pub fn write_simularium_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
             .get_index(p.ingredient_id as usize)
             .expect("ingredient_id out of range");
         let _ = name;
-        let radius = match ing.shape {
-            IngredientShape::SingleSphere { radius } => radius,
-        };
+        let radius = ing.shape.enclosing_radius();
         let (roll, pitch, yaw) = p.rotation.euler_angles();
         data.extend_from_slice(&[
             1000.0_f64,                          // visType
