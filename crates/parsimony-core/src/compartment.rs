@@ -331,7 +331,12 @@ impl CompartmentKind {
     /// instead of random `sample_surface` + collision rejection, which
     /// blows up for a dense regular layer. Returns `None` for kinds
     /// without an analytic even tiling; callers fall back to random.
-    pub fn surface_point_fibonacci(&self, i: u64, n: u64) -> Option<(Point3<f32>, Vector3<f32>)> {
+    pub fn surface_point_fibonacci<R: Rng>(
+        &self,
+        i: u64,
+        n: u64,
+        rng: &mut R,
+    ) -> Option<(Point3<f32>, Vector3<f32>)> {
         match self {
             CompartmentKind::Sphere { center, radius } => {
                 let nf = n.max(1) as f32;
@@ -340,7 +345,21 @@ impl CompartmentKind {
                 let r = (1.0 - y * y).max(0.0).sqrt();
                 let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
                 let theta = golden * ifl;
-                let dir = Vector3::new(theta.cos() * r, y, theta.sin() * r);
+                let mut dir = Vector3::new(theta.cos() * r, y, theta.sin() * r);
+                // Tangential jitter dissolves the regular Fibonacci spiral
+                // into an organic (blue-noise-ish) distribution — still
+                // even, but without the obviously patterned spiral lines.
+                let spacing = 3.54 / nf.sqrt(); // ~arc spacing on unit sphere
+                let amp = 0.5 * spacing;
+                let helper = if dir.x.abs() < 0.9 {
+                    Vector3::x()
+                } else {
+                    Vector3::y()
+                };
+                let t1 = (helper - dir * dir.dot(&helper)).normalize();
+                let t2 = dir.cross(&t1);
+                dir = (dir + t1 * rng.gen_range(-amp..amp) + t2 * rng.gen_range(-amp..amp))
+                    .normalize();
                 Some((center + dir * *radius, dir))
             }
             _ => None,

@@ -279,6 +279,11 @@ function resize() {
   camera.aspect = r.width / r.height;
   camera.updateProjectionMatrix();
   renderer.setSize(r.width, r.height);
+  // Impostor point size is in pixels, so it depends on viewport height.
+  for (const m of compartmentMeshes) {
+    const u = m.material && m.material.uniforms;
+    if (u && u.uViewportHeight) u.uViewportHeight.value = r.height;
+  }
   if (composer) {
     composer.setSize(r.width, r.height);
   }
@@ -407,7 +412,65 @@ function makeCelMaterial(color) {
 // `wantLoad` next frame, so it drops out of consideration without
 // us having to track or cancel stale queue entries.
 const objLoader = new OBJLoader();
-let objLoadInFlight = false;
+let objLoadsInFlight = 0;
+
+// ───── OBJ parsing on a Web Worker pool ─────────────────────────────
+// OBJ fetch+parse is the load bottleneck and JS is single-threaded, so
+// we move it off the main thread onto a pool of workers (real threads).
+// Each worker fetches an OBJ and parses it (our OBJs are plain indexed
+// v/f triangle soup — see obj-worker.js), returning transferable typed
+// arrays the main thread caches + uploads. The main thread keeps the
+// memory + IndexedDB cache tiers; only misses go to a worker. Falls back
+// to main-thread parsing (`fetchAndParseObj`) if Workers are unavailable.
+const WORKER_COUNT = Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4));
+const MAX_CONCURRENT_LOADS = WORKER_COUNT; // load tasks in flight at once
+let objWorkers = null; // array of Workers, or null → main-thread parsing
+let _workerNext = 0; // round-robin cursor
+let _workerReqId = 0;
+const _workerPending = new Map(); // reqId → { resolve, reject }
+
+function initObjWorkers() {
+  try {
+    const ws = [];
+    for (let i = 0; i < WORKER_COUNT; i++) {
+      const w = new Worker(new URL("./obj-worker.js", import.meta.url));
+      w.onmessage = (e) => {
+        const { id, positions, normals, indices, error } = e.data;
+        const p = _workerPending.get(id);
+        if (!p) return;
+        _workerPending.delete(id);
+        if (error) p.reject(new Error(error));
+        else p.resolve({ positions, normals, indices });
+      };
+      w.onerror = (ev) => {
+        // Worker script failed to load/run — disable the pool and let
+        // in-flight + future loads fall back to the main thread.
+        console.warn("[viewer] OBJ worker failed; using main-thread parsing:",
+                     ev.message || ev);
+        objWorkers = null;
+        for (const [, p] of _workerPending) p.reject(new Error("worker failed"));
+        _workerPending.clear();
+      };
+      ws.push(w);
+    }
+    objWorkers = ws;
+    console.log(`[viewer] OBJ parsing on ${WORKER_COUNT} web workers`);
+  } catch (e) {
+    console.warn("[viewer] web workers unavailable; parsing on main thread:", e);
+    objWorkers = null;
+  }
+}
+initObjWorkers();
+
+// Hand one OBJ URL to a worker; resolves with { positions, normals,
+// indices } typed arrays. Round-robins across the pool.
+function parseObjInWorker(url) {
+  return new Promise((resolve, reject) => {
+    const id = _workerReqId++;
+    _workerPending.set(id, { resolve, reject });
+    objWorkers[_workerNext++ % objWorkers.length].postMessage({ id, url });
+  });
+}
 let _drainScheduled = false;
 
 // In-memory parsed-geometry cache — the tier above IndexedDB. Maps a
@@ -741,39 +804,58 @@ async function drainObjLoadQueue() {
     scheduleReassess();
   }
 
-  // Second tier: one real fetch+parse at a time. Everything cached was
-  // promoted to `loaded` above, so this scan only ever picks a level we
-  // don't yet have in memory.
-  if (objLoadInFlight) return;
-  let best = null;
-  let bestPriority = Infinity;
-  for (const entry of instancedMeshes) {
-    if (!entry.lods) continue;
-    for (let i = 0; i < entry.lods.length; i++) {
-      const lvl = entry.lods[i];
-      if (lvl.loaded || lvl.loading || !lvl.wantLoad) continue;
-      if (lvl.wantPriority < bestPriority) {
-        bestPriority = lvl.wantPriority;
-        best = { entry, levelIdx: i, lvl };
+  // Second tier: fill a concurrency pool with real fetch+parse loads,
+  // each dispatched to a Web Worker (cache misses parse off the main
+  // thread, so the coarse sweep and big fine LODs both stream without
+  // freezing the UI). Cached levels were already materialised above.
+  while (objLoadsInFlight < MAX_CONCURRENT_LOADS) {
+    let best = null;
+    let bestPriority = Infinity;
+    for (const entry of instancedMeshes) {
+      if (!entry.lods) continue;
+      for (let i = 0; i < entry.lods.length; i++) {
+        const lvl = entry.lods[i];
+        if (lvl.loaded || lvl.loading || !lvl.wantLoad) continue;
+        if (lvl.wantPriority < bestPriority) {
+          bestPriority = lvl.wantPriority;
+          best = { entry, levelIdx: i, lvl };
+        }
       }
     }
+    if (!best) break;
+    best.lvl.loading = true;
+    objLoadsInFlight++;
+    loadLevel(best); // fire-and-track; loads overlap across the pool
   }
-  if (!best) return;
+}
 
-  best.lvl.loading = true;
-  objLoadInFlight = true;
+// Load one LOD level — memory cache was already checked by the prime
+// loop, so here we hit IndexedDB (cross-reload) and, on a miss, parse in
+// a worker; then cache + materialise, free the pool slot, and refill.
+async function loadLevel(best) {
+  const resolved = resolveMeshUrl(best.lvl.url);
   try {
-    const geom = await fetchAndParseObj(best.lvl.url);
-    // Promote into the in-memory cache (recording robustR so revisits
-    // skip the percentile sort) before handing clones to the meshes.
-    const resolved = resolveMeshUrl(best.lvl.url);
-    let cached = geomMemCache.get(resolved);
-    if (!cached) {
-      cached = { geom, robustR: robustBoundingRadius(geom) };
-      geomMemCache.set(resolved, cached);
+    let geom;
+    if (objWorkers) {
+      let entry = await idbGet(resolved);
+      if (entry && entry.positions && entry.positions.length > 0) {
+        cacheHits++;
+      } else {
+        cacheMisses++;
+        entry = await parseObjInWorker(resolved);
+        idbPut(resolved, entry).catch(() => {
+          cacheWriteErrors++;
+        });
+      }
+      geom = cacheEntryToGeometry(entry);
+    } else {
+      // No workers — parse on the main thread (also handles its own cache).
+      geom = await fetchAndParseObj(best.lvl.url);
     }
+    const robustR = robustBoundingRadius(geom);
+    geomMemCache.set(resolved, { geom, robustR });
     if (!best.lvl.loaded) {
-      ensureLodMesh(best.entry, best.levelIdx, cached.geom, cached.robustR);
+      ensureLodMesh(best.entry, best.levelIdx, geom, robustR);
       updateMeshLoadingStatus();
       scheduleReassess();
     }
@@ -781,11 +863,8 @@ async function drainObjLoadQueue() {
     console.warn(`LOD ${best.levelIdx} load failed for ${best.entry.name}:`, err);
   } finally {
     best.lvl.loading = false;
-    objLoadInFlight = false;
-    // setTimeout(0) yields a macrotask between parses so the just-
-    // installed InstancedMesh and any pending UI work get a turn
-    // before the next 1-2 second OBJ parse blocks the main thread.
-    setTimeout(drainObjLoadQueue, 0);
+    objLoadsInFlight--;
+    scheduleDrain(); // a slot freed — refill the pool (coalesced)
   }
 }
 
@@ -880,6 +959,123 @@ function buildCompartments(doc) {
   }
 }
 
+// ───── impostor lipid bilayer ───────────────────────────────────────
+// A real membrane is ~10^6 lipids at ~76 Å²/headgroup — far too many to
+// store as pack placements or draw as meshes. So we render lipid heads
+// as GPU sphere *impostors* (one camera-facing point sprite each, shaded
+// round + lit in the fragment shader: ~free per lipid) and *generate*
+// the bilayer in the viewer from the cell compartment — two evenly
+// (jittered) tiled leaflet shells — instead of packing a million
+// placements. This is how cellPACK/Maritan render dense membranes.
+//
+// Tunables (eyeball + adjust):
+const MEMBRANE_SPACING = 11;     // Å between headgroups (smaller = denser/continuous)
+const MEMBRANE_THICKNESS = 40;   // Å between inner/outer leaflets
+const MEMBRANE_HEAD_RADIUS = 5;  // Å headgroup impostor radius
+const MEMBRANE_MAX_POINTS = 1600000;
+
+function makeImpostorMaterial(headColor) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uViewportHeight: { value: renderer.domElement.clientHeight || 900 },
+      uColorHead: { value: headColor.clone() },
+      uColorTail: { value: headColor.clone().multiplyScalar(0.7) },
+      uLightDir: { value: new THREE.Vector3(0.3, 0.5, 0.85).normalize() },
+    },
+    vertexShader: `
+      attribute float aRadius;
+      attribute float aHead;
+      uniform float uViewportHeight;
+      varying float vHead;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vHead = aHead;
+        gl_Position = projectionMatrix * mv;
+        // Projected sphere diameter in pixels (projectionMatrix[1][1] = 1/tan(fov/2)).
+        gl_PointSize = aRadius * uViewportHeight * projectionMatrix[1][1] / max(-mv.z, 0.001);
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColorHead;
+      uniform vec3 uColorTail;
+      uniform vec3 uLightDir;
+      varying float vHead;
+      void main() {
+        vec2 c = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(c, c);
+        if (r2 > 1.0) discard;                       // round the sprite
+        vec3 n = vec3(c.x, -c.y, sqrt(1.0 - r2));    // view-space sphere normal
+        float ndl = max(dot(n, normalize(uLightDir)), 0.0);
+        vec3 base = mix(uColorTail, uColorHead, vHead);
+        gl_FragColor = vec4(base * (0.35 + 0.7 * ndl), 1.0);
+      }
+    `,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true,
+  });
+}
+
+function buildImpostorMembrane(doc) {
+  const comps = (doc.compartments || []).filter(
+    (c) => c.kind === "sphere" && Array.isArray(c.center) && typeof c.radius === "number",
+  );
+  if (comps.length === 0) return;
+  const lip = (doc.ingredients || []).find((i) => i.name === "lipid");
+  const col = lip && lip.color
+    ? new THREE.Color(lip.color[0], lip.color[1], lip.color[2])
+    : new THREE.Color(0.96, 0.86, 0.55);
+
+  for (const c of comps) {
+    const [cx, cy, cz] = c.center;
+    const shells = [c.radius, Math.max(1, c.radius - MEMBRANE_THICKNESS)];
+    const perShellCap = Math.floor(MEMBRANE_MAX_POINTS / shells.length);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    // Pre-size: sum points across shells.
+    let total = 0;
+    const counts = shells.map((R) => {
+      const n = Math.min(perShellCap,
+        Math.round((4 * Math.PI * R * R) / (MEMBRANE_SPACING * MEMBRANE_SPACING)));
+      total += n;
+      return n;
+    });
+    const pos = new Float32Array(total * 3);
+    const rad = new Float32Array(total);
+    const head = new Float32Array(total);
+    let w = 0;
+    for (let s = 0; s < shells.length; s++) {
+      const R = shells[s];
+      const n = counts[s];
+      const amp = 0.5 * (3.54 / Math.sqrt(Math.max(1, n))); // ~half the arc spacing
+      for (let i = 0; i < n; i++) {
+        const y = 1 - 2 * (i + 0.5) / n;
+        const rr = Math.sqrt(Math.max(0, 1 - y * y));
+        const th = golden * i;
+        let dx = Math.cos(th) * rr + (Math.random() - 0.5) * 2 * amp;
+        let dy = y + (Math.random() - 0.5) * 2 * amp;
+        let dz = Math.sin(th) * rr + (Math.random() - 0.5) * 2 * amp;
+        const len = Math.hypot(dx, dy, dz) || 1;
+        dx /= len; dy /= len; dz /= len;
+        pos[w * 3] = cx + dx * R;
+        pos[w * 3 + 1] = cy + dy * R;
+        pos[w * 3 + 2] = cz + dz * R;
+        rad[w] = MEMBRANE_HEAD_RADIUS;
+        head[w] = 1;
+        w++;
+      }
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geom.setAttribute("aRadius", new THREE.BufferAttribute(rad, 1));
+    geom.setAttribute("aHead", new THREE.BufferAttribute(head, 1));
+    const points = new THREE.Points(geom, makeImpostorMaterial(col));
+    points.frustumCulled = false;
+    points.visible = !toggleMembrane || toggleMembrane.checked;
+    scene.add(points);
+    compartmentMeshes.push(points); // disposed by disposeCompartments
+  }
+}
+
 // Build the scene from a `parsimony.pack.v1` document.
 async function buildScene(doc, fileName) {
   clearPacking();
@@ -931,6 +1127,9 @@ async function buildScene(doc, fileName) {
   for (const [tid, pts] of byType.entries()) {
     const ing = ingredientById.get(tid);
     if (!ing) continue;
+    // The lipid bilayer is drawn as a generated impostor membrane
+    // (buildImpostorMembrane), not as packed multi_sphere instances.
+    if (ing.name === "lipid") continue;
     const colorArr = ing.color || [0.5, 0.5, 0.5];
     const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
     const enc = ing.shape.enclosing_radius || ing.shape.radius || 1.0;
@@ -954,7 +1153,7 @@ async function buildScene(doc, fileName) {
   }
   bboxLines = makeBoxLines(bbMin, bbMax, 0x556677);
   scene.add(bboxLines);
-  buildCompartments(doc);
+  buildImpostorMembrane(doc);
 
   framePacking(bbMin, bbMax);
   renderLegend();
@@ -983,7 +1182,10 @@ function buildFallbackGeometry(ing, enclosingRadius) {
       && Array.isArray(ing.shape.spheres) && ing.shape.spheres.length > 0) {
     const geoms = ing.shape.spheres.map((s) => {
       const r = s.radius || 0.5;
-      const g = new THREE.SphereGeometry(r, 16, 8);
+      // Lower-poly proxy spheres — multi_sphere ingredients (rods, and
+      // the lipid bilayer at tens of thousands of instances) don't need
+      // high tessellation; keeps the dense membrane cheap to draw.
+      const g = new THREE.SphereGeometry(r, 12, 6);
       g.translate(s.offset[0], s.offset[1], s.offset[2]);
       return g;
     });
@@ -1349,6 +1551,25 @@ function reassessLODs() {
       }
     }
 
+  }
+
+  // Coarsest-LOD preload: independent of the camera, queue every mesh
+  // ingredient's coarsest level so the whole scene shows real (if
+  // coarse) geometry from the start — not just the framed neighbourhood,
+  // and not a minute of placeholder spheres popping in one by one. Top
+  // priority (−1) so this breadth pass loads before the distance-ranked
+  // refinement of nearby instances; the ellipsoid fallback covers each
+  // ingredient until its coarse mesh lands, and `reassessLODs` then
+  // upgrades the near ones to finer levels. Once a coarse level is
+  // loaded the guard below makes this a no-op.
+  for (const entry of instancedMeshes) {
+    const lods = entry.lods;
+    if (!lods || lods.length === 0) continue;
+    const lvl0 = lods[0];
+    if (!lvl0.loaded && !lvl0.loading) {
+      lvl0.wantLoad = true;
+      lvl0.wantPriority = -1;
+    }
   }
 
   // Hand off to the priority drain. It scans all entries' wantLoad

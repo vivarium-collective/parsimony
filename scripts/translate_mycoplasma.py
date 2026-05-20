@@ -372,11 +372,18 @@ def main() -> int:
         objects["lipid"] = {
             "type": "multi_sphere",
             "color": [0.96, 0.86, 0.55],
-            "positions": [[0, 0, 25], [0, 0, 11], [0, 0, -11], [0, 0, -25]],
-            "radii": [5.0, 3.2, 3.2, 5.0],
+            # Connected head + 3-bead tail chain per leaflet, mirrored
+            # across the midplane to span the ~57 A bilayer: a bulkier
+            # head bead and a thinner tapering tail, so it reads as a real
+            # lipid rather than a head + one stub.
+            "positions": [
+                [0, 0, 24], [0, 0, 17], [0, 0, 11], [0, 0, 5],
+                [0, 0, -5], [0, 0, -11], [0, 0, -17], [0, 0, -24],
+            ],
+            "radii": [4.5, 3.0, 2.7, 2.5, 2.5, 2.7, 3.0, 4.5],
             "principal_vector": [0, 0, 1],
-            # Even Fibonacci tiling over the surface (not collision-packed)
-            # so the bilayer is dense + the pack stays O(count).
+            # Even (jittered) Fibonacci tiling over the surface, not
+            # collision-packed, so the bilayer is dense + O(count).
             "packing_mode": "tiled",
         }
         surface_entries.append(

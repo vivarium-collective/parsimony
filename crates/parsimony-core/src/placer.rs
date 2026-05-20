@@ -271,10 +271,14 @@ impl<'a> GreedyRandomPlacer<'a> {
                             stuck[dir_idx] = true;
                             continue;
                         }
-                        compartment
-                            .kind
-                            .surface_point_fibonacci(idx, directive.count as u64)
-                            .unwrap_or_else(|| compartment.kind.sample_surface(&mut rng))
+                        match compartment.kind.surface_point_fibonacci(
+                            idx,
+                            directive.count as u64,
+                            &mut rng,
+                        ) {
+                            Some(pn) => pn,
+                            None => compartment.kind.sample_surface(&mut rng),
+                        }
                     } else {
                         compartment.kind.sample_surface(&mut rng)
                     };
