@@ -50,6 +50,15 @@ const FIXED: u32 = u32::MAX;
 /// carry hundreds; a representative subset keeps a whole-cell pass tractable
 /// (a clean pack's full proxies don't overlap, so neither does a subset).
 const PROXY_CAP: usize = 16;
+/// Per-instance step (Å) below which an instance counts as settled: it isn't
+/// moved and doesn't keep the loop alive. Kept an order of magnitude under
+/// the clash threshold in [`measure`] (1e-3 Å) so that converging here implies
+/// no remaining clashes — the early exit can't leave overlaps behind.
+const MOVE_EPS: f32 = 1e-4;
+/// Recompact the incrementally-updated index every this-many iterations.
+/// Updates keep the tree *correct* but can unbalance it; a periodic
+/// `rebuild_if_needed` restores query speed without an O(n) check every step.
+const REBUILD_EVERY: usize = 16;
 
 pub fn relax(snapshot: &mut Snapshot, recipe: &Recipe, iterations: usize) -> RelaxStats {
     let bound: HashSet<&str> = recipe
@@ -125,9 +134,15 @@ pub fn relax(snapshot: &mut Snapshot, recipe: &Recipe, iterations: usize) -> Rel
 
     let mut iters_run = 0;
     if clashes_before > 0 {
+        // Build the broad-phase ONCE and keep it current with incremental
+        // `update`s as instances move, rather than rebuilding it every
+        // iteration. A clean pack has zero clashes and never reaches here; when
+        // overlaps do exist this turns the settle loop from O(iterations ×
+        // full-rebuild) into O(build + moved-proxies × log n). `maxr` is the
+        // largest proxy radius and never changes (proxies only translate).
+        let (mut idx, maxr) = build(&ppos, &prad);
         for _ in 0..iterations {
             iters_run += 1;
-            let (idx, maxr) = build(&ppos, &prad);
             let mut disp = vec![Vector3::zeros(); m];
             for p in 0..ppos.len() {
                 let inst = pinst[p];
@@ -151,7 +166,10 @@ pub fn relax(snapshot: &mut Snapshot, recipe: &Recipe, iterations: usize) -> Rel
             }
             // Apply each instance's net displacement (damped + capped to a
             // proxy radius/iter so a many-proxy body can't lurch), translate
-            // its proxies, and clamp the centre into its compartment.
+            // its proxies, mirror the move into the index, and clamp the centre
+            // into its compartment. Instances that barely move are left in
+            // place (and out of the index churn).
+            let mut max_move = 0.0f32;
             for i in 0..m {
                 let mut d = disp[i] * DAMPING;
                 let cap = mov_rmax[i].max(1.0);
@@ -160,11 +178,26 @@ pub fn relax(snapshot: &mut Snapshot, recipe: &Recipe, iterations: usize) -> Rel
                 }
                 let new_center = clamp_into(mov_center[i] + d, mov_rmax[i], mov_comp[i], &bbox);
                 let actual = new_center - mov_center[i];
+                let amove = actual.norm();
+                if amove <= MOVE_EPS {
+                    continue; // settled — don't touch its proxies or the index
+                }
+                max_move = max_move.max(amove);
                 mov_center[i] = new_center;
                 let (lo, hi) = mov_range[i];
                 for p in lo..hi {
                     ppos[p] += actual;
+                    idx.update(p as u64, Aabb::from_sphere(ppos[p], prad[p])).ok();
                 }
+            }
+            // Converged: nothing moved more than MOVE_EPS this pass, so any
+            // residual overlap is below the clash threshold. Stop early instead
+            // of burning the rest of the iteration budget.
+            if max_move <= MOVE_EPS {
+                break;
+            }
+            if iters_run % REBUILD_EVERY == 0 {
+                idx.rebuild_if_needed();
             }
         }
     }
@@ -225,13 +258,14 @@ fn measure(ppos: &[Point3<f32>], prad: &[f32], pinst: &[u32]) -> (usize, f32) {
     (clashes, max_pen)
 }
 
+/// Bulk-build a proxy index keyed by proxy slot (`build_from` is tighter and
+/// faster than a stream of inserts), returning it alongside the largest proxy
+/// radius for broad-phase query inflation.
 fn build(ppos: &[Point3<f32>], prad: &[f32]) -> (QbvhIndex, f32) {
     let mut idx = QbvhIndex::new();
-    let mut maxr = 0.0f32;
-    for i in 0..ppos.len() {
-        idx.insert(i as u64, Aabb::from_sphere(ppos[i], prad[i])).ok();
-        maxr = maxr.max(prad[i]);
-    }
+    idx.build_from((0..ppos.len()).map(|i| (i as u64, Aabb::from_sphere(ppos[i], prad[i]))))
+        .ok();
+    let maxr = prad.iter().copied().fold(0.0f32, f32::max);
     (idx, maxr)
 }
 

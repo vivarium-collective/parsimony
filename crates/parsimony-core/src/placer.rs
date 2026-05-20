@@ -57,6 +57,30 @@ const SURFACE_REJECTION_CAP: u32 = 500;
 /// ingredient (the cell is saturated at proxy density for it).
 const DENSIFY_FAIL_CAP: u32 = 2000;
 
+/// Cap on a directive's cached valid-cell list. A whole-cell recipe packs
+/// hundreds of interior directives over a fine grid; uncapped, each list would
+/// hold the entire (tens-of-millions-of-cells) compartment volume and the lists
+/// together reach tens of GB — enough to OOM the machine before a single
+/// placement. We instead keep at most this many cells per directive, which is
+/// ample to sample placements from and is refilled from the live grid whenever
+/// it empties. Across hundreds of directives this bounds the lists to ~1 GB
+/// total instead of tens of GB; ordinary recipes hold fewer valid cells than
+/// this and are unaffected (and stay bit-for-bit reproducible — see
+/// [`build_valid_cells_for`]).
+const MAX_VALID_CELLS: usize = 500_000;
+
+/// Try budget for the rejection-sampling fast path in [`build_valid_cells_for`],
+/// as a multiple of [`MAX_VALID_CELLS`]. Sampling fills the cap in ~cap/density
+/// tries, so this lets it succeed down to ~1/8 valid-cell density before
+/// falling back to a full scan (the better tool once the grid is that crowded).
+const REJECTION_TRY_BUDGET: usize = 8;
+
+// TEMP profiling — remove after diagnosis. Counts full-scan fallbacks and the
+// cells those scans touch, to see how much the crowded-rebuild path costs.
+static PROF_FULL_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_SCAN_CELLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_REJECT_TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Clone, Copy)]
 pub struct PlacerConfig {
     /// Hard cap on per-instance placement attempts; overrides the
@@ -82,6 +106,15 @@ pub struct PlacerConfig {
     /// conservative enclosing-sphere clearance left — letting non-spherical
     /// meshes nestle until their actual proxy spheres touch. Off by default.
     pub densify: bool,
+    /// Deterministic ceiling on total candidate attempts in the densify
+    /// phase, summed across every interior directive. Densify is already
+    /// bounded per-directive (it abandons an ingredient after
+    /// `DENSIFY_FAIL_CAP` consecutive misses), but on a whole-cell recipe
+    /// those give-up tails sum to tens of millions of attempts; this is the
+    /// hard stop that keeps a `--densify` run from monopolising the machine.
+    /// Counts attempts, not wall time, so packing stays bit-for-bit
+    /// reproducible. When reached, densify stops and keeps what it placed.
+    pub densify_max_attempts: u64,
 }
 
 impl Default for PlacerConfig {
@@ -92,6 +125,7 @@ impl Default for PlacerConfig {
             clearance_cell_size: None,
             strict_bounds: true,
             densify: false,
+            densify_max_attempts: 20_000_000,
         }
     }
 }
@@ -218,10 +252,18 @@ impl<'a> GreedyRandomPlacer<'a> {
         // the ingredient's enclosing sphere fits with `radius`
         // clearance from every forbidden surface. Empty for Surface
         // directives.
+        let _t_build = std::time::Instant::now();
         let mut valid_cells: Vec<Vec<u32>> = directives
             .iter()
-            .map(|d| self.build_valid_cells(d, &clearance))
+            .map(|d| self.build_valid_cells(d, &clearance, &mut rng))
             .collect();
+        let mut prof_rebuilds = 0u64;
+        eprintln!(
+            "[prof] init valid_cells ({} dirs): {:.2?}",
+            directives.len(),
+            _t_build.elapsed()
+        );
+        let _t_main = std::time::Instant::now();
 
         loop {
             // Uniform-random pick over live directives — matches
@@ -269,7 +311,8 @@ impl<'a> GreedyRandomPlacer<'a> {
                         // list pruned across placements, but on
                         // emptiness we do a full pass — catches cells
                         // we never sampled directly.
-                        valid_cells[dir_idx] = self.build_valid_cells(directive, &clearance);
+                        prof_rebuilds += 1;
+                        valid_cells[dir_idx] = self.build_valid_cells(directive, &clearance, &mut rng);
                         pos = sample_from_valid_cells(
                             &mut valid_cells[dir_idx],
                             &clearance,
@@ -388,14 +431,31 @@ impl<'a> GreedyRandomPlacer<'a> {
             stats.placed += 1;
             stats.successful_attempts += 1;
         }
+        eprintln!(
+            "[prof] main pass: {:.2?} ({} placed, {} rebuilds)",
+            _t_main.elapsed(),
+            stats.placed,
+            prof_rebuilds
+        );
+        let _t_dens = std::time::Instant::now();
 
         // Densify phase: fill the remaining requested instances using
         // proxy-accurate fit — each candidate's *actual* proxy spheres must
         // clear the grid, not its enclosing sphere — so non-spherical meshes
         // nestle until their shapes touch, far tighter than the main pass.
+        //
+        // Bounded two ways: each directive abandons its ingredient after
+        // DENSIFY_FAIL_CAP consecutive misses, and the whole phase stops once
+        // it has made `densify_max_attempts` candidates total. On a whole-cell
+        // recipe the per-directive give-up tails alone sum to millions of
+        // attempts, so the global budget is the real guard against a
+        // `--densify` run monopolising the machine. The budget counts attempts
+        // (not wall time), so packing stays bit-for-bit reproducible.
         if self.config.densify {
             let margin = clearance.cell_size; // grid-resolution safety margin
-            for dir_idx in 0..directives.len() {
+            let budget = self.config.densify_max_attempts;
+            let mut densify_attempts = 0u64;
+            'densify: for dir_idx in 0..directives.len() {
                 let directive = directives[dir_idx];
                 if !matches!(directive.region, RegionKind::Interior) || remaining[dir_idx] == 0 {
                     continue;
@@ -414,6 +474,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                     .collect();
                 let mut consecutive_fail = 0u32;
                 while remaining[dir_idx] > 0 && consecutive_fail < DENSIFY_FAIL_CAP {
+                    if densify_attempts >= budget {
+                        break 'densify;
+                    }
+                    densify_attempts += 1;
                     // Sample an interior point whose enclosing sphere is
                     // contained (so all proxies stay inside the compartment).
                     let mut sampled = None;
@@ -439,19 +503,22 @@ impl<'a> GreedyRandomPlacer<'a> {
                     } else {
                         UnitQuaternion::identity()
                     };
-                    let proxies: Vec<(Point3<f32>, f32)> =
-                        ingredient.shape.world_spheres(pos, rot).collect();
                     per_ingredient_attempts[dir_idx] += 1;
                     stats.total_attempts += 1;
                     // Proxy-accurate fit: every proxy must clear the grid.
-                    if proxies
-                        .iter()
-                        .all(|(c, r)| clearance.clearance_at(*c) >= r + margin)
-                    {
+                    // Tested lazily over the (lazy) sphere iterator, so a mesh
+                    // whose first proxy already clashes never pays to transform
+                    // the rest — the dominant cost once the cell is crowded and
+                    // most attempts fail.
+                    let fits = ingredient
+                        .shape
+                        .world_spheres(pos, rot)
+                        .all(|(c, r)| clearance.clearance_at(c) >= r + margin);
+                    if fits {
                         let uid = next_uid;
                         next_uid += 1;
-                        for (c, r) in &proxies {
-                            clearance.update_for_placement(*c, *r, max_required_radius);
+                        for (c, r) in ingredient.shape.world_spheres(pos, rot) {
+                            clearance.update_for_placement(c, r, max_required_radius);
                         }
                         snapshot.placements.push(Placement {
                             instance_uid: uid,
@@ -473,6 +540,13 @@ impl<'a> GreedyRandomPlacer<'a> {
             }
         }
 
+        eprintln!(
+            "[prof] densify: {:.2?}  |  full_scans={} scan_cells={} reject_tries={}",
+            _t_dens.elapsed(),
+            PROF_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed),
+            PROF_SCAN_CELLS.load(std::sync::atomic::Ordering::Relaxed),
+            PROF_REJECT_TRIES.load(std::sync::atomic::Ordering::Relaxed),
+        );
         for (i, directive) in directives.iter().enumerate() {
             stats.per_ingredient.push((
                 directive.ingredient.clone(),
@@ -655,10 +729,11 @@ impl<'a> GreedyRandomPlacer<'a> {
     /// whose stored clearance is at least the required cell count AND
     /// whose centre passes the compartment's shape-fit test AND isn't
     /// inside a child compartment. Empty for Surface directives.
-    fn build_valid_cells(
+    fn build_valid_cells<R: Rng>(
         &self,
         directive: &PlacementDirective,
         grid: &ClearanceGrid,
+        rng: &mut R,
     ) -> Vec<u32> {
         if matches!(directive.region, RegionKind::Surface) {
             return Vec::new();
@@ -671,6 +746,7 @@ impl<'a> GreedyRandomPlacer<'a> {
             compartment,
             &self.recipe.compartments,
             self.config.strict_bounds,
+            rng,
         )
     }
 }
@@ -687,12 +763,13 @@ impl<'a> GreedyRandomPlacer<'a> {
 /// authoritative for the sphere-clearance check — sampling combined
 /// with slack-bounded jitter then keeps placements collision-free
 /// without a downstream QBVH check.
-fn build_valid_cells_for(
+fn build_valid_cells_for<R: Rng>(
     grid: &ClearanceGrid,
     ingredient: &Ingredient,
     compartment: &Compartment,
     all_compartments: &IndexMap<String, Compartment>,
     strict_bounds: bool,
+    rng: &mut R,
 ) -> Vec<u32> {
     let radius = ingredient.shape.enclosing_radius();
     let is_root_domain = compartment.parent.is_none();
@@ -733,30 +810,80 @@ fn build_valid_cells_for(
 
     let stride_y = grid.dims[0];
     let stride_z = grid.dims[0] * grid.dims[1];
-    let mut list = Vec::new();
-    for cz in lo_z..=hi_z {
-        let row_base_z = cz as usize * stride_z;
-        for cy in lo_y..=hi_y {
-            let row_base = row_base_z + cy as usize * stride_y;
-            for cx in lo_x..=hi_x {
-                let i = row_base + cx as usize;
-                if grid.clearance[i] < radius {
-                    continue;
-                }
-                let centre = grid.cell_centre([cx, cy, cz]);
-                if compartment.kind.signed_distance(centre) < compartment_cutoff {
-                    continue;
-                }
-                // Cell must be outside every child by at least `radius`:
-                // `signed_distance` is positive inside, so `-sd >= radius`
-                // means "outside the child by ≥ radius".
-                if children
-                    .iter()
-                    .any(|c| -c.kind.signed_distance(centre) < radius)
-                {
-                    continue;
-                }
+
+    // Is cell (cx,cy,cz) with flat index `i` a valid placement cell? Clearance
+    // ≥ radius, ≥ cutoff inside the host compartment, and ≥ radius outside every
+    // child compartment (`signed_distance` is positive inside, so `-sd ≥ radius`
+    // means "outside the child by ≥ radius"). Shared by both passes below.
+    let cell_valid = |i: usize, cx: i32, cy: i32, cz: i32| -> bool {
+        if grid.clearance[i] < radius {
+            return false;
+        }
+        let centre = grid.cell_centre([cx, cy, cz]);
+        if compartment.kind.signed_distance(centre) < compartment_cutoff {
+            return false;
+        }
+        !children
+            .iter()
+            .any(|c| -c.kind.signed_distance(centre) < radius)
+    };
+
+    let candidates =
+        (hi_x - lo_x + 1) as u64 * (hi_y - lo_y + 1) as u64 * (hi_z - lo_z + 1) as u64;
+
+    // Fast path: when the candidate volume dwarfs the cap, draw random cells and
+    // keep the valid ones rather than scanning every cell. The list is first
+    // built when the compartment is nearly empty, so almost every cell is valid
+    // and this fills the cap in ~cap/density tries — orders of magnitude fewer
+    // than the tens of millions of cells a whole-cell grid holds (where the full
+    // scan costs tens of billions of signed-distance evals). A try budget bounds
+    // the work; if the grid is too crowded to fill the cap by sampling, fall
+    // through to the exhaustive scan, which finds sparse valid cells directly.
+    if candidates > MAX_VALID_CELLS as u64 {
+        let budget = MAX_VALID_CELLS.saturating_mul(REJECTION_TRY_BUDGET);
+        let mut list = Vec::with_capacity(MAX_VALID_CELLS);
+        let mut tries = 0usize;
+        while list.len() < MAX_VALID_CELLS && tries < budget {
+            tries += 1;
+            let cx = rng.gen_range(lo_x..=hi_x);
+            let cy = rng.gen_range(lo_y..=hi_y);
+            let cz = rng.gen_range(lo_z..=hi_z);
+            let i = cx as usize + stride_y * cy as usize + stride_z * cz as usize;
+            if cell_valid(i, cx, cy, cz) {
                 list.push(i as u32);
+            }
+        }
+        PROF_REJECT_TRIES.fetch_add(tries as u64, std::sync::atomic::Ordering::Relaxed);
+        if list.len() == MAX_VALID_CELLS {
+            return list;
+        }
+        // Too crowded for sampling to pay off — fall through to a full scan.
+    }
+
+    // Exhaustive scan with reservoir sampling (Algorithm R): keeps a uniform
+    // random subset of at most MAX_VALID_CELLS valid cells in one pass. When the
+    // candidate volume is ≤ the cap this keeps every valid cell and draws no
+    // randomness, so ordinary recipes stay bit-for-bit reproducible.
+    PROF_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PROF_SCAN_CELLS.fetch_add(candidates, std::sync::atomic::Ordering::Relaxed);
+    let mut list: Vec<u32> = Vec::new();
+    let mut seen: usize = 0;
+    for cz in lo_z..=hi_z {
+        for cy in lo_y..=hi_y {
+            for cx in lo_x..=hi_x {
+                let i = cx as usize + stride_y * cy as usize + stride_z * cz as usize;
+                if !cell_valid(i, cx, cy, cz) {
+                    continue;
+                }
+                if seen < MAX_VALID_CELLS {
+                    list.push(i as u32);
+                } else {
+                    let j = rng.gen_range(0..=seen);
+                    if j < MAX_VALID_CELLS {
+                        list[j] = i as u32;
+                    }
+                }
+                seen += 1;
             }
         }
     }
@@ -1092,5 +1219,58 @@ mod tests {
         // The densify pass keeps the main pass's placements and only adds to
         // them, so it never regresses.
         assert!(dense.snapshot.placements.len() >= sparse.snapshot.placements.len());
+    }
+
+    #[test]
+    fn densify_budget_caps_the_phase() {
+        // Same thin-rod recipe. A zero attempt budget makes the densify phase
+        // produce no candidates, so it places exactly the enclosing-sphere
+        // pass's count — proof the global guard is honoured (and that a
+        // pathological recipe can't spin densify unbounded).
+        let src = r#"{
+            "bounding_box": [[0,0,0],[200,200,200]],
+            "objects": { "rod": { "type": "single_cylinder", "length": 80, "radius": 4 } },
+            "composition": {
+                "space": { "regions": { "interior": [ { "object": "rod", "count": 400 } ] } }
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(src).unwrap();
+        let sparse = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        let capped = GreedyRandomPlacer::new(
+            &recipe,
+            PlacerConfig { densify: true, densify_max_attempts: 0, ..PlacerConfig::default() },
+        )
+        .pack(7);
+        assert_eq!(
+            capped.snapshot.placements.len(),
+            sparse.snapshot.placements.len(),
+            "a zero budget must place exactly the enclosing-sphere pass's count",
+        );
+    }
+
+    #[test]
+    fn valid_cell_list_is_capped() {
+        use crate::clearance_grid::ClearanceGrid;
+        use rand::SeedableRng;
+        use rand_xoshiro::Xoshiro256PlusPlus;
+        // A fine grid over this box holds ~1M cells, ~900k valid for a small
+        // interior sphere — far above MAX_VALID_CELLS. Reservoir sampling must
+        // clamp the list to the cap; this is what stops a whole-cell recipe
+        // from OOMing while building hundreds of these lists at once.
+        let recipe = Recipe::from_json_str(
+            r#"{
+            "bounding_box": [[0,0,0],[200,200,200]],
+            "objects": { "s": { "type": "single_sphere", "radius": 3 } },
+            "composition": { "space": { "regions": { "interior": [ { "object": "s", "count": 1 } ] } } }
+        }"#,
+        )
+        .unwrap();
+        let grid = ClearanceGrid::new(recipe.bounding_box, 2.0);
+        let (_, ing) = recipe.ingredients.get_index(0).unwrap();
+        let (_, comp) = recipe.compartments.get_index(0).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        let cells =
+            build_valid_cells_for(&grid, ing, comp, &recipe.compartments, true, &mut rng);
+        assert_eq!(cells.len(), MAX_VALID_CELLS, "valid-cell list must clamp to the cap");
     }
 }
