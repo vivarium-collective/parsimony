@@ -144,11 +144,22 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
                         .iter()
                         .map(|l| json!({ "url": l.url, "voxel_size": l.voxel_size }))
                         .collect();
-                    json!({
+                    let mut shape = json!({
                         "kind": "mesh",
                         "lods": lods,
                         "enclosing_radius": ing.shape.enclosing_radius(),
-                    })
+                    });
+                    // Anisotropic stand-in for the viewer's placeholder /
+                    // far-LOD: a principal-axis ellipsoid so elongated
+                    // species read as cigars instead of fat enclosing
+                    // balls. Rotation is [w, x, y, z] (pack convention).
+                    if let Some(e) = ing.shape.principal_ellipsoid() {
+                        shape["ellipsoid"] = json!({
+                            "semi_axes": e.semi_axes,
+                            "rotation": [e.rotation.w, e.rotation.i, e.rotation.j, e.rotation.k],
+                        });
+                    }
+                    shape
                 }
             };
             json!({

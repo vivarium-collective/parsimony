@@ -152,8 +152,10 @@ echo "[view_pack] serving viewer at ${URL}"
 
 # Prefer uv-managed python (lets us declare a python version), fall
 # back to system python3. Either runs stdlib http.server only.
+# Use the repo's no-cache server so viewer.js edits + freshly packed
+# data always show up on reload (stdlib http.server caches aggressively).
 if command -v uv >/dev/null 2>&1; then
-    exec uv run --python 3.12 python -m http.server "$PORT"
+    exec uv run --python 3.12 python scripts/serve.py "$PORT"
 else
-    exec python3 -m http.server "$PORT"
+    exec python3 scripts/serve.py "$PORT"
 fi

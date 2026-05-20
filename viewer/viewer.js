@@ -31,6 +31,7 @@ const toggleBbox = document.getElementById("toggle-bbox");
 const toggleAxes = document.getElementById("toggle-axes");
 const toggleGrid = document.getElementById("toggle-bg-grid");
 const toggleSpin = document.getElementById("toggle-spin");
+const toggleMembrane = document.getElementById("toggle-membrane");
 const sliceAxis = document.getElementById("slice-axis");
 const slicePos = document.getElementById("slice-pos");
 const slicePosValue = document.getElementById("slice-pos-value");
@@ -238,6 +239,9 @@ gridHelper.position.y = 0;
 scene.add(gridHelper);
 
 let bboxLines = null;
+// Compartment surfaces (the "membrane"): translucent shells for sphere
+// compartments (the cell envelope). Rebuilt per packing, disposed with it.
+let compartmentMeshes = [];
 // Each entry tracks one ingredient type and all of its LOD slots.
 // `fallbackSphere` is the placeholder used before any OBJ arrives or
 // when no LOD is loaded for an instance's desired level. `lods[i]`
@@ -319,6 +323,7 @@ function clearPacking() {
     }
   }
   instancedMeshes = [];
+  disposeCompartments();
   if (bboxLines) {
     scene.remove(bboxLines);
     bboxLines.geometry.dispose();
@@ -404,6 +409,19 @@ function makeCelMaterial(color) {
 const objLoader = new OBJLoader();
 let objLoadInFlight = false;
 let _drainScheduled = false;
+
+// In-memory parsed-geometry cache — the tier above IndexedDB. Maps a
+// resolved OBJ URL to its merged, normal-computed BufferGeometry plus
+// the robust radius we derived from it. Unlike the per-scene
+// InstancedMeshes (which clearPacking disposes on every scene switch),
+// this map is never cleared during a session: navigating away from a
+// packing and back re-materialises its meshes straight from RAM — a
+// cheap geometry clone — instead of re-fetching, re-parsing, and
+// popping them in one-at-a-time through the load throttle. Entries are
+// "masters": no InstancedMesh ever owns one (every mesh gets a clone),
+// so they survive mesh disposal. Session-scoped; a page reload falls
+// back to the IndexedDB tier below.
+const geomMemCache = new Map(); // resolvedUrl -> { geom, robustR }
 
 // ───── IndexedDB-backed mesh cache ──────────────────────────────────
 // Stores already-parsed BufferGeometries (as raw typed-array dumps)
@@ -699,6 +717,33 @@ function scheduleDrain() {
 // but they're a single ~one-second blip — the next pick comes from
 // the *current* view.
 async function drainObjLoadQueue() {
+  // First tier: instantly satisfy every wanted level we already hold in
+  // the in-memory cache. These cost only a geometry clone — no fetch,
+  // no OBJ parse — so there's no reason to serialise them behind the
+  // one-at-a-time throttle the real loads use. Materialise them all in
+  // one synchronous batch, even while a real parse is in flight. This
+  // is what makes navigating back to a previously-viewed packing snap
+  // to full detail instead of popping in level-by-level.
+  let primedAny = false;
+  for (const entry of instancedMeshes) {
+    if (!entry.lods) continue;
+    for (let i = 0; i < entry.lods.length; i++) {
+      const lvl = entry.lods[i];
+      if (lvl.loaded || lvl.loading || !lvl.wantLoad) continue;
+      const cached = geomMemCache.get(resolveMeshUrl(lvl.url));
+      if (!cached) continue;
+      ensureLodMesh(entry, i, cached.geom, cached.robustR);
+      primedAny = true;
+    }
+  }
+  if (primedAny) {
+    updateMeshLoadingStatus();
+    scheduleReassess();
+  }
+
+  // Second tier: one real fetch+parse at a time. Everything cached was
+  // promoted to `loaded` above, so this scan only ever picks a level we
+  // don't yet have in memory.
   if (objLoadInFlight) return;
   let best = null;
   let bestPriority = Infinity;
@@ -719,8 +764,16 @@ async function drainObjLoadQueue() {
   objLoadInFlight = true;
   try {
     const geom = await fetchAndParseObj(best.lvl.url);
+    // Promote into the in-memory cache (recording robustR so revisits
+    // skip the percentile sort) before handing clones to the meshes.
+    const resolved = resolveMeshUrl(best.lvl.url);
+    let cached = geomMemCache.get(resolved);
+    if (!cached) {
+      cached = { geom, robustR: robustBoundingRadius(geom) };
+      geomMemCache.set(resolved, cached);
+    }
     if (!best.lvl.loaded) {
-      ensureLodMesh(best.entry, best.levelIdx, geom);
+      ensureLodMesh(best.entry, best.levelIdx, cached.geom, cached.robustR);
       updateMeshLoadingStatus();
       scheduleReassess();
     }
@@ -733,6 +786,97 @@ async function drainObjLoadQueue() {
     // installed InstancedMesh and any pending UI work get a turn
     // before the next 1-2 second OBJ parse blocks the main thread.
     setTimeout(drainObjLoadQueue, 0);
+  }
+}
+
+// ───── compartment surfaces ("membrane") ───────────────────────────
+// Compartments arrive as sphere / box / mesh boundaries. We render
+// sphere compartments (the cell envelope) as a translucent, fresnel-
+// rimmed shell with a faint cellular grain — evoking the lipid bilayer
+// that the surface lipids tile, so the membrane reads as a surface
+// rather than a loose cloud of head-group beads. The outer "space" box
+// is already drawn as the bbox wireframe, so box compartments are
+// skipped; mesh compartments aren't rendered yet.
+function makeMembraneMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(0x5fc6d4) },
+      uOpacity: { value: 0.13 },
+      uRim: { value: 0.55 },
+      uGrainScale: { value: 0.14 },
+    },
+    vertexShader: `
+      varying vec3 vN; varying vec3 vWorld; varying vec3 vLocal;
+      void main() {
+        vLocal = position;
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorld = wp.xyz;
+        vN = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColor; uniform float uOpacity; uniform float uRim; uniform float uGrainScale;
+      varying vec3 vN; varying vec3 vWorld; varying vec3 vLocal;
+      vec3 hash3(vec3 p) {
+        p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
+                 dot(p, vec3(269.5, 183.3, 246.1)),
+                 dot(p, vec3(113.5, 271.9, 124.6)));
+        return fract(sin(p) * 43758.5453);
+      }
+      // Worley/cellular distance — a pebbled "lipid head" grain.
+      float worley(vec3 p) {
+        vec3 ip = floor(p); vec3 fp = fract(p); float d = 1.0;
+        for (int x = -1; x <= 1; x++)
+        for (int y = -1; y <= 1; y++)
+        for (int z = -1; z <= 1; z++) {
+          vec3 g = vec3(float(x), float(y), float(z));
+          vec3 o = hash3(ip + g); vec3 r = g + o - fp;
+          d = min(d, dot(r, r));
+        }
+        return sqrt(d);
+      }
+      void main() {
+        vec3 N = normalize(vN);
+        vec3 V = normalize(cameraPosition - vWorld);
+        float fres = pow(1.0 - abs(dot(N, V)), 3.0);
+        float w = worley(vLocal * uGrainScale);
+        float pebble = smoothstep(0.12, 0.7, w);
+        float grain = mix(0.82, 1.18, 1.0 - pebble);
+        vec3 col = uColor * grain;
+        float a = clamp(uOpacity * grain + fres * uRim, 0.0, 0.92);
+        gl_FragColor = vec4(col, a);
+      }
+    `,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+}
+
+function disposeCompartments() {
+  for (const m of compartmentMeshes) {
+    scene.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
+  }
+  compartmentMeshes = [];
+}
+
+function buildCompartments(doc) {
+  const comps = doc.compartments || [];
+  for (const c of comps) {
+    if (c.kind !== "sphere" || !Array.isArray(c.center) || typeof c.radius !== "number") {
+      continue; // box → bbox wireframe already; mesh → not yet rendered
+    }
+    const geom = new THREE.SphereGeometry(c.radius, 64, 48);
+    geom.translate(c.center[0], c.center[1], c.center[2]);
+    const mesh = new THREE.Mesh(geom, makeMembraneMaterial());
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 2; // draw after opaque contents so it blends over them
+    mesh.visible = !toggleMembrane || toggleMembrane.checked;
+    scene.add(mesh);
+    compartmentMeshes.push(mesh);
   }
 }
 
@@ -810,6 +954,7 @@ async function buildScene(doc, fileName) {
   }
   bboxLines = makeBoxLines(bbMin, bbMax, 0x556677);
   scene.add(bboxLines);
+  buildCompartments(doc);
 
   framePacking(bbMin, bbMax);
   renderLegend();
@@ -845,6 +990,27 @@ function buildFallbackGeometry(ing, enclosingRadius) {
     const merged = mergeGeometries(geoms, false);
     geoms.forEach((g) => g.dispose());
     if (merged) return merged;
+  }
+  // Mesh ingredients get an anisotropic ellipsoid placeholder: a unit
+  // sphere baked into the principal-axis ellipsoid the packer fitted to
+  // the molecule. Elongated species then read as cigars (and flat ones
+  // as discs) instead of fat enclosing balls, both before their OBJ
+  // LODs stream in and at the sub-3px far range that never loads a mesh.
+  // The per-instance placement quaternion (applied in reassessLODs)
+  // orients the whole ellipsoid, so the instance path is unchanged and
+  // sphere↔mesh swaps keep apparent size. Older packs without the field
+  // fall through to the plain enclosing sphere.
+  const ell = ing.shape.kind === "mesh" ? ing.shape.ellipsoid : null;
+  if (ell && Array.isArray(ell.semi_axes)) {
+    const r = Array.isArray(ell.rotation) ? ell.rotation : [1, 0, 0, 0];
+    const g = new THREE.SphereGeometry(1, 20, 12);
+    const m = new THREE.Matrix4().compose(
+      new THREE.Vector3(),
+      new THREE.Quaternion(r[1], r[2], r[3], r[0]), // pack stores [w, x, y, z]
+      new THREE.Vector3(ell.semi_axes[0], ell.semi_axes[1], ell.semi_axes[2]),
+    );
+    g.applyMatrix4(m);
+    return g;
   }
   return new THREE.SphereGeometry(enclosingRadius, 24, 12);
 }
@@ -910,7 +1076,7 @@ function addInstancedType(ing, color, enclosingRadius, pts) {
 // once its OBJ has finished loading. Count is left at 0; the next
 // `reassessLODs` call fills it. We dispose any prior geometry so
 // repeated calls (e.g. on reload) don't leak GPU buffers.
-function ensureLodMesh(entry, levelIdx, geom) {
+function ensureLodMesh(entry, levelIdx, geom, robustR) {
   const lvl = entry.lods[levelIdx];
 
   // Per-LOD bounding analysis: the robust radius (99th-percentile
@@ -935,7 +1101,10 @@ function ensureLodMesh(entry, levelIdx, geom) {
   // 3.5×, stretching the blob beyond recognition), we mark the
   // LOD degenerate and the picker walks past it instead of
   // rendering a distorted version.
-  const robustR = robustBoundingRadius(geom);
+  // robustR is supplied by the caller when the geometry came from the
+  // in-memory cache (we recorded it at first parse); recompute only on
+  // a true first load.
+  if (robustR == null) robustR = robustBoundingRadius(geom);
   const targetR = entry.enclosingRadius;
   if (robustR > 1e-6) {
     const ratio = robustR / targetR;
@@ -953,7 +1122,7 @@ function ensureLodMesh(entry, levelIdx, geom) {
     // Already created; replace geometry in place.
     lvl.standardMesh.geometry.dispose();
     lvl.celMesh.geometry.dispose();
-    lvl.standardMesh.geometry = geom;
+    lvl.standardMesh.geometry = geom.clone();
     lvl.celMesh.geometry = geom.clone();
   } else {
     const standardMat = new THREE.MeshStandardMaterial({
@@ -961,7 +1130,10 @@ function ensureLodMesh(entry, levelIdx, geom) {
       roughness: 0.55,
       metalness: 0.05,
     });
-    const standard = new THREE.InstancedMesh(geom, standardMat, entry.placements.length);
+    // Both meshes own a clone; `geom` stays an unowned master in
+    // geomMemCache so clearPacking (which disposes mesh geometries)
+    // can't free the cached copy.
+    const standard = new THREE.InstancedMesh(geom.clone(), standardMat, entry.placements.length);
     const cel = new THREE.InstancedMesh(
       geom.clone(),
       makeCelMaterial(entry.color),
@@ -1439,6 +1611,11 @@ toggleGrid.addEventListener("change", () => {
 toggleSpin.addEventListener("change", () => {
   autoSpin = toggleSpin.checked;
 });
+if (toggleMembrane) {
+  toggleMembrane.addEventListener("change", () => {
+    for (const m of compartmentMeshes) m.visible = toggleMembrane.checked;
+  });
+}
 sliceAxis.addEventListener("change", applyClippingPlane);
 slicePos.addEventListener("input", applyClippingPlane);
 sliceFlip.addEventListener("change", applyClippingPlane);

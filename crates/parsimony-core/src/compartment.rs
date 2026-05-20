@@ -325,6 +325,28 @@ impl CompartmentKind {
         }
     }
 
+    /// Deterministic even ("Fibonacci sphere") surface point + outward
+    /// normal: the `i`-th of `n` points spread quasi-uniformly over the
+    /// surface. Tiled surface placement (e.g. a lipid bilayer) uses this
+    /// instead of random `sample_surface` + collision rejection, which
+    /// blows up for a dense regular layer. Returns `None` for kinds
+    /// without an analytic even tiling; callers fall back to random.
+    pub fn surface_point_fibonacci(&self, i: u64, n: u64) -> Option<(Point3<f32>, Vector3<f32>)> {
+        match self {
+            CompartmentKind::Sphere { center, radius } => {
+                let nf = n.max(1) as f32;
+                let ifl = i as f32;
+                let y = 1.0 - 2.0 * (ifl + 0.5) / nf; // walk +1 → −1
+                let r = (1.0 - y * y).max(0.0).sqrt();
+                let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+                let theta = golden * ifl;
+                let dir = Vector3::new(theta.cos() * r, y, theta.sin() * r);
+                Some((center + dir * *radius, dir))
+            }
+            _ => None,
+        }
+    }
+
     pub fn aabb(&self) -> Aabb {
         match self {
             CompartmentKind::Box(aabb) => *aabb,

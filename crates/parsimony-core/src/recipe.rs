@@ -162,11 +162,15 @@ pub enum RegionKind {
 }
 
 /// How a placement candidate is picked. Mirrors cellPACK's `packing_mode`
-/// field; only `Random` is supported in v0.1.
+/// field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PackingMode {
     #[default]
     Random,
+    /// Even ("Fibonacci") tiling over a compartment surface — for dense
+    /// regular layers like a lipid bilayer. Falls back to random on
+    /// compartments without an analytic even tiling.
+    Tiled,
 }
 
 /// One resolved placement directive: "place `count` instances of
@@ -820,6 +824,7 @@ fn walk_composition_region(
 fn parse_packing_mode(s: Option<&str>) -> Result<PackingMode, RecipeError> {
     match s {
         None | Some("random") => Ok(PackingMode::Random),
+        Some("tiled") => Ok(PackingMode::Tiled),
         Some(other) => Err(RecipeError::UnsupportedPackingMode(other.to_string())),
     }
 }
@@ -974,15 +979,14 @@ mod tests {
     }
 
     #[test]
-    fn loads_real_spheres_in_a_box_from_cellpack() {
-        // Smoke test against the actual file in the cellpack clone, if present.
-        let path = std::path::Path::new(
-            "/home/pattern/code/cellpack/examples/recipes/v2/spheres_in_a_box.json",
+    fn loads_real_spheres_in_a_box() {
+        // Smoke test against the vendored recipe (examples/recipes/),
+        // resolved relative to this crate so it's machine-independent.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/recipes/spheres_in_a_box.json"
         );
-        if !path.exists() {
-            return; // skip if cellpack isn't available
-        }
-        let r = Recipe::from_file(path).expect("load real recipe");
+        let r = Recipe::from_file(std::path::Path::new(path)).expect("load vendored recipe");
         assert_eq!(r.directives.iter().map(|d| d.count).sum::<u32>(), 630);
     }
 
@@ -1127,11 +1131,10 @@ mod tests {
 
     #[test]
     fn loads_mesh_compartment_from_local_obj() {
-        let mesh_path = "/home/pattern/code/cellpack/cellpack/tests/geometry/sphere.obj";
-        if !std::path::Path::new(mesh_path).exists() {
-            eprintln!("skipping: cellpack sphere.obj not at expected path");
-            return;
-        }
+        let mesh_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/meshes/sphere.obj"
+        );
         // Quoted JSON values must escape backslashes; the path is
         // POSIX-clean here so we can inline directly.
         let src = format!(
@@ -1170,12 +1173,11 @@ mod tests {
 
     #[test]
     fn loads_mesh_ingredient_from_local_obj() {
-        // Use cellpack's local sphere.obj (tessellated unit sphere).
-        let mesh_path = "/home/pattern/code/cellpack/cellpack/tests/geometry/sphere.obj";
-        if !std::path::Path::new(mesh_path).exists() {
-            eprintln!("skipping: cellpack sphere.obj not at expected path");
-            return;
-        }
+        // Use the repo's tessellated sphere.obj (examples/meshes).
+        let mesh_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/meshes/sphere.obj"
+        );
         let src = format!(
             r#"{{
                 "bounding_box": [[0,0,0],[100,100,100]],

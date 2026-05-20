@@ -33,7 +33,7 @@ use crate::clearance_grid::ClearanceGrid;
 use crate::compartment::{Compartment, align_to_normal};
 use crate::ingredient::{Ingredient, IngredientShape};
 use crate::placement::{Placement, Snapshot};
-use crate::recipe::{PlacementDirective, Recipe, RegionKind};
+use crate::recipe::{PackingMode, PlacementDirective, Recipe, RegionKind};
 
 /// Uniform random rotation on SO(3) via Shoemake's method. Pure 3D
 /// uniform — equiprobable orientation, no Euler-angle biasing.
@@ -259,7 +259,25 @@ impl<'a> GreedyRandomPlacer<'a> {
                     (pos, rot)
                 }
                 RegionKind::Surface => {
-                    let (p, n) = compartment.kind.sample_surface(&mut rng);
+                    // Tiled ingredients (e.g. a lipid bilayer) walk an
+                    // even Fibonacci point set instead of random sampling
+                    // + rejection — dense and O(count). Each attempt takes
+                    // the next point; once the set is exhausted the layer
+                    // is laid. Non-tileable compartments fall back to
+                    // random sampling.
+                    let (p, n) = if matches!(ingredient.packing_mode, PackingMode::Tiled) {
+                        let idx = per_ingredient_attempts[dir_idx] - 1; // 0-based this attempt
+                        if idx >= directive.count as u64 {
+                            stuck[dir_idx] = true;
+                            continue;
+                        }
+                        compartment
+                            .kind
+                            .surface_point_fibonacci(idx, directive.count as u64)
+                            .unwrap_or_else(|| compartment.kind.sample_surface(&mut rng))
+                    } else {
+                        compartment.kind.sample_surface(&mut rng)
+                    };
                     let rot = align_to_normal(ingredient.principal_vector, n);
                     (p, rot)
                 }
@@ -270,8 +288,14 @@ impl<'a> GreedyRandomPlacer<'a> {
             // those. Interior placements were picked from a cell whose
             // clearance ≥ radius and jittered within the cell's
             // slack — the grid + slack-bounded jitter mathematically
-            // guarantee no overlap, so we skip the QBVH check.
-            if matches!(directive.region, RegionKind::Surface)
+            // guarantee no overlap, so we skip the QBVH check. Tiled
+            // surface layers (e.g. a lipid bilayer) self-avoid by
+            // construction (even Fibonacci spacing), so they skip the
+            // check — and the QBVH insert + clearance update below — to
+            // stay O(count) instead of O(count^2) at high density.
+            let tiled = matches!(ingredient.packing_mode, PackingMode::Tiled);
+            if !tiled
+                && matches!(directive.region, RegionKind::Surface)
                 && self.collides_with_existing(
                     &ingredient.shape,
                     pos,
@@ -293,7 +317,13 @@ impl<'a> GreedyRandomPlacer<'a> {
             let uid = next_uid;
             next_uid += 1;
             let candidate_aabb = Aabb::from_sphere(pos, enclosing_radius);
-            index.insert(uid, candidate_aabb).expect("uid collision");
+            // Tiled layers stay out of the QBVH + clearance grid (they
+            // self-avoid and form a thin decorative shell). We still push
+            // the per-uid arrays so they stay aligned by uid — those
+            // entries simply never get queried since they're not indexed.
+            if !tiled {
+                index.insert(uid, candidate_aabb).expect("uid collision");
+            }
             shapes_by_uid.push(&ingredient.shape);
             centers_by_uid.push(pos);
             rotations_by_uid.push(rotation);
@@ -302,8 +332,10 @@ impl<'a> GreedyRandomPlacer<'a> {
             // sphere) and distance for cells in range. Every proxy
             // sphere of the placed ingredient gets its own update so
             // multi-sphere ingredients are tracked accurately.
-            for (c, r) in ingredient.shape.world_spheres(pos, rotation) {
-                clearance.update_for_placement(c, r, max_required_radius);
+            if !tiled {
+                for (c, r) in ingredient.shape.world_spheres(pos, rotation) {
+                    clearance.update_for_placement(c, r, max_required_radius);
+                }
             }
             snapshot.placements.push(Placement {
                 instance_uid: uid,

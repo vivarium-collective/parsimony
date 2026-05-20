@@ -1,6 +1,6 @@
-//! End-to-end integration test: load cellPACK's `spheres_in_a_box.json`,
-//! pack it, validate the result. Skipped (with a warning printed) if
-//! the cellPACK clone isn't present at the expected path.
+//! End-to-end integration test: load the vendored `spheres_in_a_box.json`
+//! (examples/recipes/), pack it, and validate the result. The recipe
+//! lives in-repo, so this no longer depends on a cellPACK checkout.
 
 use std::path::Path;
 use std::time::Instant;
@@ -9,12 +9,14 @@ use parsimony_core::{
     write_simularium_json, write_transforms_json, GreedyRandomPlacer, PlacerConfig, Recipe,
 };
 
-const CELLPACK_RECIPE: &str =
-    "/home/pattern/code/cellpack/examples/recipes/v2/spheres_in_a_box.json";
+const SPHERES_RECIPE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/recipes/spheres_in_a_box.json"
+);
 
-fn cellpack_recipe_path() -> Option<&'static Path> {
-    let p = Path::new(CELLPACK_RECIPE);
-    if p.exists() { Some(p) } else { None }
+fn spheres_recipe_path() -> Option<&'static Path> {
+    // Vendored in-repo — always present, so the tests below never skip.
+    Some(Path::new(SPHERES_RECIPE))
 }
 
 #[test]
@@ -24,8 +26,8 @@ fn pack_runs_under_time_budget() {
     // clearance-update loop. Bound generously so both pass; release
     // builds get a dedicated perf assertion in the bench.
     let bound_ms = if cfg!(debug_assertions) { 15_000 } else { 2_000 };
-    let Some(path) = cellpack_recipe_path() else {
-        eprintln!("skipping: {CELLPACK_RECIPE} not found");
+    let Some(path) = spheres_recipe_path() else {
+        eprintln!("skipping: {SPHERES_RECIPE} not found");
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -44,7 +46,7 @@ fn pack_runs_under_time_budget() {
 
 #[test]
 fn pack_places_a_reasonable_fraction() {
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -64,7 +66,7 @@ fn pack_places_a_reasonable_fraction() {
 
 #[test]
 fn no_overlaps_in_packing() {
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -103,7 +105,7 @@ fn all_inside_bounding_box() {
     // and match cellPACK's `is_point_inside_bb` default) is opt-in via
     // `PlacerConfig::strict_bounds = false`; see the placer's unit
     // tests for that path.
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -130,7 +132,7 @@ fn all_inside_bounding_box() {
 
 #[test]
 fn simularium_output_is_well_formed() {
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -156,7 +158,7 @@ fn simularium_output_is_well_formed() {
 
 #[test]
 fn transforms_output_is_well_formed() {
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");
@@ -171,7 +173,7 @@ fn transforms_output_is_well_formed() {
 
 #[test]
 fn deterministic_same_seed_same_output() {
-    let Some(path) = cellpack_recipe_path() else {
+    let Some(path) = spheres_recipe_path() else {
         return;
     };
     let recipe = Recipe::from_file(path).expect("load recipe");

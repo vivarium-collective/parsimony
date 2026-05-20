@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use nalgebra::{Point3, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Point3, Rotation3, SymmetricEigen, UnitQuaternion, Vector3};
 use parry3d::shape::TriMesh;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,19 @@ pub type IngredientId = u32;
 pub struct ProxySphere {
     pub offset: Vector3<f32>,
     pub radius: f32,
+}
+
+/// An origin-centred, principal-axis-aligned ellipsoid fitted to an
+/// ingredient's geometry. `semi_axes` are the half-extents along the
+/// local axes encoded by `rotation` (which maps ellipsoid-local axes
+/// into ingredient-local space). Renderers use it as a cheap
+/// anisotropic stand-in — a cigar for rods, a disc for plates — where
+/// they'd otherwise draw a single enclosing sphere that over-claims
+/// badly for non-spherical molecules.
+#[derive(Debug, Clone, Copy)]
+pub struct PrincipalEllipsoid {
+    pub semi_axes: [f32; 3],
+    pub rotation: UnitQuaternion<f32>,
 }
 
 /// Shape representation used for collision testing. cellPACK calls
@@ -79,6 +92,23 @@ impl IngredientShape {
                     .map(|v| v.coords.norm())
                     .fold(0.0_f32, f32::max);
                 from_proxies.max(from_vertices)
+            }
+        }
+    }
+
+    /// An origin-centred, principal-axis ellipsoid that snugly encloses
+    /// this shape — a cheap anisotropic stand-in for renderers to draw
+    /// as the placeholder / far-LOD proxy instead of a single enclosing
+    /// sphere (which reads as a fat ball for elongated or flat
+    /// molecules). `None` when a sphere is already faithful
+    /// (`SingleSphere`) or when multi-sphere already renders its own
+    /// shape-true union, or there aren't enough points to fit one.
+    pub fn principal_ellipsoid(&self) -> Option<PrincipalEllipsoid> {
+        match self {
+            IngredientShape::SingleSphere { .. } => None,
+            IngredientShape::MultiSphere { .. } => None,
+            IngredientShape::Mesh { trimesh, .. } => {
+                principal_ellipsoid_of(trimesh.vertices().iter().map(|v| v.coords))
             }
         }
     }
@@ -144,6 +174,61 @@ impl IngredientShape {
         let proxies = shape_helpers::voxelise_mesh_to_proxies(&trimesh, voxel_size);
         IngredientShape::Mesh { trimesh, proxies }
     }
+}
+
+/// Fit an origin-centred oriented ellipsoid to a point cloud. The axes
+/// are the eigenvectors of the centroid-relative covariance (the
+/// principal directions); each semi-axis is the 99th-percentile
+/// |projection onto that axis| measured from the ORIGIN — so the
+/// ellipsoid is centred where the rendered geometry's origin is (the
+/// same place the sphere proxy it replaces sits) and shrugs off the
+/// stray outlier vertices marching-cubes surfaces sometimes leave far
+/// from the body. Returns `None` for clouds too small to fit.
+fn principal_ellipsoid_of(
+    points: impl Iterator<Item = Vector3<f32>>,
+) -> Option<PrincipalEllipsoid> {
+    let pts: Vec<Vector3<f32>> = points.collect();
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+    let inv_n = 1.0 / n as f32;
+
+    let mut centroid = Vector3::zeros();
+    for p in &pts {
+        centroid += *p;
+    }
+    centroid *= inv_n;
+
+    let mut cov = Matrix3::zeros();
+    for p in &pts {
+        let d = *p - centroid;
+        cov += d * d.transpose();
+    }
+    cov *= inv_n;
+
+    // Eigenvectors of a symmetric matrix are orthonormal, so `axes` is
+    // orthogonal (det ±1). Flip one column if it came out left-handed
+    // so `from_rotation_matrix` reads a rotation, not a reflection.
+    let mut axes = SymmetricEigen::new(cov).eigenvectors;
+    if axes.determinant() < 0.0 {
+        let flipped = -axes.column(2).into_owned();
+        axes.set_column(2, &flipped);
+    }
+
+    let cut = ((n as f32 * 0.99) as usize).min(n - 1);
+    let mut semi_axes = [0.0_f32; 3];
+    for k in 0..3 {
+        let axis = axes.column(k).into_owned();
+        let mut proj: Vec<f32> = pts.iter().map(|p| p.dot(&axis).abs()).collect();
+        proj.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        // Clamp away from zero so a perfectly flat axis still yields a
+        // (very thin) renderable ellipsoid rather than a degenerate one.
+        semi_axes[k] = proj[cut].max(1e-3);
+    }
+
+    let rotation = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(axes));
+    Some(PrincipalEllipsoid { semi_axes, rotation })
 }
 
 pub struct WorldSphereIter<'a> {
@@ -414,5 +499,44 @@ pub mod obj {
         }
         TriMesh::new(vertices, indices)
             .map_err(|e| ObjError::TriMesh(format!("{e:?}")))
+    }
+}
+
+#[cfg(test)]
+mod ellipsoid_tests {
+    use super::*;
+
+    #[test]
+    fn fit_is_anisotropic_and_axis_aligned() {
+        // A cloud stretched ~10:1 along local X, thin in Y/Z.
+        let mut pts = Vec::new();
+        for i in 0..400 {
+            let t = i as f32 / 399.0;
+            pts.push(Vector3::new(
+                (t - 0.5) * 20.0,                 // x in [-10, 10]
+                ((i % 7) as f32 - 3.0) * 0.2,     // y in ~[-0.6, 0.6]
+                ((i % 5) as f32 - 2.0) * 0.2,     // z in ~[-0.4, 0.4]
+            ));
+        }
+        let e = principal_ellipsoid_of(pts.into_iter()).expect("fit");
+
+        let max = e.semi_axes.iter().copied().fold(0.0_f32, f32::max);
+        let min = e.semi_axes.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(max > 8.0, "long semi-axis should be ~10, got {max}");
+        assert!(min < 2.0, "short semi-axes should be thin, got {min}");
+
+        // The long axis must point along ±X in ingredient-local space.
+        let k = (0..3)
+            .max_by(|a, b| e.semi_axes[*a].partial_cmp(&e.semi_axes[*b]).unwrap())
+            .unwrap();
+        let local = Vector3::new((k == 0) as i32 as f32, (k == 1) as i32 as f32, (k == 2) as i32 as f32);
+        let world = e.rotation * local;
+        assert!(world.x.abs() > 0.98, "long axis should align with ±X, got {world:?}");
+    }
+
+    #[test]
+    fn none_for_tiny_cloud() {
+        let pts = vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)];
+        assert!(principal_ellipsoid_of(pts.into_iter()).is_none());
     }
 }

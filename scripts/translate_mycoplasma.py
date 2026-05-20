@@ -227,9 +227,10 @@ def main() -> int:
                          "is ~150-200 nm diameter; default 2000 Å = 400 nm "
                          "diameter, deliberately generous so the proteins "
                          "have room)")
-    ap.add_argument("--lipid-count", type=int, default=8000,
-                    help="Synthetic lipid head-group spheres placed on the "
-                         "cell-sphere surface (default 8000; 0 disables).")
+    ap.add_argument("--lipid-count", type=int, default=40000,
+                    help="Coarse-grained bilayer lipids tiled evenly over the "
+                         "cell surface (default 40000; 0 disables). Tune up for "
+                         "a denser, more continuous-looking membrane.")
     args = ap.parse_args()
 
     if args.recipe_json is None:
@@ -359,22 +360,30 @@ def main() -> int:
         # Offset palette so surface proteins read differently from interior.
         convert_one(ing, surface_entries, idx + 5)
 
-    # Add a simple lipid placeholder so the membrane reads visually.
-    # cellPACK's Maritan model uses atomic lipids (~30k of them);
-    # we approximate with a synthetic surface ingredient placed by
-    # parsimony's Surface region on the sphere compartment.
+    # Coarse-grained bilayer-spanning lipid. Real membranes have ~10^6
+    # lipids; Maritan uses atomic ones. We approximate with a multi-
+    # sphere whose head/tail/tail/head beads straddle the membrane: when
+    # the Surface region orients its principal_vector (+Z) along the
+    # outward normal, the two heads land on the inner/outer faces and the
+    # tails fill the core, so a field of these reads as a two-leaflet
+    # bilayer (~60 A thick, matching the real lipid patches in the
+    # Maritan data). `lipid_count` is the coarse-grained unit count.
     if args.lipid_count > 0:
-        objects["lipid_head"] = {
-            "type": "single_sphere",
+        objects["lipid"] = {
+            "type": "multi_sphere",
             "color": [0.96, 0.86, 0.55],
-            "radius": 5.0,
+            "positions": [[0, 0, 25], [0, 0, 11], [0, 0, -11], [0, 0, -25]],
+            "radii": [5.0, 3.2, 3.2, 5.0],
             "principal_vector": [0, 0, 1],
+            # Even Fibonacci tiling over the surface (not collision-packed)
+            # so the bilayer is dense + the pack stays O(count).
+            "packing_mode": "tiled",
         }
         surface_entries.append(
-            {"object": "lipid_head", "count": args.lipid_count}
+            {"object": "lipid", "count": args.lipid_count}
         )
-        print(f"\nadded synthetic lipid bilayer: {args.lipid_count:,} surface placements",
-              file=sys.stderr)
+        print(f"\nadded coarse-grained lipid bilayer: {args.lipid_count:,} "
+              f"bilayer-spanning surface placements", file=sys.stderr)
 
     # Compose the parsimony recipe — a Sphere compartment for the cell
     # carries both an interior region (cytoplasmic proteins) and a

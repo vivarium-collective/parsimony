@@ -16999,19 +16999,47 @@
         }
       ]
     },
-    "lipid_head": {
-      "type": "single_sphere",
+    "lipid": {
+      "type": "multi_sphere",
       "color": [
         0.96,
         0.86,
         0.55
       ],
-      "radius": 5.0,
+      "positions": [
+        [
+          0,
+          0,
+          25
+        ],
+        [
+          0,
+          0,
+          11
+        ],
+        [
+          0,
+          0,
+          -11
+        ],
+        [
+          0,
+          0,
+          -25
+        ]
+      ],
+      "radii": [
+        5.0,
+        3.2,
+        3.2,
+        5.0
+      ],
       "principal_vector": [
         0,
         0,
         1
-      ]
+      ],
+      "packing_mode": "tiled"
     }
   },
   "composition": {
@@ -19553,8 +19581,8 @@
             "count": 0
           },
           {
-            "object": "lipid_head",
-            "count": 8000
+            "object": "lipid",
+            "count": 40000
           }
         ]
       }
