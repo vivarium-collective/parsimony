@@ -32,6 +32,7 @@ const toggleAxes = document.getElementById("toggle-axes");
 const toggleGrid = document.getElementById("toggle-bg-grid");
 const toggleSpin = document.getElementById("toggle-spin");
 const toggleMembrane = document.getElementById("toggle-membrane");
+const toggleFiber = document.getElementById("toggle-fiber");
 const sliceAxis = document.getElementById("slice-axis");
 const slicePos = document.getElementById("slice-pos");
 const slicePosValue = document.getElementById("slice-pos-value");
@@ -981,7 +982,11 @@ const MEMBRANE_SPACING = 11;       // Å between lipids in a leaflet (smaller = 
 const MEMBRANE_THICKNESS = 40;     // Å total bilayer thickness (centred on the cell surface)
 const MEMBRANE_HEAD_RADIUS = 5;    // Å headgroup impostor radius
 const MEMBRANE_TAIL_RADIUS = 4.0;  // Å tail-bead impostor radius (fat enough to read as a continuous strand)
-const MEMBRANE_MAX_POINTS = 3000000;
+// Hard cap on bilayer impostor sprites. At 11 Å spacing over a 2000 Å cell the
+// shell wants ~2.5M sprites — enough to tank far-view navigation on its own
+// (it's the dominant cost; the interior is negligible by comparison). Cap it
+// ~8× lower; the membrane reads as a slightly sparser shell but stays smooth.
+const MEMBRANE_MAX_POINTS = 300000;
 
 function makeImpostorMaterial(headColor) {
   return new THREE.ShaderMaterial({
@@ -1115,6 +1120,7 @@ function buildFiber(ing, placements) {
     const geom = new THREE.TubeGeometry(curve, tubular, sh.radius || 8, 8, false);
     const mesh = new THREE.Mesh(geom, mat);
     mesh.frustumCulled = false;
+    mesh.visible = !toggleFiber || toggleFiber.checked;
     scene.add(mesh);
     fiberMeshes.push(mesh);
   }
@@ -1444,7 +1450,20 @@ let lodVoxelPixelTarget = 4.0;
 // where the smoothed OBJ silhouette becomes visually distinct from
 // a sphere; small ingredients switch to OBJ as soon as the user
 // gets close enough to perceive the shape difference.
-const lodSphereBudgetPx = 3.0;
+//
+// On a whole-cell recipe (~20k mesh instances), viewing the whole cell
+// from far away puts every instance in the frustum at a few px each —
+// at 3 px they ALL route to meshes (no culling, mass OBJ loads) and the
+// view becomes unnavigable. Default to a higher budget so distant
+// instances stay cheap proxies; the "Mesh @px" slider tunes it.
+let lodSphereBudgetPx = 12.0;
+
+// Fraction of each ingredient's instances actually drawn — a viz-only
+// subsample (the pack order is random, so a prefix is a uniform random
+// subset). The packed cell is numerically sparse (~4% volume) but the
+// oversized ellipsoid proxies read as crowded; halving the drawn instances
+// declutters and cuts render load without re-packing. Driven by "Show %".
+let interiorFraction = 0.5;
 
 let reassessQueued = false;
 function scheduleReassess() {
@@ -1511,7 +1530,8 @@ function reassessLODs() {
       }
     }
 
-    for (let pi = 0; pi < entry.placements.length; pi++) {
+    const nShow = Math.round(entry.placements.length * interiorFraction);
+    for (let pi = 0; pi < nShow; pi++) {
       const p = entry.placements[pi];
       const px = p.position[0], py = p.position[1], pz = p.position[2];
       _tmpSphere.center.set(px, py, pz);
@@ -1903,6 +1923,11 @@ if (toggleMembrane) {
     for (const m of compartmentMeshes) m.visible = toggleMembrane.checked;
   });
 }
+if (toggleFiber) {
+  toggleFiber.addEventListener("change", () => {
+    for (const m of fiberMeshes) m.visible = toggleFiber.checked;
+  });
+}
 sliceAxis.addEventListener("change", applyClippingPlane);
 slicePos.addEventListener("input", applyClippingPlane);
 sliceFlip.addEventListener("change", applyClippingPlane);
@@ -1952,6 +1977,35 @@ if (meshBudgetSlider) {
   meshBudgetSlider.addEventListener("input", () => {
     lodVoxelPixelTarget = parseFloat(meshBudgetSlider.value);
     meshBudgetValue.textContent = lodVoxelPixelTarget.toFixed(1);
+    scheduleReassess();
+  });
+}
+
+// "Mesh @px" slider — writes `lodSphereBudgetPx`, the projected radius
+// below which an ingredient draws as a cheap proxy instead of loading
+// its OBJ. Higher keeps far/dense views as proxies (navigable); lower
+// loads meshes sooner (more detail, slower).
+const sphereBudgetSlider = document.getElementById("sphere-budget");
+const sphereBudgetValue = document.getElementById("sphere-budget-value");
+if (sphereBudgetSlider) {
+  sphereBudgetSlider.value = String(lodSphereBudgetPx);
+  sphereBudgetValue.textContent = lodSphereBudgetPx.toFixed(0);
+  sphereBudgetSlider.addEventListener("input", () => {
+    lodSphereBudgetPx = parseFloat(sphereBudgetSlider.value);
+    sphereBudgetValue.textContent = lodSphereBudgetPx.toFixed(0);
+    scheduleReassess();
+  });
+}
+
+// "Show %" slider — fraction of interior instances drawn (viz subsample).
+const showFractionSlider = document.getElementById("show-fraction");
+const showFractionValue = document.getElementById("show-fraction-value");
+if (showFractionSlider) {
+  showFractionSlider.value = String(Math.round(interiorFraction * 100));
+  showFractionValue.textContent = showFractionSlider.value;
+  showFractionSlider.addEventListener("input", () => {
+    interiorFraction = parseFloat(showFractionSlider.value) / 100;
+    showFractionValue.textContent = showFractionSlider.value;
     scheduleReassess();
   });
 }
