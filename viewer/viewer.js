@@ -982,11 +982,7 @@ const MEMBRANE_SPACING = 11;       // Å between lipids in a leaflet (smaller = 
 const MEMBRANE_THICKNESS = 40;     // Å total bilayer thickness (centred on the cell surface)
 const MEMBRANE_HEAD_RADIUS = 5;    // Å headgroup impostor radius
 const MEMBRANE_TAIL_RADIUS = 4.0;  // Å tail-bead impostor radius (fat enough to read as a continuous strand)
-// Hard cap on bilayer impostor sprites. At 11 Å spacing over a 2000 Å cell the
-// shell wants ~2.5M sprites — enough to tank far-view navigation on its own
-// (it's the dominant cost; the interior is negligible by comparison). Cap it
-// ~8× lower; the membrane reads as a slightly sparser shell but stays smooth.
-const MEMBRANE_MAX_POINTS = 300000;
+const MEMBRANE_MAX_POINTS = 3000000;
 
 function makeImpostorMaterial(headColor) {
   return new THREE.ShaderMaterial({
