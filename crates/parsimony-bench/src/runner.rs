@@ -20,7 +20,7 @@ pub struct CellpackConfig {
 impl Default for CellpackConfig {
     fn default() -> Self {
         Self {
-            python: PathBuf::from("/home/pattern/code/cellpack/.venv/bin/python"),
+            python: PathBuf::from("../cellpack/.venv/bin/python"),
             spacing: 1,
             place_method: "jitter".into(),
         }
@@ -113,9 +113,7 @@ pub struct ParsimonyConfig {
 impl Default for ParsimonyConfig {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from(
-                "/home/pattern/code/parsimony/target/release/parsimony",
-            ),
+            binary: PathBuf::from("target/release/parsimony"),
             seed: 0,
             loose_bounds: false,
         }

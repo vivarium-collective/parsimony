@@ -1122,6 +1122,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "parsimony-bench",
  "parsimony-core",
  "parsimony-spatial",
  "serde_json",

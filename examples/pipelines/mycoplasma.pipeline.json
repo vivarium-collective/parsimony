@@ -1,0 +1,23 @@
+{
+  "name": "mycoplasma_staged",
+  "recipe": "../recipes/mycoplasma.json",
+  "seed": 0,
+  "strict_bounds": true,
+  "stages": [
+    {
+      "id": "chromosome",
+      "kind": "chromosome"
+    },
+    {
+      "id": "membrane",
+      "kind": "pack",
+      "include": ["lipid"]
+    },
+    {
+      "id": "interior",
+      "kind": "pack",
+      "exclude": ["lipid"],
+      "depends_on": ["chromosome"]
+    }
+  ]
+}

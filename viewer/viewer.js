@@ -242,6 +242,8 @@ let bboxLines = null;
 // Compartment surfaces (the "membrane"): translucent shells for sphere
 // compartments (the cell envelope). Rebuilt per packing, disposed with it.
 let compartmentMeshes = [];
+// Chromosome / fiber tubes, rebuilt per packing, disposed with it.
+let fiberMeshes = [];
 // Each entry tracks one ingredient type and all of its LOD slots.
 // `fallbackSphere` is the placeholder used before any OBJ arrives or
 // when no LOD is loaded for an instance's desired level. `lods[i]`
@@ -329,6 +331,12 @@ function clearPacking() {
   }
   instancedMeshes = [];
   disposeCompartments();
+  for (const m of fiberMeshes) {
+    scene.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
+  }
+  fiberMeshes = [];
   if (bboxLines) {
     scene.remove(bboxLines);
     bboxLines.geometry.dispose();
@@ -969,10 +977,11 @@ function buildCompartments(doc) {
 // placements. This is how cellPACK/Maritan render dense membranes.
 //
 // Tunables (eyeball + adjust):
-const MEMBRANE_SPACING = 11;     // Å between headgroups (smaller = denser/continuous)
-const MEMBRANE_THICKNESS = 40;   // Å between inner/outer leaflets
-const MEMBRANE_HEAD_RADIUS = 5;  // Å headgroup impostor radius
-const MEMBRANE_MAX_POINTS = 1600000;
+const MEMBRANE_SPACING = 11;       // Å between lipids in a leaflet (smaller = denser)
+const MEMBRANE_THICKNESS = 40;     // Å total bilayer thickness (centred on the cell surface)
+const MEMBRANE_HEAD_RADIUS = 5;    // Å headgroup impostor radius
+const MEMBRANE_TAIL_RADIUS = 4.0;  // Å tail-bead impostor radius (fat enough to read as a continuous strand)
+const MEMBRANE_MAX_POINTS = 3000000;
 
 function makeImpostorMaterial(headColor) {
   return new THREE.ShaderMaterial({
@@ -1026,29 +1035,32 @@ function buildImpostorMembrane(doc) {
     ? new THREE.Color(lip.color[0], lip.color[1], lip.color[2])
     : new THREE.Color(0.96, 0.86, 0.55);
 
+  // One lipid = a head at the leaflet surface + two tail beads reaching
+  // toward the midplane. Offsets are radial distances from the bilayer
+  // midplane, which we centre on the compartment surface so embedded
+  // proteins — placed with their origin on that surface — span it.
+  const h = MEMBRANE_THICKNESS * 0.5;
+  const beadOffset = [h, 0.55 * h, 0.18 * h]; // head, tail, tail (→ midplane)
+  const beadRadius = [MEMBRANE_HEAD_RADIUS, MEMBRANE_TAIL_RADIUS, MEMBRANE_TAIL_RADIUS];
+  const beadHead = [1, 0, 0];
+  const perLipid = beadOffset.length;
+  const golden = Math.PI * (3 - Math.sqrt(5));
+
   for (const c of comps) {
     const [cx, cy, cz] = c.center;
-    const shells = [c.radius, Math.max(1, c.radius - MEMBRANE_THICKNESS)];
-    const perShellCap = Math.floor(MEMBRANE_MAX_POINTS / shells.length);
-    const golden = Math.PI * (3 - Math.sqrt(5));
-    // Pre-size: sum points across shells.
-    let total = 0;
-    const counts = shells.map((R) => {
-      const n = Math.min(perShellCap,
-        Math.round((4 * Math.PI * R * R) / (MEMBRANE_SPACING * MEMBRANE_SPACING)));
-      total += n;
-      return n;
-    });
+    const Rmid = c.radius;
+    const cap = Math.floor(MEMBRANE_MAX_POINTS / (2 * perLipid));
+    const nLeaflet = Math.min(cap,
+      Math.round((4 * Math.PI * Rmid * Rmid) / (MEMBRANE_SPACING * MEMBRANE_SPACING)));
+    const total = 2 * nLeaflet * perLipid;
     const pos = new Float32Array(total * 3);
     const rad = new Float32Array(total);
     const head = new Float32Array(total);
+    const amp = 0.5 * (3.54 / Math.sqrt(Math.max(1, nLeaflet))); // ~half arc spacing
     let w = 0;
-    for (let s = 0; s < shells.length; s++) {
-      const R = shells[s];
-      const n = counts[s];
-      const amp = 0.5 * (3.54 / Math.sqrt(Math.max(1, n))); // ~half the arc spacing
-      for (let i = 0; i < n; i++) {
-        const y = 1 - 2 * (i + 0.5) / n;
+    for (const sign of [1, -1]) { // outer (+) then inner (−) leaflet
+      for (let i = 0; i < nLeaflet; i++) {
+        const y = 1 - 2 * (i + 0.5) / nLeaflet;
         const rr = Math.sqrt(Math.max(0, 1 - y * y));
         const th = golden * i;
         let dx = Math.cos(th) * rr + (Math.random() - 0.5) * 2 * amp;
@@ -1056,12 +1068,15 @@ function buildImpostorMembrane(doc) {
         let dz = Math.sin(th) * rr + (Math.random() - 0.5) * 2 * amp;
         const len = Math.hypot(dx, dy, dz) || 1;
         dx /= len; dy /= len; dz /= len;
-        pos[w * 3] = cx + dx * R;
-        pos[w * 3 + 1] = cy + dy * R;
-        pos[w * 3 + 2] = cz + dz * R;
-        rad[w] = MEMBRANE_HEAD_RADIUS;
-        head[w] = 1;
-        w++;
+        for (let b = 0; b < perLipid; b++) {
+          const R = Rmid + sign * beadOffset[b];
+          pos[w * 3] = cx + dx * R;
+          pos[w * 3 + 1] = cy + dy * R;
+          pos[w * 3 + 2] = cz + dz * R;
+          rad[w] = beadRadius[b];
+          head[w] = beadHead[b];
+          w++;
+        }
       }
     }
     const geom = new THREE.BufferGeometry();
@@ -1073,6 +1088,35 @@ function buildImpostorMembrane(doc) {
     points.visible = !toggleMembrane || toggleMembrane.checked;
     scene.add(points);
     compartmentMeshes.push(points); // disposed by disposeCompartments
+  }
+}
+
+// ───── chromosome / genome fiber ─────────────────────────────────────
+// A `fiber` ingredient (e.g. the chromosome) is a polyline of bead
+// centres. We render it as one smooth tube through the beads
+// (Catmull-Rom), per placement — cheap (a single mesh) and reads as a
+// continuous chromosome threading the cell.
+function buildFiber(ing, placements) {
+  const sh = ing.shape;
+  if (!Array.isArray(sh.points) || sh.points.length < 2) return;
+  const c = ing.color || [0.86, 0.3, 0.42];
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(c[0], c[1], c[2]),
+    roughness: 0.6,
+    metalness: 0.05,
+  });
+  for (const p of placements) {
+    const [ox, oy, oz] = p.position;
+    const cps = sh.points.map(
+      (pt) => new THREE.Vector3(pt[0] + ox, pt[1] + oy, pt[2] + oz),
+    );
+    const curve = new THREE.CatmullRomCurve3(cps, false, "catmullrom", 0.5);
+    const tubular = Math.min(8000, sh.points.length * 3);
+    const geom = new THREE.TubeGeometry(curve, tubular, sh.radius || 8, 8, false);
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.frustumCulled = false;
+    scene.add(mesh);
+    fiberMeshes.push(mesh);
   }
 }
 
@@ -1130,6 +1174,11 @@ async function buildScene(doc, fileName) {
     // The lipid bilayer is drawn as a generated impostor membrane
     // (buildImpostorMembrane), not as packed multi_sphere instances.
     if (ing.name === "lipid") continue;
+    // The chromosome (a fiber) is drawn as a tube, not instanced spheres.
+    if (ing.shape && ing.shape.kind === "fiber") {
+      buildFiber(ing, pts);
+      continue;
+    }
     const colorArr = ing.color || [0.5, 0.5, 0.5];
     const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
     const enc = ing.shape.enclosing_radius || ing.shape.radius || 1.0;
@@ -1278,6 +1327,11 @@ function addInstancedType(ing, color, enclosingRadius, pts) {
 // once its OBJ has finished loading. Count is left at 0; the next
 // `reassessLODs` call fills it. We dispose any prior geometry so
 // repeated calls (e.g. on reload) don't leak GPU buffers.
+// A LOD whose thinnest bounding-box extent is below this (Å) collapsed to
+// a near-2D sheet at its voxel size — treated as degenerate so the picker
+// skips it (a real molecule is never sub-3 Å thin in any dimension).
+const PLANAR_MIN_THICKNESS = 3.0;
+
 function ensureLodMesh(entry, levelIdx, geom, robustR) {
   const lvl = entry.lods[levelIdx];
 
@@ -1317,6 +1371,18 @@ function ensureLodMesh(entry, levelIdx, geom, robustR) {
     lvl.degenerate = ratio < 0.4 || ratio > 2.5;
   } else {
     lvl.geomScale = 1.0;
+    lvl.degenerate = true;
+  }
+
+  // Also reject LODs that marching-cubes collapsed to a near-2D sheet: a
+  // protein dimension thinner than the voxel renders as a flat quad
+  // ("the square"). Flagging it degenerate makes the picker fall to a
+  // finer LOD or the 3D ellipsoid, so the molecule keeps its depth.
+  // (Real thin filaments are tens of Å thick — well above the cutoff.)
+  geom.computeBoundingBox();
+  const _ext = new THREE.Vector3();
+  geom.boundingBox.getSize(_ext);
+  if (Math.min(_ext.x, _ext.y, _ext.z) < PLANAR_MIN_THICKNESS) {
     lvl.degenerate = true;
   }
 

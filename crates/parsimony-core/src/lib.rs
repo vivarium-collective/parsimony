@@ -5,8 +5,10 @@
 
 pub mod compartment;
 pub(crate) mod clearance_grid;
+pub mod fiber;
 pub mod ingredient;
 pub mod output;
+pub mod pipeline;
 pub mod placement;
 pub mod placer;
 pub mod recipe;
@@ -14,6 +16,9 @@ pub mod recipe;
 pub use compartment::{Compartment, CompartmentId, CompartmentKind};
 pub use ingredient::{Ingredient, IngredientId, IngredientShape, ProxySphere};
 pub use output::{write_pack_json, write_simularium_json, write_transforms_json};
+pub use pipeline::{
+    Pipeline, PipelineError, PipelineRun, Stage, StageKind, StagePlan, StageReport,
+};
 pub use placement::{Op, Placement, ReplaceChange, Snapshot, VariantId};
 pub use placer::{GreedyRandomPlacer, PlacerConfig, PlacerOutcome, PlacerStats};
 pub use recipe::{

@@ -114,7 +114,7 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         })
         .collect();
 
-    let ingredients: Vec<Value> = recipe
+    let mut ingredients: Vec<Value> = recipe
         .ingredients
         .iter()
         .enumerate()
@@ -161,6 +161,12 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
                     }
                     shape
                 }
+                IngredientShape::Fiber { points, radius } => json!({
+                    "kind": "fiber",
+                    "points": points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>(),
+                    "radius": radius,
+                    "enclosing_radius": ing.shape.enclosing_radius(),
+                }),
             };
             json!({
                 "id": id as u64,
@@ -171,7 +177,7 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         })
         .collect();
 
-    let placements: Vec<Value> = snapshot
+    let mut placements: Vec<Value> = snapshot
         .placements
         .iter()
         .map(|p| {
@@ -184,6 +190,36 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
             })
         })
         .collect();
+
+    // Genome fiber, if the placer generated one — emitted as an extra
+    // `fiber` ingredient + a placement at the cell centre.
+    if let Some(chr) = &snapshot.chromosome {
+        let id = ingredients.len() as u64;
+        let enc = chr
+            .points
+            .iter()
+            .map(|p| p.coords.norm())
+            .fold(0.0_f32, f32::max)
+            + chr.radius;
+        ingredients.push(json!({
+            "id": id,
+            "name": "chromosome",
+            "color": chr.color,
+            "shape": {
+                "kind": "fiber",
+                "points": chr.points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>(),
+                "radius": chr.radius,
+                "enclosing_radius": enc,
+            },
+        }));
+        placements.push(json!({
+            "uid": placements.len() as u64,
+            "ingredient": id,
+            "compartment": 0,
+            "position": [chr.center.x, chr.center.y, chr.center.z],
+            "rotation": [1.0, 0.0, 0.0, 0.0],
+        }));
+    }
 
     json!({
         "format": "parsimony.pack.v1",

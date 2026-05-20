@@ -32,6 +32,35 @@ struct RawRecipe {
     bounding_box: [[f32; 3]; 2],
     objects: IndexMap<String, RawObject>,
     composition: IndexMap<String, RawCompositionEntry>,
+    #[serde(default)]
+    chromosome: Option<RawChromosome>,
+}
+
+/// Recipe-level declaration of the genome fiber — a single chromosome
+/// the packer generates as a constrained self-avoiding walk in its cell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawChromosome {
+    beads: usize,
+    spacing: f32,
+    #[serde(default)]
+    bead_radius: Option<f32>,
+    #[serde(default)]
+    color: Option<[f32; 3]>,
+    #[serde(default)]
+    compartment: Option<String>,
+    /// Optional plectonemic supercoiling: wind the genome as an interwound
+    /// double helix along a backbone axis instead of a plain walk.
+    #[serde(default)]
+    supercoil: Option<RawSupercoil>,
+}
+
+/// Superhelix parameters for a plectonemically supercoiled chromosome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawSupercoil {
+    /// Superhelix radius (how fat the coil is).
+    radius: f32,
+    /// Axial rise per turn (how stretched the coil is).
+    pitch: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +223,27 @@ pub struct Recipe {
     pub ingredients: IndexMap<String, Ingredient>,
     pub compartments: IndexMap<String, Compartment>,
     pub directives: Vec<PlacementDirective>,
+    /// Genome fiber spec (one chromosome the placer generates), if any.
+    pub chromosome: Option<ChromosomeSpec>,
+}
+
+/// Resolved chromosome spec (from the recipe-level `chromosome` field).
+#[derive(Debug, Clone)]
+pub struct ChromosomeSpec {
+    pub beads: usize,
+    pub spacing: f32,
+    pub bead_radius: f32,
+    pub color: [f32; 3],
+    pub compartment: Option<String>,
+    /// Plectonemic supercoiling, if requested.
+    pub supercoil: Option<SupercoilSpec>,
+}
+
+/// Resolved superhelix parameters (see [`RawSupercoil`]).
+#[derive(Debug, Clone, Copy)]
+pub struct SupercoilSpec {
+    pub radius: f32,
+    pub pitch: f32,
 }
 
 impl Recipe {
@@ -486,6 +536,16 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
         ingredients,
         compartments,
         directives,
+        chromosome: raw.chromosome.map(|c| ChromosomeSpec {
+            beads: c.beads,
+            spacing: c.spacing,
+            bead_radius: c.bead_radius.unwrap_or(8.0),
+            color: c.color.unwrap_or([0.9, 0.4, 0.5]),
+            compartment: c.compartment,
+            supercoil: c
+                .supercoil
+                .map(|s| SupercoilSpec { radius: s.radius, pitch: s.pitch }),
+        }),
     })
 }
 

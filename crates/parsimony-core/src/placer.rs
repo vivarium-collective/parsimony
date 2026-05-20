@@ -144,6 +144,22 @@ impl<'a> GreedyRandomPlacer<'a> {
     }
 
     pub fn pack(&self, seed: u64) -> PlacerOutcome {
+        self.pack_with_obstacles(seed, &[])
+    }
+
+    /// Like [`pack`](Self::pack), but seeds the clearance grid with a set
+    /// of pre-existing world-space obstacle spheres before packing — so
+    /// this run's interior placements avoid geometry produced by an
+    /// earlier stage (e.g. the chromosome). Used by the staged pipeline
+    /// to pack the interior *around* a fixed chromosome. Obstacles enter
+    /// the clearance grid, which governs Interior candidate cells; tiled
+    /// Surface placements (the lipid bilayer) self-avoid and are
+    /// unaffected.
+    pub fn pack_with_obstacles(
+        &self,
+        seed: u64,
+        obstacles: &[(Point3<f32>, f32)],
+    ) -> PlacerOutcome {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
         let mut snapshot = Snapshot::new(self.recipe.name.clone(), seed);
         let mut index: QbvhIndex = QbvhIndex::new();
@@ -170,6 +186,13 @@ impl<'a> GreedyRandomPlacer<'a> {
             (max_required_radius / 8.0).max(0.5)
         });
         let mut clearance = ClearanceGrid::new(self.recipe.bounding_box, cell_size);
+
+        // Seed upstream-stage obstacles into the clearance grid so this
+        // run's interior candidate cells that overlap them are rejected
+        // up front (the grid is authoritative for Interior placement).
+        for &(c, r) in obstacles {
+            clearance.update_for_placement(c, r, max_required_radius);
+        }
 
         let directives: Vec<&PlacementDirective> = self.recipe.directives.iter().collect();
         let mut remaining: Vec<u32> = directives.iter().map(|d| d.count).collect();
@@ -364,7 +387,59 @@ impl<'a> GreedyRandomPlacer<'a> {
                 per_ingredient_attempts[i],
             ));
         }
+        // Chromosome: generate the genome as a constrained self-avoiding
+        // walk inside its cell compartment (the "chain packing"), carried
+        // on the snapshot for the writer to emit as a fiber.
+        if let Some(chr) = &self.recipe.chromosome {
+            if let Some((center, cell_r)) = self.chromosome_cell(chr) {
+                let pts = match &chr.supercoil {
+                    Some(sc) => crate::fiber::generate_supercoiled_fiber(
+                        cell_r,
+                        chr.beads,
+                        chr.spacing,
+                        chr.bead_radius,
+                        sc.radius,
+                        sc.pitch,
+                        &mut rng,
+                    ),
+                    None => crate::fiber::generate_fiber(
+                        cell_r,
+                        chr.beads,
+                        chr.spacing,
+                        chr.bead_radius,
+                        &mut rng,
+                    ),
+                };
+                snapshot.chromosome = Some(crate::placement::Chromosome {
+                    center,
+                    radius: chr.bead_radius,
+                    color: chr.color,
+                    points: pts,
+                });
+            }
+        }
+
         PlacerOutcome { snapshot, stats }
+    }
+
+    /// The cell compartment the chromosome lives in: the named one if the
+    /// spec gives a name, else the first sphere compartment. Returns its
+    /// centre + radius.
+    fn chromosome_cell(
+        &self,
+        chr: &crate::recipe::ChromosomeSpec,
+    ) -> Option<(Point3<f32>, f32)> {
+        for (name, comp) in &self.recipe.compartments {
+            if let Some(want) = &chr.compartment {
+                if name != want {
+                    continue;
+                }
+            }
+            if let crate::compartment::CompartmentKind::Sphere { center, radius } = &comp.kind {
+                return Some((*center, *radius));
+            }
+        }
+        None
     }
 
     /// Tree-vs-tree sphere collision against already-placed instances.

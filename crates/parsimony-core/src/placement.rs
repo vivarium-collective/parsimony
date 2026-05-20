@@ -26,11 +26,25 @@ pub struct Placement {
 /// Snapshot of a packed configuration — the load-bearing serialized
 /// form. The spatial index is reconstructable from this (per design
 /// doc §5.5).
+/// A generated chromosome (genome) fiber: a coarse-grained bead path
+/// from the chain generator, carried on the snapshot for the writer to
+/// emit as a `fiber` ingredient. Points are relative to `center` (the
+/// cell compartment centre it was generated in).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chromosome {
+    pub center: Point3<f32>,
+    pub radius: f32,
+    pub color: [f32; 3],
+    pub points: Vec<Point3<f32>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub recipe_name: String,
     pub seed: u64,
     pub placements: Vec<Placement>,
+    /// The genome fiber, if the recipe declared a chromosome.
+    pub chromosome: Option<Chromosome>,
 }
 
 impl Snapshot {
@@ -39,6 +53,7 @@ impl Snapshot {
             recipe_name,
             seed,
             placements: Vec::new(),
+            chromosome: None,
         }
     }
 }

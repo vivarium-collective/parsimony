@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use parsimony_core::{
-    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
+    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer, Pipeline,
     PlacerConfig, PlacerOutcome, Recipe,
 };
 
@@ -36,6 +36,12 @@ enum Command {
     Demos(DemosArgs),
     /// Pack-and-serve the local three.js viewer (supersedes view_pack.sh).
     Viewer(ViewerArgs),
+    /// Pack a recipe and compare it against cellPACK (validation).
+    Compare(CompareArgs),
+    /// Generate mesh LODs from PDB/CIF structures (PDB → SDF → OBJ LODs).
+    Mesh(MeshArgs),
+    /// Run a staged packing pipeline (DAG + content-addressed cache).
+    Pipeline(PipelineArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -96,6 +102,9 @@ fn main() -> Result<()> {
         Command::Pack(args) => run_pack(args),
         Command::Demos(args) => run_demos(args),
         Command::Viewer(args) => run_viewer(args),
+        Command::Compare(args) => run_compare(args),
+        Command::Mesh(args) => run_mesh(args),
+        Command::Pipeline(args) => run_pipeline(args),
     }
 }
 
@@ -472,4 +481,359 @@ fn which_python() -> Result<String> {
         }
     }
     anyhow::bail!("no python3/python on PATH (needed for the viewer's static file server)")
+}
+
+// ───── compare ──────────────────────────────────────────────────────
+// Pack a recipe with parsimony (in-process) and, if a cellPACK checkout
+// is available, pack the same recipe with cellPACK and report a
+// side-by-side comparison (placement counts by radius + position spread).
+// This is the validation harness — cellPACK / Maritan results are the
+// reference we measure our own packing against. cellPACK is optional: no
+// checkout → a parsimony-only report.
+#[derive(Debug, Parser)]
+struct CompareArgs {
+    /// Recipe JSON path.
+    recipe: PathBuf,
+
+    /// cellPACK checkout to compare against (uses its `.venv` python).
+    #[arg(long, default_value = "../cellpack")]
+    cellpack: PathBuf,
+
+    /// Skip cellPACK entirely; report parsimony only.
+    #[arg(long)]
+    no_cellpack: bool,
+
+    /// Directory for the generated `.simularium` files.
+    #[arg(long, default_value = "/tmp/parsimony_compare")]
+    out_dir: PathBuf,
+
+    /// RNG seed for parsimony.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// cellPACK `spacing` (it scales positions/radii by 1/spacing in its
+    /// Simularium output; we rescale before comparing).
+    #[arg(long, default_value_t = 1)]
+    spacing: u32,
+
+    /// Use strict bounds for parsimony (whole sphere inside). Default is
+    /// loose (cellPACK semantics) for an apples-to-apples comparison.
+    #[arg(long)]
+    strict_bounds: bool,
+}
+
+fn run_compare(args: CompareArgs) -> Result<()> {
+    use parsimony_bench::compare::{compare_counts, distribution_stats};
+    use parsimony_bench::parse::SimulariumDoc;
+    use parsimony_bench::runner::{run_cellpack, CellpackConfig};
+
+    fs::create_dir_all(&args.out_dir)
+        .with_context(|| format!("creating {}", args.out_dir.display()))?;
+
+    // Parsimony — packed in-process (no subprocess, no hardcoded binary).
+    eprintln!("packing parsimony…");
+    let t = Instant::now();
+    let (recipe, out) = pack_recipe(&args.recipe, args.seed, !args.strict_bounds)?;
+    let psy_elapsed = t.elapsed();
+    let psy_path = args.out_dir.join("parsimony.simularium");
+    let sim = write_simularium_json(&out.snapshot, &recipe);
+    fs::write(&psy_path, serde_json::to_string(&sim)?)
+        .with_context(|| format!("writing {}", psy_path.display()))?;
+    let psy_doc = SimulariumDoc::from_json(&fs::read_to_string(&psy_path)?, "parsimony")?;
+    eprintln!("  {} placements in {:.2?}", psy_doc.agents.len(), psy_elapsed);
+
+    // cellPACK — only if its venv python is present.
+    let py = args.cellpack.join(".venv/bin/python");
+    let cp = if args.no_cellpack {
+        None
+    } else if !py.exists() {
+        eprintln!(
+            "cellpack python not found at {} — parsimony-only report.\n  \
+             (point --cellpack at a checkout, or pass --no-cellpack)",
+            py.display(),
+        );
+        None
+    } else {
+        eprintln!("packing cellpack via {}…", py.display());
+        let cfg = CellpackConfig { python: py, spacing: args.spacing, ..Default::default() };
+        match run_cellpack(&args.recipe, &args.out_dir, &cfg) {
+            Ok(run) => {
+                let mut doc = SimulariumDoc::from_json(
+                    &fs::read_to_string(&run.simularium_path)?,
+                    "cellpack",
+                )?;
+                doc.rescale(args.spacing as f32);
+                eprintln!("  {} placements in {:.2?}", doc.agents.len(), run.elapsed);
+                Some((doc, run.elapsed))
+            }
+            Err(e) => {
+                eprintln!("  cellpack run failed: {e:#}");
+                None
+            }
+        }
+    };
+
+    // Report.
+    println!("\n=== compare: {} ===\n", args.recipe.display());
+    println!("{:<12} {:>12} {:>12}", "engine", "placements", "wall");
+    println!("{:-<12} {:->12} {:->12}", "", "", "");
+    println!("{:<12} {:>12} {:>12.2?}", "parsimony", psy_doc.agents.len(), psy_elapsed);
+    if let Some((cp_doc, cp_el)) = &cp {
+        println!("{:<12} {:>12} {:>12.2?}", "cellpack", cp_doc.agents.len(), cp_el);
+        println!("\nper-radius counts:");
+        println!("{:>10} {:>12} {:>12} {:>9}", "radius", "cellpack", "parsimony", "%diff");
+        println!("{:->10} {:->12} {:->12} {:->9}", "", "", "", "");
+        for r in compare_counts(cp_doc, &psy_doc) {
+            println!(
+                "{:>10.2} {:>12} {:>12} {:>+8.1}%",
+                r.radius, r.a_count, r.b_count, r.pct_diff(),
+            );
+        }
+    }
+    let ps = distribution_stats(&psy_doc.agents);
+    println!("\nposition stddev (x, y, z):");
+    println!("  parsimony ({:.1}, {:.1}, {:.1})", ps.stddev[0], ps.stddev[1], ps.stddev[2]);
+    if let Some((cp_doc, _)) = &cp {
+        let cs = distribution_stats(&cp_doc.agents);
+        println!("  cellpack  ({:.1}, {:.1}, {:.1})", cs.stddev[0], cs.stddev[1], cs.stddev[2]);
+    }
+    Ok(())
+}
+
+// ───── mesh ─────────────────────────────────────────────────────────
+// Generate mesh LODs from PDB/CIF structures. The heavy lifting (vdW
+// signed-distance field + marching cubes) lives in scripts/pdb_to_mesh.py
+// (scientific python deps via uv); this subcommand is the CLI front that
+// drives it over a structure — or a whole directory — at each LOD voxel
+// size, writing <slug>.lod<N>.obj. Run from the repo root.
+#[derive(Debug, Parser)]
+struct MeshArgs {
+    /// A PDB/CIF file, a 4-char RCSB ID, or a directory of them.
+    path: String,
+
+    /// LOD voxel sizes in Å (coarse→fine), comma-separated.
+    #[arg(long, default_value = "16,8,4,2.5")]
+    lods: String,
+
+    /// Output directory for the generated <slug>.lod<N>.obj files.
+    #[arg(long, default_value = "examples/pdb_meshes")]
+    out_dir: PathBuf,
+}
+
+fn run_mesh(args: MeshArgs) -> Result<()> {
+    let script = Path::new("scripts/pdb_to_mesh.py");
+    if !script.exists() {
+        anyhow::bail!("{} not found — run `parsimony mesh` from the repo root", script.display());
+    }
+    if std::process::Command::new("uv").arg("--version").output().is_err() {
+        anyhow::bail!(
+            "`uv` not on PATH — needed for the PDB→mesh script (https://docs.astral.sh/uv/)"
+        );
+    }
+    let lods: Vec<f32> = args
+        .lods
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if lods.is_empty() {
+        anyhow::bail!("no valid --lods (expected e.g. 16,8,4,2.5)");
+    }
+    fs::create_dir_all(&args.out_dir)?;
+
+    // Inputs: a directory of .pdb/.cif, a single file, or a PDB ID.
+    let p = Path::new(&args.path);
+    let inputs: Vec<String> = if p.is_dir() {
+        let mut found: Vec<String> = fs::read_dir(p)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|pp| {
+                pp.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("pdb") || x.eq_ignore_ascii_case("cif"))
+                    .unwrap_or(false)
+            })
+            .map(|pp| pp.to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    } else {
+        vec![args.path.clone()] // file path or PDB ID
+    };
+    if inputs.is_empty() {
+        anyhow::bail!("no .pdb/.cif inputs under {}", args.path);
+    }
+
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for input in &inputs {
+        let slug = Path::new(input)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(input.as_str())
+            .to_string();
+        for (i, voxel) in lods.iter().enumerate() {
+            let out = args.out_dir.join(format!("{slug}.lod{i}.obj"));
+            eprint!("  {slug} lod{i} (res {voxel} Å) … ");
+            let st = std::process::Command::new("uv")
+                .arg("run")
+                .arg(script)
+                .arg(input)
+                .arg("--out")
+                .arg(&out)
+                .arg("--resolution")
+                .arg(voxel.to_string())
+                .status();
+            match st {
+                Ok(s) if s.success() => {
+                    eprintln!("→ {}", out.display());
+                    ok += 1;
+                }
+                Ok(s) => {
+                    eprintln!("FAILED ({s})");
+                    failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("FAILED ({e})");
+                    failed += 1;
+                }
+            }
+        }
+    }
+    eprintln!("mesh: {ok} OBJs generated, {failed} failed → {}", args.out_dir.display());
+    if failed > 0 {
+        anyhow::bail!("{failed} mesh generation(s) failed");
+    }
+    Ok(())
+}
+
+// ───── pipeline ──────────────────────────────────────────────────────
+// Staged packing as a small build system: a pipeline file lists stages
+// (chromosome / pack-subset) with dependencies; each stage's partial
+// snapshot is content-addressed and cached under <root>/.parsimony/cache.
+// `run` repacks only the stages whose inputs changed (and their
+// descendants) and merges everything into one pack.json the viewer reads;
+// `status` shows what's fresh vs stale without packing. Recipe paths in
+// the pipeline file resolve relative to the pipeline file itself.
+#[derive(Debug, Parser)]
+struct PipelineArgs {
+    #[command(subcommand)]
+    action: PipelineAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum PipelineAction {
+    /// Pack stale stages (reuse cached ones) and write the merged pack.
+    Run {
+        /// Pipeline JSON file.
+        file: PathBuf,
+        /// Output pack path. Default: <root>/viewer/data/<name>.pack.json.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Ignore the cache; repack every stage.
+        #[arg(long)]
+        force: bool,
+        /// Stage cache directory. Default: <root>/.parsimony/cache.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Project root (for default cache + output locations).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Show each stage's cache key and whether it's fresh (cached) or stale.
+    Status {
+        /// Pipeline JSON file.
+        file: PathBuf,
+        /// Stage cache directory. Default: <root>/.parsimony/cache.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Project root (for the default cache location).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+}
+
+fn run_pipeline(args: PipelineArgs) -> Result<()> {
+    match args.action {
+        PipelineAction::Run {
+            file,
+            out,
+            force,
+            cache_dir,
+            root,
+        } => {
+            let pipeline = Pipeline::load(&file)
+                .with_context(|| format!("loading pipeline `{}`", file.display()))?;
+            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let cache_dir = cache_dir.unwrap_or_else(|| root.join(".parsimony/cache"));
+
+            let t = Instant::now();
+            let run = pipeline
+                .run(base_dir, &cache_dir, force)
+                .with_context(|| format!("running pipeline `{}`", pipeline.name))?;
+            let elapsed = t.elapsed();
+
+            let (packed, cached) = run
+                .reports
+                .iter()
+                .fold((0, 0), |(p, c), r| if r.from_cache { (p, c + 1) } else { (p + 1, c) });
+            eprintln!(
+                "pipeline `{}`: {} packed, {} cached in {:.2?}",
+                pipeline.name, packed, cached, elapsed
+            );
+            for r in &run.reports {
+                let tag = if r.from_cache { "cached" } else { "packed" };
+                let chr = if r.chromosome { " +chromosome" } else { "" };
+                eprintln!(
+                    "  {tag:<6} {:<14} {:>6} placed  {:<22}{chr}  [{}]",
+                    r.id, r.placed, r.kind, r.cache_key
+                );
+            }
+
+            let out_path = out.unwrap_or_else(|| {
+                root.join("viewer/data")
+                    .join(format!("{}.pack.json", pipeline.name))
+            });
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let value = write_pack_json(&run.merged, &run.recipe);
+            fs::write(&out_path, serde_json::to_string_pretty(&value)?)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            eprintln!(
+                "merged {} placements{} → {}",
+                run.merged.placements.len(),
+                if run.merged.chromosome.is_some() { " + chromosome" } else { "" },
+                out_path.display()
+            );
+            Ok(())
+        }
+        PipelineAction::Status {
+            file,
+            cache_dir,
+            root,
+        } => {
+            let pipeline = Pipeline::load(&file)
+                .with_context(|| format!("loading pipeline `{}`", file.display()))?;
+            let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+            let cache_dir = cache_dir.unwrap_or_else(|| root.join(".parsimony/cache"));
+            let plans = pipeline.plan(base_dir, &cache_dir)?;
+
+            println!(
+                "pipeline `{}` — {} stages (cache: {})",
+                pipeline.name,
+                plans.len(),
+                cache_dir.display()
+            );
+            println!("{:<14} {:<6} {:<18} {:<22} {}", "stage", "state", "key", "kind", "depends_on");
+            for s in &plans {
+                let state = if s.cached { "fresh" } else { "stale" };
+                println!(
+                    "{:<14} {state:<6} {:<18} {:<22} {}",
+                    s.id,
+                    s.cache_key,
+                    s.kind,
+                    s.depends_on.join(",")
+                );
+            }
+            Ok(())
+        }
+    }
 }

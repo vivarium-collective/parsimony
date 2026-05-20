@@ -59,6 +59,13 @@ pub enum IngredientShape {
         trimesh: Arc<TriMesh>,
         proxies: Vec<ProxySphere>,
     },
+    /// A fiber: a polyline of bead centres (ingredient-local space) with
+    /// a uniform bead radius — the chromosome, one long coarse-grained
+    /// chain. Collision treats it as a chain of spheres.
+    Fiber {
+        points: Vec<Point3<f32>>,
+        radius: f32,
+    },
 }
 
 impl IngredientShape {
@@ -93,6 +100,10 @@ impl IngredientShape {
                     .fold(0.0_f32, f32::max);
                 from_proxies.max(from_vertices)
             }
+            IngredientShape::Fiber { points, radius } => points
+                .iter()
+                .map(|p| p.coords.norm() + radius)
+                .fold(0.0_f32, f32::max),
         }
     }
 
@@ -110,6 +121,7 @@ impl IngredientShape {
             IngredientShape::Mesh { trimesh, .. } => {
                 principal_ellipsoid_of(trimesh.vertices().iter().map(|v| v.coords))
             }
+            IngredientShape::Fiber { .. } => None,
         }
     }
 
@@ -120,6 +132,7 @@ impl IngredientShape {
             IngredientShape::SingleSphere { .. } => false,
             IngredientShape::MultiSphere { spheres } => spheres.len() > 1,
             IngredientShape::Mesh { .. } => true,
+            IngredientShape::Fiber { points, .. } => points.len() > 1,
         }
     }
 
@@ -264,6 +277,15 @@ impl<'a> Iterator for WorldSphereIter<'a> {
                     let s = &proxies[self.index];
                     self.index += 1;
                     Some((self.position + self.rotation * s.offset, s.radius))
+                } else {
+                    None
+                }
+            }
+            IngredientShape::Fiber { points, radius } => {
+                if self.index < points.len() {
+                    let p = points[self.index];
+                    self.index += 1;
+                    Some((self.position + self.rotation * p.coords, *radius))
                 } else {
                     None
                 }

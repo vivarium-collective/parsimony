@@ -82,6 +82,7 @@ fn shape_zoo_includes_every_shape_type() {
             IngredientShape::SingleSphere { .. } => has_single_sphere = true,
             IngredientShape::MultiSphere { .. } => has_multi_sphere = true,
             IngredientShape::Mesh { .. } => has_mesh = true,
+            IngredientShape::Fiber { .. } => {}
         }
     }
     assert!(has_single_sphere, "demo should include a single_sphere");

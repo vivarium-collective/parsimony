@@ -19611,5 +19611,19 @@
         ]
       }
     }
+  },
+  "chromosome": {
+    "beads": 1500,
+    "spacing": 22,
+    "bead_radius": 10,
+    "color": [
+      0.86,
+      0.3,
+      0.42
+    ],
+    "supercoil": {
+      "radius": 80,
+      "pitch": 120
+    }
   }
 }
