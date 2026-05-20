@@ -33,7 +33,7 @@ use crate::clearance_grid::ClearanceGrid;
 use crate::compartment::{Compartment, align_to_normal};
 use crate::ingredient::{Ingredient, IngredientShape};
 use crate::placement::{Placement, Snapshot};
-use crate::recipe::{PackingMode, PlacementDirective, Recipe, RegionKind};
+use crate::recipe::{ChromosomeSpec, PackingMode, PlacementDirective, Recipe, RegionKind};
 
 /// Uniform random rotation on SO(3) via Shoemake's method. Pure 3D
 /// uniform — equiprobable orientation, no Euler-angle biasing.
@@ -52,6 +52,10 @@ fn random_rotation<R: Rng>(rng: &mut R) -> UnitQuaternion<f32> {
 /// sampling on the compartment boundary (no per-cell filtering), so the
 /// cap needs to be generous enough to survive transient crowding.
 const SURFACE_REJECTION_CAP: u32 = 500;
+
+/// Consecutive proxy-fit misses before the densify phase gives up on an
+/// ingredient (the cell is saturated at proxy density for it).
+const DENSIFY_FAIL_CAP: u32 = 2000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlacerConfig {
@@ -73,6 +77,11 @@ pub struct PlacerConfig {
     /// match is recoverable. Named compartments (capsule, sphere,
     /// mesh) are always strict regardless of this flag.
     pub strict_bounds: bool,
+    /// After the main (enclosing-sphere) pass, run a proxy-accurate densify
+    /// phase that fills the remaining requested instances into the gaps the
+    /// conservative enclosing-sphere clearance left — letting non-spherical
+    /// meshes nestle until their actual proxy spheres touch. Off by default.
+    pub densify: bool,
 }
 
 impl Default for PlacerConfig {
@@ -82,6 +91,7 @@ impl Default for PlacerConfig {
             default_jitter_attempts: 20,
             clearance_cell_size: None,
             strict_bounds: true,
+            densify: false,
         }
     }
 }
@@ -379,6 +389,90 @@ impl<'a> GreedyRandomPlacer<'a> {
             stats.successful_attempts += 1;
         }
 
+        // Densify phase: fill the remaining requested instances using
+        // proxy-accurate fit — each candidate's *actual* proxy spheres must
+        // clear the grid, not its enclosing sphere — so non-spherical meshes
+        // nestle until their shapes touch, far tighter than the main pass.
+        if self.config.densify {
+            let margin = clearance.cell_size; // grid-resolution safety margin
+            for dir_idx in 0..directives.len() {
+                let directive = directives[dir_idx];
+                if !matches!(directive.region, RegionKind::Interior) || remaining[dir_idx] == 0 {
+                    continue;
+                }
+                let ingredient = self.recipe.ingredients.get(&directive.ingredient).unwrap();
+                let compartment = self.recipe.compartments.get(&directive.compartment).unwrap();
+                let er = ingredient.shape.enclosing_radius();
+                let needs_rot = ingredient.shape.needs_rotation();
+                let bb = compartment.kind.aabb();
+                let children: Vec<&Compartment> = compartment
+                    .children
+                    .iter()
+                    .filter_map(|&id| {
+                        self.recipe.compartments.get_index(id as usize).map(|(_, c)| c)
+                    })
+                    .collect();
+                let mut consecutive_fail = 0u32;
+                while remaining[dir_idx] > 0 && consecutive_fail < DENSIFY_FAIL_CAP {
+                    // Sample an interior point whose enclosing sphere is
+                    // contained (so all proxies stay inside the compartment).
+                    let mut sampled = None;
+                    for _ in 0..32 {
+                        let p = Point3::new(
+                            rng.gen_range(bb.min.x..bb.max.x),
+                            rng.gen_range(bb.min.y..bb.max.y),
+                            rng.gen_range(bb.min.z..bb.max.z),
+                        );
+                        if compartment.kind.signed_distance(p) >= er
+                            && children.iter().all(|c| -c.kind.signed_distance(p) >= er)
+                        {
+                            sampled = Some(p);
+                            break;
+                        }
+                    }
+                    let Some(pos) = sampled else {
+                        consecutive_fail += 1;
+                        continue;
+                    };
+                    let rot = if needs_rot {
+                        random_rotation(&mut rng)
+                    } else {
+                        UnitQuaternion::identity()
+                    };
+                    let proxies: Vec<(Point3<f32>, f32)> =
+                        ingredient.shape.world_spheres(pos, rot).collect();
+                    per_ingredient_attempts[dir_idx] += 1;
+                    stats.total_attempts += 1;
+                    // Proxy-accurate fit: every proxy must clear the grid.
+                    if proxies
+                        .iter()
+                        .all(|(c, r)| clearance.clearance_at(*c) >= r + margin)
+                    {
+                        let uid = next_uid;
+                        next_uid += 1;
+                        for (c, r) in &proxies {
+                            clearance.update_for_placement(*c, *r, max_required_radius);
+                        }
+                        snapshot.placements.push(Placement {
+                            instance_uid: uid,
+                            ingredient_id: self.ingredient_ids[&directive.ingredient],
+                            variant_id: 0,
+                            compartment_id: self.compartment_ids[&directive.compartment],
+                            position: pos,
+                            rotation: rot,
+                        });
+                        remaining[dir_idx] -= 1;
+                        per_ingredient_placed[dir_idx] += 1;
+                        stats.placed += 1;
+                        stats.successful_attempts += 1;
+                        consecutive_fail = 0;
+                    } else {
+                        consecutive_fail += 1;
+                    }
+                }
+            }
+        }
+
         for (i, directive) in directives.iter().enumerate() {
             stats.per_ingredient.push((
                 directive.ingredient.clone(),
@@ -410,6 +504,47 @@ impl<'a> GreedyRandomPlacer<'a> {
                         &mut rng,
                     ),
                 };
+                // DNA-binding proteins bound along the fiber, avoiding the
+                // interior already placed this run. (The monolithic packer
+                // lays the chromosome *after* the interior, so some interior
+                // may sit where the strand now runs; colliding bindings are
+                // skipped. The staged pipeline avoids that by packing the
+                // interior around the chromosome first.)
+                if !chr.proteins.is_empty() && pts.len() >= 2 {
+                    let fiber_world: Vec<Point3<f32>> =
+                        pts.iter().map(|p| center + p.coords).collect();
+                    let obstacles: Vec<(Point3<f32>, f32)> = snapshot
+                        .placements
+                        .iter()
+                        .flat_map(|pl| {
+                            let ing = self
+                                .recipe
+                                .ingredients
+                                .get_index(pl.ingredient_id as usize)
+                                .unwrap()
+                                .1;
+                            ing.shape.world_spheres(pl.position, pl.rotation)
+                        })
+                        .collect();
+                    let proteins = self.resolve_fiber_proteins(chr);
+                    for b in crate::fiber_pack::pack_on_fiber(
+                        &fiber_world,
+                        &proteins,
+                        &obstacles,
+                        chr.bead_radius,
+                        &mut rng,
+                    ) {
+                        snapshot.placements.push(Placement {
+                            instance_uid: next_uid,
+                            ingredient_id: b.ingredient_id,
+                            variant_id: 0,
+                            compartment_id: 0,
+                            position: b.position,
+                            rotation: b.rotation,
+                        });
+                        next_uid += 1;
+                    }
+                }
                 snapshot.chromosome = Some(crate::placement::Chromosome {
                     center,
                     radius: chr.bead_radius,
@@ -440,6 +575,21 @@ impl<'a> GreedyRandomPlacer<'a> {
             }
         }
         None
+    }
+
+    /// Resolve the chromosome's bound-protein specs to `(ingredient_id,
+    /// ingredient, count)`, skipping any whose object isn't an ingredient
+    /// (the recipe loader already rejects those, so this is belt-and-braces).
+    fn resolve_fiber_proteins(&self, chr: &ChromosomeSpec) -> Vec<(u32, &Ingredient, u32)> {
+        chr.proteins
+            .iter()
+            .filter_map(|(name, count)| {
+                self.recipe
+                    .ingredients
+                    .get_full(name)
+                    .map(|(idx, _, ing)| (idx as u32, ing, *count))
+            })
+            .collect()
     }
 
     /// Tree-vs-tree sphere collision against already-placed instances.
@@ -912,5 +1062,35 @@ mod tests {
         for (pa, pb) in a.snapshot.placements.iter().zip(b.snapshot.placements.iter()) {
             assert_eq!(pa.position, pb.position);
         }
+    }
+
+    #[test]
+    fn densify_packs_more_than_the_enclosing_pass() {
+        // Thin rods: a big enclosing radius (~44) but a slim proxy footprint
+        // (r=4). The enclosing-sphere pass keeps them far apart; the densify
+        // phase lets them nestle, fitting many more.
+        let src = r#"{
+            "bounding_box": [[0,0,0],[200,200,200]],
+            "objects": { "rod": { "type": "single_cylinder", "length": 80, "radius": 4 } },
+            "composition": {
+                "space": { "regions": { "interior": [ { "object": "rod", "count": 400 } ] } }
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(src).unwrap();
+        let sparse = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        let dense = GreedyRandomPlacer::new(
+            &recipe,
+            PlacerConfig { densify: true, ..PlacerConfig::default() },
+        )
+        .pack(7);
+        assert!(
+            dense.snapshot.placements.len() > sparse.snapshot.placements.len(),
+            "densify should fit more rods (sparse={}, dense={})",
+            sparse.snapshot.placements.len(),
+            dense.snapshot.placements.len(),
+        );
+        // The densify pass keeps the main pass's placements and only adds to
+        // them, so it never regresses.
+        assert!(dense.snapshot.placements.len() >= sparse.snapshot.placements.len());
     }
 }

@@ -29,12 +29,12 @@
     {
       "file": "mycoplasma_top30.pack.json",
       "id": "mycoplasma_top30",
-      "label": "mycoplasma — top-30 species (50244 placed)"
+      "label": "mycoplasma — top-30 species (50316 placed)"
     },
     {
       "file": "mycoplasma_full.pack.json",
       "id": "mycoplasma_full",
-      "label": "mycoplasma (full) — 642 species + lipid bilayer (59302 placed)"
+      "label": "mycoplasma (full) — 642 species + lipid bilayer (59373 placed)"
     }
   ]
 }

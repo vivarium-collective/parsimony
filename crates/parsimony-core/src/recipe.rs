@@ -52,6 +52,9 @@ struct RawChromosome {
     /// double helix along a backbone axis instead of a plain walk.
     #[serde(default)]
     supercoil: Option<RawSupercoil>,
+    /// DNA-binding proteins to pack along the fiber (RNAP, replisome, …).
+    #[serde(default)]
+    proteins: Vec<RawFiberProtein>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -61,6 +64,14 @@ struct RawSupercoil {
     radius: f32,
     /// Axial rise per turn (how stretched the coil is).
     pitch: f32,
+}
+
+/// A protein species bound along the chromosome. `object` names an entry in
+/// `objects` (any ingredient shape); `count` instances are placed on the fiber.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawFiberProtein {
+    object: String,
+    count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +248,8 @@ pub struct ChromosomeSpec {
     pub compartment: Option<String>,
     /// Plectonemic supercoiling, if requested.
     pub supercoil: Option<SupercoilSpec>,
+    /// DNA-binding proteins to pack along the fiber: `(ingredient name, count)`.
+    pub proteins: Vec<(String, u32)>,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -530,6 +543,18 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
         recipe_dir,
     )?;
 
+    // Chromosome-bound protein references must resolve to real ingredients.
+    if let Some(chr) = &raw.chromosome {
+        for p in &chr.proteins {
+            if !ingredients.contains_key(&p.object) {
+                return Err(RecipeError::UnsupportedIngredient(format!(
+                    "{} (chromosome protein)",
+                    p.object
+                )));
+            }
+        }
+    }
+
     Ok(Recipe {
         name: raw.name.unwrap_or_else(|| "unnamed".to_string()),
         bounding_box,
@@ -545,6 +570,7 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
             supercoil: c
                 .supercoil
                 .map(|s| SupercoilSpec { radius: s.radius, pitch: s.pitch }),
+            proteins: c.proteins.iter().map(|p| (p.object.clone(), p.count)).collect(),
         }),
     })
 }

@@ -736,6 +736,10 @@ enum PipelineAction {
         /// Project root (for default cache + output locations).
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Run N iterations of a relaxation pass over the merged assembly to
+        /// settle residual clashes at stage boundaries (0 = off).
+        #[arg(long, default_value_t = 0)]
+        relax: usize,
     },
     /// Show each stage's cache key and whether it's fresh (cached) or stale.
     Status {
@@ -758,6 +762,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
             force,
             cache_dir,
             root,
+            relax,
         } => {
             let pipeline = Pipeline::load(&file)
                 .with_context(|| format!("loading pipeline `{}`", file.display()))?;
@@ -765,7 +770,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
             let cache_dir = cache_dir.unwrap_or_else(|| root.join(".parsimony/cache"));
 
             let t = Instant::now();
-            let run = pipeline
+            let mut run = pipeline
                 .run(base_dir, &cache_dir, force)
                 .with_context(|| format!("running pipeline `{}`", pipeline.name))?;
             let elapsed = t.elapsed();
@@ -784,6 +789,20 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
                 eprintln!(
                     "  {tag:<6} {:<14} {:>6} placed  {:<22}{chr}  [{}]",
                     r.id, r.placed, r.kind, r.cache_key
+                );
+            }
+
+            if relax > 0 {
+                let rs = parsimony_core::relax(&mut run.merged, &run.recipe, relax);
+                eprintln!(
+                    "relax: {} iters, {} movable, {} proxy spheres — clashes {}→{}, max penetration {:.1}→{:.1} Å",
+                    rs.iterations,
+                    rs.movable,
+                    rs.proxy_spheres,
+                    rs.clashes_before,
+                    rs.clashes_after,
+                    rs.max_penetration_before,
+                    rs.max_penetration_after,
                 );
             }
 

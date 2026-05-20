@@ -100,6 +100,27 @@ impl ClearanceGrid {
         )
     }
 
+    /// Clearance (distance to the nearest placed sphere's surface) at the
+    /// cell containing `p`. Points outside the grid read as `0.0` (blocked).
+    /// Used by the densify phase to test, per proxy, whether a candidate
+    /// instance's actual spheres fit — far tighter than the enclosing-sphere
+    /// test the main pass uses.
+    #[inline]
+    pub fn clearance_at(&self, p: Point3<f32>) -> f32 {
+        let c = self.point_to_cell(p);
+        if c[0] < 0
+            || c[1] < 0
+            || c[2] < 0
+            || c[0] >= self.dims[0] as i32
+            || c[1] >= self.dims[1] as i32
+            || c[2] >= self.dims[2] as i32
+        {
+            return 0.0;
+        }
+        let i = c[0] as usize + self.dims[0] * (c[1] as usize + self.dims[1] * c[2] as usize);
+        self.clearance[i]
+    }
+
     /// Update cells in range of a new placement at `p` with radius `r`,
     /// when the largest ingredient anyone might want to sample for is
     /// `max_required_radius`. Cells inside the sphere become `0.0`;

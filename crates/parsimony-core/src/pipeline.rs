@@ -38,9 +38,12 @@ use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use rand::SeedableRng;
+use rand_xoshiro::Xoshiro256PlusPlus;
+
 use crate::compartment::{Compartment, CompartmentKind};
 use crate::ingredient::{Ingredient, IngredientShape};
-use crate::placement::Snapshot;
+use crate::placement::{Placement, Snapshot};
 use crate::placer::{GreedyRandomPlacer, PlacerConfig};
 use crate::recipe::{PackingMode, Recipe, RegionKind};
 
@@ -99,22 +102,43 @@ pub enum StageKind {
         include: Vec<String>,
         #[serde(default)]
         exclude: Vec<String>,
+        /// Run the proxy-accurate densify phase for this stage (packs
+        /// non-spherical mesh ingredients tighter than enclosing-sphere
+        /// clearance allows).
+        #[serde(default)]
+        densify: bool,
+        /// Clearance-grid cell size (Å). Finer than the autodetected
+        /// `max_radius/8` recovers placements the coarse grid misses (and
+        /// shrinks the densify margin), at higher memory/time. `None` = auto.
+        #[serde(default)]
+        clearance_cell_size: Option<f32>,
     },
+    /// Bind the chromosome's DNA-binding proteins along the fiber produced
+    /// by a `chromosome` dependency. The proteins + counts come from the
+    /// recipe's `chromosome.proteins`; list the chromosome (and any stages
+    /// whose geometry the proteins should avoid) in `depends_on`.
+    FiberPack,
 }
 
 impl StageKind {
     fn label(&self) -> String {
         match self {
             StageKind::Chromosome => "chromosome".into(),
-            StageKind::Pack { include, exclude } => {
-                if !include.is_empty() {
+            StageKind::Pack { include, exclude, densify, .. } => {
+                let sel = if !include.is_empty() {
                     format!("pack include=[{}]", include.join(","))
                 } else if !exclude.is_empty() {
                     format!("pack exclude=[{}]", exclude.join(","))
                 } else {
                     "pack all".into()
+                };
+                if *densify {
+                    format!("{sel} +dense")
+                } else {
+                    sel
                 }
             }
+            StageKind::FiberPack => "fiber proteins".into(),
         }
     }
 }
@@ -235,18 +259,31 @@ impl Pipeline {
                 let snap: Snapshot = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
                 (snap, true)
             } else {
-                let dep_snaps: Vec<&Snapshot> =
-                    stage.depends_on.iter().map(|d| &snaps[d.as_str()]).collect();
-                let obstacles = obstacles_from(&dep_snaps, &recipe);
-                let sub = sub_recipe(&recipe, &stage.kind);
-                let cfg = PlacerConfig {
-                    strict_bounds: self.strict_bounds,
-                    ..PlacerConfig::default()
+                let snapshot = if matches!(stage.kind, StageKind::FiberPack) {
+                    run_fiber_pack(stage, &recipe, &snaps, self.seed)
+                } else {
+                    let dep_snaps: Vec<&Snapshot> =
+                        stage.depends_on.iter().map(|d| &snaps[d.as_str()]).collect();
+                    let obstacles = obstacles_from(&dep_snaps, &recipe);
+                    let sub = sub_recipe(&recipe, &stage.kind);
+                    let (densify, cell_size) = match &stage.kind {
+                        StageKind::Pack { densify, clearance_cell_size, .. } => {
+                            (*densify, *clearance_cell_size)
+                        }
+                        _ => (false, None),
+                    };
+                    let cfg = PlacerConfig {
+                        strict_bounds: self.strict_bounds,
+                        densify,
+                        clearance_cell_size: cell_size,
+                        ..PlacerConfig::default()
+                    };
+                    GreedyRandomPlacer::new(&sub, cfg)
+                        .pack_with_obstacles(stage.effective_seed(self.seed), &obstacles)
+                        .snapshot
                 };
-                let out = GreedyRandomPlacer::new(&sub, cfg)
-                    .pack_with_obstacles(stage.effective_seed(self.seed), &obstacles);
-                std::fs::write(&path, serde_json::to_string(&out.snapshot)?)?;
-                (out.snapshot, false)
+                std::fs::write(&path, serde_json::to_string(&snapshot)?)?;
+                (snapshot, false)
             };
 
             reports.push(StageReport {
@@ -328,8 +365,10 @@ impl Pipeline {
                     None => h.string("<none>"),
                 }
             }
-            StageKind::Pack { include, exclude } => {
+            StageKind::Pack { include, exclude, densify, clearance_cell_size } => {
                 h.string("pack");
+                h.u8(*densify as u8);
+                h.f32(clearance_cell_size.unwrap_or(0.0));
                 for d in &recipe.directives {
                     if !pack_selects(include, exclude, &d.ingredient) {
                         continue;
@@ -339,6 +378,19 @@ impl Pipeline {
                     h.u8(region_tag(d.region));
                     h.u32(d.count);
                     h.u8(matches!(d.packing_mode, PackingMode::Tiled) as u8);
+                }
+            }
+            StageKind::FiberPack => {
+                h.string("fiber_pack");
+                match &recipe.chromosome {
+                    Some(c) => {
+                        h.f32(c.bead_radius);
+                        for (name, count) in &c.proteins {
+                            h.string(name);
+                            h.u32(*count);
+                        }
+                    }
+                    None => h.string("<none>"),
                 }
             }
         }
@@ -364,11 +416,22 @@ fn sub_recipe(recipe: &Recipe, kind: &StageKind) -> Recipe {
     match kind {
         StageKind::Chromosome => {
             r.directives.clear();
+            // Bound proteins are a separate FiberPack stage; the placer must
+            // not also bind them while generating the fiber here.
+            if let Some(c) = r.chromosome.as_mut() {
+                c.proteins.clear();
+            }
         }
-        StageKind::Pack { include, exclude } => {
+        StageKind::Pack { include, exclude, .. } => {
             r.chromosome = None;
             r.directives
                 .retain(|d| pack_selects(include, exclude, &d.ingredient));
+        }
+        // FiberPack is run by `run_fiber_pack`, not the volume placer, so it
+        // never reaches here — but the match must stay exhaustive.
+        StageKind::FiberPack => {
+            r.directives.clear();
+            r.chromosome = None;
         }
     }
     r
@@ -404,6 +467,72 @@ fn obstacles_from(deps: &[&Snapshot], recipe: &Recipe) -> Vec<(Point3<f32>, f32)
         }
     }
     obs
+}
+
+/// Execute a [`StageKind::FiberPack`] stage: bind the chromosome's proteins
+/// along the fiber from a `chromosome` dependency, avoiding the
+/// dependencies' placed geometry (e.g. the interior). The DNA beads
+/// themselves aren't obstacles — bindings are meant to sit on them.
+fn run_fiber_pack(
+    stage: &Stage,
+    recipe: &Recipe,
+    snaps: &HashMap<&str, Snapshot>,
+    pipeline_seed: u64,
+) -> Snapshot {
+    let mut snap = Snapshot::new(recipe.name.clone(), stage.effective_seed(pipeline_seed));
+    let Some(chr_spec) = &recipe.chromosome else {
+        return snap;
+    };
+    let Some(chrom) = stage
+        .depends_on
+        .iter()
+        .filter_map(|d| snaps.get(d.as_str()))
+        .find_map(|s| s.chromosome.as_ref())
+    else {
+        return snap;
+    };
+
+    let fiber_world: Vec<nalgebra::Point3<f32>> =
+        chrom.points.iter().map(|p| chrom.center + p.coords).collect();
+    let obstacles: Vec<(nalgebra::Point3<f32>, f32)> = stage
+        .depends_on
+        .iter()
+        .filter_map(|d| snaps.get(d.as_str()))
+        .flat_map(|s| {
+            s.placements.iter().flat_map(|pl| {
+                recipe
+                    .ingredients
+                    .get_index(pl.ingredient_id as usize)
+                    .map(|(_, ing)| ing.shape.world_spheres(pl.position, pl.rotation))
+                    .into_iter()
+                    .flatten()
+            })
+        })
+        .collect();
+    let proteins: Vec<(u32, &Ingredient, u32)> = chr_spec
+        .proteins
+        .iter()
+        .filter_map(|(name, count)| {
+            recipe
+                .ingredients
+                .get_full(name)
+                .map(|(idx, _, ing)| (idx as u32, ing, *count))
+        })
+        .collect();
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(stage.effective_seed(pipeline_seed));
+    for b in crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chrom.radius, &mut rng)
+    {
+        snap.placements.push(Placement {
+            instance_uid: snap.placements.len() as u64,
+            ingredient_id: b.ingredient_id,
+            variant_id: 0,
+            compartment_id: 0,
+            position: b.position,
+            rotation: b.rotation,
+        });
+    }
+    snap
 }
 
 // ───── graph ─────────────────────────────────────────────────────────
@@ -636,6 +765,8 @@ mod tests {
                     kind: StageKind::Pack {
                         include: vec![],
                         exclude: vec![],
+                        densify: false,
+                        clearance_cell_size: None,
                     },
                     depends_on: vec!["chromosome".into()],
                     seed: None,
