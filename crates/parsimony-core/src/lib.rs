@@ -8,6 +8,7 @@ pub(crate) mod clearance_grid;
 pub mod fiber;
 pub mod fiber_pack;
 pub mod ingredient;
+pub(crate) mod octree;
 pub mod output;
 pub mod pipeline;
 pub mod placement;

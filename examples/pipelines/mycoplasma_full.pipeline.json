@@ -3,6 +3,7 @@
   "recipe": "../recipes/mycoplasma_full.json",
   "seed": 0,
   "strict_bounds": true,
+  "backend": "octree",
   "stages": [
     {
       "id": "chromosome",

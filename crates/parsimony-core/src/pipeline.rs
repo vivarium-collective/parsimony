@@ -44,7 +44,7 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use crate::compartment::{Compartment, CompartmentKind};
 use crate::ingredient::{Ingredient, IngredientShape};
 use crate::placement::{Placement, Snapshot};
-use crate::placer::{GreedyRandomPlacer, PlacerConfig};
+use crate::placer::{GreedyRandomPlacer, PlacementBackend, PlacerConfig};
 use crate::recipe::{PackingMode, Recipe, RegionKind};
 
 // ───── data model ────────────────────────────────────────────────────
@@ -68,6 +68,11 @@ pub struct Pipeline {
     /// Whole-sphere containment for the root domain (parsimony default).
     #[serde(default = "default_true")]
     pub strict_bounds: bool,
+    /// Placement engine for this pipeline's Pack stages. Default is the legacy
+    /// grid+valid_cells engine; set `"backend": "octree"` for the content-scaled
+    /// engine (whole-cell recipes).
+    #[serde(default)]
+    pub backend: PlacementBackend,
     pub stages: Vec<Stage>,
 }
 
@@ -276,6 +281,7 @@ impl Pipeline {
                         strict_bounds: self.strict_bounds,
                         densify,
                         clearance_cell_size: cell_size,
+                        backend: self.backend,
                         ..PlacerConfig::default()
                     };
                     GreedyRandomPlacer::new(&sub, cfg)
@@ -340,6 +346,7 @@ impl Pipeline {
         }
         hash_aabb(&mut h, &recipe.bounding_box);
         h.u8(self.strict_bounds as u8);
+        h.u8(self.backend as u8);
 
         // Stage identity + selection.
         h.string(&stage.id);
@@ -753,6 +760,7 @@ mod tests {
             recipe: "recipe.json".into(),
             seed: 0,
             strict_bounds: true,
+            backend: PlacementBackend::Legacy,
             stages: vec![
                 Stage {
                     id: "chromosome".into(),

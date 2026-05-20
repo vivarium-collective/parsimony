@@ -25,12 +25,14 @@
 use indexmap::IndexMap;
 use nalgebra::{Point3, Quaternion, UnitQuaternion};
 use rand::{Rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 use parsimony_spatial::{Aabb, QbvhIndex, Sphere, SpatialIndex};
 
 use crate::clearance_grid::ClearanceGrid;
 use crate::compartment::{Compartment, align_to_normal};
+use crate::octree::OccupancyOctree;
 use crate::ingredient::{Ingredient, IngredientShape};
 use crate::placement::{Placement, Snapshot};
 use crate::recipe::{ChromosomeSpec, PackingMode, PlacementDirective, Recipe, RegionKind};
@@ -75,11 +77,25 @@ const MAX_VALID_CELLS: usize = 500_000;
 /// falling back to a full scan (the better tool once the grid is that crowded).
 const REJECTION_TRY_BUDGET: usize = 8;
 
-// TEMP profiling — remove after diagnosis. Counts full-scan fallbacks and the
-// cells those scans touch, to see how much the crowded-rebuild path costs.
-static PROF_FULL_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_SCAN_CELLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_REJECT_TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Consecutive placement misses (since the last success) before the octree
+/// backend abandons a directive — the compartment is saturated for it.
+const OCTREE_FAIL_CAP: u32 = 1000;
+
+/// Which interior-placement engine the placer uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementBackend {
+    /// Dense clearance grid + per-directive valid-cell lists (cellPACK-style).
+    /// Volume-scaled; the original engine, kept as the default and as a fallback
+    /// for recipes that still want its exact behaviour.
+    #[default]
+    Legacy,
+    /// Sparse occupancy octree, built incrementally and shared across the main
+    /// pass and densify (which collapse into one proxy-accurate loop). Cost
+    /// scales with placed content, not box volume — the engine for whole-cell
+    /// recipes. See [`crate::octree`].
+    Octree,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlacerConfig {
@@ -115,6 +131,10 @@ pub struct PlacerConfig {
     /// Counts attempts, not wall time, so packing stays bit-for-bit
     /// reproducible. When reached, densify stops and keeps what it placed.
     pub densify_max_attempts: u64,
+    /// Which placement engine to use. [`PlacementBackend::Octree`] is
+    /// content-scaled (for whole-cell recipes); [`PlacementBackend::Legacy`]
+    /// (default) is the original grid+valid_cells engine.
+    pub backend: PlacementBackend,
 }
 
 impl Default for PlacerConfig {
@@ -126,6 +146,7 @@ impl Default for PlacerConfig {
             strict_bounds: true,
             densify: false,
             densify_max_attempts: 20_000_000,
+            backend: PlacementBackend::Legacy,
         }
     }
 }
@@ -204,6 +225,18 @@ impl<'a> GreedyRandomPlacer<'a> {
         seed: u64,
         obstacles: &[(Point3<f32>, f32)],
     ) -> PlacerOutcome {
+        match self.config.backend {
+            PlacementBackend::Legacy => self.pack_legacy(seed, obstacles),
+            PlacementBackend::Octree => self.pack_octree(seed, obstacles),
+        }
+    }
+
+    /// The original grid + valid-cells engine ([`PlacementBackend::Legacy`]).
+    fn pack_legacy(
+        &self,
+        seed: u64,
+        obstacles: &[(Point3<f32>, f32)],
+    ) -> PlacerOutcome {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
         let mut snapshot = Snapshot::new(self.recipe.name.clone(), seed);
         let mut index: QbvhIndex = QbvhIndex::new();
@@ -252,18 +285,10 @@ impl<'a> GreedyRandomPlacer<'a> {
         // the ingredient's enclosing sphere fits with `radius`
         // clearance from every forbidden surface. Empty for Surface
         // directives.
-        let _t_build = std::time::Instant::now();
         let mut valid_cells: Vec<Vec<u32>> = directives
             .iter()
             .map(|d| self.build_valid_cells(d, &clearance, &mut rng))
             .collect();
-        let mut prof_rebuilds = 0u64;
-        eprintln!(
-            "[prof] init valid_cells ({} dirs): {:.2?}",
-            directives.len(),
-            _t_build.elapsed()
-        );
-        let _t_main = std::time::Instant::now();
 
         loop {
             // Uniform-random pick over live directives — matches
@@ -311,7 +336,6 @@ impl<'a> GreedyRandomPlacer<'a> {
                         // list pruned across placements, but on
                         // emptiness we do a full pass — catches cells
                         // we never sampled directly.
-                        prof_rebuilds += 1;
                         valid_cells[dir_idx] = self.build_valid_cells(directive, &clearance, &mut rng);
                         pos = sample_from_valid_cells(
                             &mut valid_cells[dir_idx],
@@ -431,13 +455,6 @@ impl<'a> GreedyRandomPlacer<'a> {
             stats.placed += 1;
             stats.successful_attempts += 1;
         }
-        eprintln!(
-            "[prof] main pass: {:.2?} ({} placed, {} rebuilds)",
-            _t_main.elapsed(),
-            stats.placed,
-            prof_rebuilds
-        );
-        let _t_dens = std::time::Instant::now();
 
         // Densify phase: fill the remaining requested instances using
         // proxy-accurate fit — each candidate's *actual* proxy spheres must
@@ -540,13 +557,6 @@ impl<'a> GreedyRandomPlacer<'a> {
             }
         }
 
-        eprintln!(
-            "[prof] densify: {:.2?}  |  full_scans={} scan_cells={} reject_tries={}",
-            _t_dens.elapsed(),
-            PROF_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed),
-            PROF_SCAN_CELLS.load(std::sync::atomic::Ordering::Relaxed),
-            PROF_REJECT_TRIES.load(std::sync::atomic::Ordering::Relaxed),
-        );
         for (i, directive) in directives.iter().enumerate() {
             stats.per_ingredient.push((
                 directive.ingredient.clone(),
@@ -555,80 +565,259 @@ impl<'a> GreedyRandomPlacer<'a> {
                 per_ingredient_attempts[i],
             ));
         }
-        // Chromosome: generate the genome as a constrained self-avoiding
-        // walk inside its cell compartment (the "chain packing"), carried
-        // on the snapshot for the writer to emit as a fiber.
-        if let Some(chr) = &self.recipe.chromosome {
-            if let Some((center, cell_r)) = self.chromosome_cell(chr) {
-                let pts = match &chr.supercoil {
-                    Some(sc) => crate::fiber::generate_supercoiled_fiber(
-                        cell_r,
-                        chr.beads,
-                        chr.spacing,
-                        chr.bead_radius,
-                        sc.radius,
-                        sc.pitch,
-                        &mut rng,
-                    ),
-                    None => crate::fiber::generate_fiber(
-                        cell_r,
-                        chr.beads,
-                        chr.spacing,
-                        chr.bead_radius,
-                        &mut rng,
-                    ),
-                };
-                // DNA-binding proteins bound along the fiber, avoiding the
-                // interior already placed this run. (The monolithic packer
-                // lays the chromosome *after* the interior, so some interior
-                // may sit where the strand now runs; colliding bindings are
-                // skipped. The staged pipeline avoids that by packing the
-                // interior around the chromosome first.)
-                if !chr.proteins.is_empty() && pts.len() >= 2 {
-                    let fiber_world: Vec<Point3<f32>> =
-                        pts.iter().map(|p| center + p.coords).collect();
-                    let obstacles: Vec<(Point3<f32>, f32)> = snapshot
-                        .placements
-                        .iter()
-                        .flat_map(|pl| {
-                            let ing = self
-                                .recipe
-                                .ingredients
-                                .get_index(pl.ingredient_id as usize)
-                                .unwrap()
-                                .1;
-                            ing.shape.world_spheres(pl.position, pl.rotation)
-                        })
-                        .collect();
-                    let proteins = self.resolve_fiber_proteins(chr);
-                    for b in crate::fiber_pack::pack_on_fiber(
-                        &fiber_world,
-                        &proteins,
-                        &obstacles,
-                        chr.bead_radius,
-                        &mut rng,
-                    ) {
-                        snapshot.placements.push(Placement {
-                            instance_uid: next_uid,
-                            ingredient_id: b.ingredient_id,
-                            variant_id: 0,
-                            compartment_id: 0,
-                            position: b.position,
-                            rotation: b.rotation,
-                        });
-                        next_uid += 1;
-                    }
-                }
-                snapshot.chromosome = Some(crate::placement::Chromosome {
-                    center,
-                    radius: chr.bead_radius,
-                    color: chr.color,
-                    points: pts,
+        // Chromosome (if any): genome fiber + bound proteins, attached to the
+        // snapshot. Shared with the octree backend.
+        self.place_chromosome(&mut snapshot, &mut next_uid, &mut rng);
+
+        PlacerOutcome { snapshot, stats }
+    }
+
+    /// Generate the recipe's chromosome fiber (plain or supercoiled) inside its
+    /// cell compartment, bind its DNA-binding proteins along it (avoiding the
+    /// interior already placed this run), and attach it to the snapshot. No-op
+    /// when the recipe has no chromosome. Shared by both placement backends.
+    fn place_chromosome<R: Rng>(
+        &self,
+        snapshot: &mut Snapshot,
+        next_uid: &mut u64,
+        rng: &mut R,
+    ) {
+        let Some(chr) = &self.recipe.chromosome else {
+            return;
+        };
+        let Some((center, cell_r)) = self.chromosome_cell(chr) else {
+            return;
+        };
+        let pts = match &chr.supercoil {
+            Some(sc) => crate::fiber::generate_supercoiled_fiber(
+                cell_r,
+                chr.beads,
+                chr.spacing,
+                chr.bead_radius,
+                sc.radius,
+                sc.pitch,
+                rng,
+            ),
+            None => {
+                crate::fiber::generate_fiber(cell_r, chr.beads, chr.spacing, chr.bead_radius, rng)
+            }
+        };
+        if !chr.proteins.is_empty() && pts.len() >= 2 {
+            let fiber_world: Vec<Point3<f32>> =
+                pts.iter().map(|p| center + p.coords).collect();
+            let obstacles: Vec<(Point3<f32>, f32)> = snapshot
+                .placements
+                .iter()
+                .flat_map(|pl| {
+                    let ing = self
+                        .recipe
+                        .ingredients
+                        .get_index(pl.ingredient_id as usize)
+                        .unwrap()
+                        .1;
+                    ing.shape.world_spheres(pl.position, pl.rotation)
+                })
+                .collect();
+            let proteins = self.resolve_fiber_proteins(chr);
+            for b in
+                crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+            {
+                snapshot.placements.push(Placement {
+                    instance_uid: *next_uid,
+                    ingredient_id: b.ingredient_id,
+                    variant_id: 0,
+                    compartment_id: 0,
+                    position: b.position,
+                    rotation: b.rotation,
                 });
+                *next_uid += 1;
+            }
+        }
+        snapshot.chromosome = Some(crate::placement::Chromosome {
+            center,
+            radius: chr.bead_radius,
+            color: chr.color,
+            points: pts,
+        });
+    }
+
+    /// Content-scaled placement on a sparse occupancy octree
+    /// ([`PlacementBackend::Octree`]). The enclosing-sphere main pass and the
+    /// proxy-accurate densify phase collapse into one loop — every candidate is
+    /// checked against the octree at proxy accuracy — so there's no separate
+    /// densify stage, clearance grid, or valid-cell list. Earlier-stage
+    /// obstacles are inserted up front so this run avoids them.
+    fn pack_octree(&self, seed: u64, obstacles: &[(Point3<f32>, f32)]) -> PlacerOutcome {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        let mut snapshot = Snapshot::new(self.recipe.name.clone(), seed);
+        let mut next_uid: u64 = 0;
+        let mut stats = PlacerStats::default();
+
+        // Frontier resolution: reuse the clearance cell-size policy (explicit
+        // override, else max-radius/8). Only the occupied/free frontier refines
+        // down to this; empty bulk stays coarse.
+        let max_required_radius = self
+            .recipe
+            .ingredients
+            .values()
+            .map(|i| i.shape.enclosing_radius())
+            .fold(0.0_f32, f32::max);
+        let min_cell = self
+            .config
+            .clearance_cell_size
+            .unwrap_or_else(|| (max_required_radius / 8.0).max(0.5));
+        let mut octree = OccupancyOctree::new(self.recipe.bounding_box, min_cell);
+        for &(c, r) in obstacles {
+            octree.insert_sphere(c, r);
+        }
+
+        let directives: Vec<&PlacementDirective> = self.recipe.directives.iter().collect();
+        let mut remaining: Vec<u32> = directives.iter().map(|d| d.count).collect();
+        let mut per_ingredient_attempts: Vec<u64> = vec![0; directives.len()];
+        let mut per_ingredient_placed: Vec<usize> = vec![0; directives.len()];
+        let mut consecutive_fail: Vec<u32> = vec![0; directives.len()];
+        let mut stuck: Vec<bool> = vec![false; directives.len()];
+        stats.requested = remaining.iter().sum::<u32>() as usize;
+
+        loop {
+            let live: Vec<usize> = (0..directives.len())
+                .filter(|&i| remaining[i] > 0 && !stuck[i])
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let dir_idx = live[rng.gen_range(0..live.len())];
+            let directive = directives[dir_idx];
+            let ingredient = self.recipe.ingredients.get(&directive.ingredient).unwrap();
+            let compartment = self.recipe.compartments.get(&directive.compartment).unwrap();
+            let er = ingredient.shape.enclosing_radius();
+            let tiled = matches!(ingredient.packing_mode, PackingMode::Tiled);
+
+            per_ingredient_attempts[dir_idx] += 1;
+            stats.total_attempts += 1;
+
+            let (pos, rotation) = match directive.region {
+                RegionKind::Interior => {
+                    // Free-biased point from the octree, kept only if its
+                    // enclosing sphere is contained in this compartment. (Always
+                    // strict containment — the octree backend targets named
+                    // compartments; loose root bounds stay on the legacy path.)
+                    let Some(p) = octree.sample_free(&mut rng) else {
+                        stuck[dir_idx] = true; // no free space anywhere
+                        continue;
+                    };
+                    let inside = compartment.kind.signed_distance(p) >= er
+                        && compartment.children.iter().all(|&id| {
+                            self.recipe
+                                .compartments
+                                .get_index(id as usize)
+                                .map(|(_, c)| -c.kind.signed_distance(p) >= er)
+                                .unwrap_or(true)
+                        });
+                    if !inside {
+                        consecutive_fail[dir_idx] += 1;
+                        if consecutive_fail[dir_idx] >= OCTREE_FAIL_CAP {
+                            stuck[dir_idx] = true;
+                        }
+                        continue;
+                    }
+                    let rot = if ingredient.shape.needs_rotation() {
+                        random_rotation(&mut rng)
+                    } else {
+                        UnitQuaternion::identity()
+                    };
+                    (p, rot)
+                }
+                RegionKind::Surface => {
+                    let (p, n) = if tiled {
+                        let idx = per_ingredient_attempts[dir_idx] - 1;
+                        if idx >= directive.count as u64 {
+                            stuck[dir_idx] = true;
+                            continue;
+                        }
+                        match compartment.kind.surface_point_fibonacci(
+                            idx,
+                            directive.count as u64,
+                            &mut rng,
+                        ) {
+                            Some(pn) => pn,
+                            None => compartment.kind.sample_surface(&mut rng),
+                        }
+                    } else {
+                        compartment.kind.sample_surface(&mut rng)
+                    };
+                    (p, align_to_normal(ingredient.principal_vector, n))
+                }
+            };
+
+            // Tiled surface layers self-avoid by construction (even spacing) and
+            // form a thin shell kept out of the octree, so the interior packs the
+            // cell volume rather than the membrane. Place with no collision test.
+            if tiled {
+                self.record_placement(&mut snapshot, &mut next_uid, directive, pos, rotation);
+                remaining[dir_idx] -= 1;
+                per_ingredient_placed[dir_idx] += 1;
+                stats.placed += 1;
+                stats.successful_attempts += 1;
+                continue;
+            }
+
+            // Proxy-accurate fit: every proxy must clear the octree. Lazy, so a
+            // candidate that clashes on its first proxy doesn't transform the rest.
+            let fits = ingredient
+                .shape
+                .world_spheres(pos, rotation)
+                .all(|(c, r)| !octree.overlaps(c, r));
+            if fits {
+                for (c, r) in ingredient.shape.world_spheres(pos, rotation) {
+                    octree.insert_sphere(c, r);
+                }
+                self.record_placement(&mut snapshot, &mut next_uid, directive, pos, rotation);
+                remaining[dir_idx] -= 1;
+                per_ingredient_placed[dir_idx] += 1;
+                stats.placed += 1;
+                stats.successful_attempts += 1;
+                consecutive_fail[dir_idx] = 0;
+            } else {
+                consecutive_fail[dir_idx] += 1;
+                if consecutive_fail[dir_idx] >= OCTREE_FAIL_CAP {
+                    stuck[dir_idx] = true;
+                }
             }
         }
 
+        for (i, directive) in directives.iter().enumerate() {
+            stats.per_ingredient.push((
+                directive.ingredient.clone(),
+                per_ingredient_placed[i],
+                directive.count as usize,
+                per_ingredient_attempts[i],
+            ));
+        }
+
+        self.place_chromosome(&mut snapshot, &mut next_uid, &mut rng);
         PlacerOutcome { snapshot, stats }
+    }
+
+    /// Push one placement onto the snapshot, advancing the UID counter.
+    fn record_placement(
+        &self,
+        snapshot: &mut Snapshot,
+        next_uid: &mut u64,
+        directive: &PlacementDirective,
+        pos: Point3<f32>,
+        rotation: UnitQuaternion<f32>,
+    ) {
+        let uid = *next_uid;
+        *next_uid += 1;
+        snapshot.placements.push(Placement {
+            instance_uid: uid,
+            ingredient_id: self.ingredient_ids[&directive.ingredient],
+            variant_id: 0,
+            compartment_id: self.compartment_ids[&directive.compartment],
+            position: pos,
+            rotation,
+        });
     }
 
     /// The cell compartment the chromosome lives in: the named one if the
@@ -853,7 +1042,6 @@ fn build_valid_cells_for<R: Rng>(
                 list.push(i as u32);
             }
         }
-        PROF_REJECT_TRIES.fetch_add(tries as u64, std::sync::atomic::Ordering::Relaxed);
         if list.len() == MAX_VALID_CELLS {
             return list;
         }
@@ -864,8 +1052,6 @@ fn build_valid_cells_for<R: Rng>(
     // random subset of at most MAX_VALID_CELLS valid cells in one pass. When the
     // candidate volume is ≤ the cap this keeps every valid cell and draws no
     // randomness, so ordinary recipes stay bit-for-bit reproducible.
-    PROF_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PROF_SCAN_CELLS.fetch_add(candidates, std::sync::atomic::Ordering::Relaxed);
     let mut list: Vec<u32> = Vec::new();
     let mut seen: usize = 0;
     for cz in lo_z..=hi_z {
@@ -1272,5 +1458,47 @@ mod tests {
         let cells =
             build_valid_cells_for(&grid, ing, comp, &recipe.compartments, true, &mut rng);
         assert_eq!(cells.len(), MAX_VALID_CELLS, "valid-cell list must clamp to the cap");
+    }
+
+    #[test]
+    fn octree_backend_packs_without_overlap() {
+        let recipe = Recipe::from_json_str(SPHERES_IN_A_BOX_TINY).unwrap();
+        let cfg = PlacerConfig {
+            backend: PlacementBackend::Octree,
+            ..PlacerConfig::default()
+        };
+        let out = GreedyRandomPlacer::new(&recipe, cfg).pack(0xFADE);
+        assert!(!out.snapshot.placements.is_empty(), "octree backend placed nothing");
+        let r = 10.0_f32;
+        for i in 0..out.snapshot.placements.len() {
+            for j in (i + 1)..out.snapshot.placements.len() {
+                let d2 = (out.snapshot.placements[i].position
+                    - out.snapshot.placements[j].position)
+                    .norm_squared();
+                assert!(
+                    d2 >= (2.0 * r) * (2.0 * r) - 1e-3,
+                    "octree placements {i},{j} overlap (d²={d2})"
+                );
+            }
+            let q = out.snapshot.placements[i].position;
+            for c in [q.x, q.y, q.z] {
+                assert!((-1e-3..=100.0 + 1e-3).contains(&c), "placement outside box");
+            }
+        }
+    }
+
+    #[test]
+    fn octree_backend_is_deterministic() {
+        let recipe = Recipe::from_json_str(SPHERES_IN_A_BOX_TINY).unwrap();
+        let cfg = PlacerConfig {
+            backend: PlacementBackend::Octree,
+            ..PlacerConfig::default()
+        };
+        let a = GreedyRandomPlacer::new(&recipe, cfg).pack(99);
+        let b = GreedyRandomPlacer::new(&recipe, cfg).pack(99);
+        assert_eq!(a.snapshot.placements.len(), b.snapshot.placements.len());
+        for (pa, pb) in a.snapshot.placements.iter().zip(b.snapshot.placements.iter()) {
+            assert_eq!(pa.position, pb.position);
+        }
     }
 }
