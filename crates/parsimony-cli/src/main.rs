@@ -95,6 +95,12 @@ struct PackArgs {
     /// explore adaptive cell sizing vs the octree. No effect on `octree`.
     #[arg(long)]
     cell_size: Option<f32>,
+
+    /// Override the recipe's chromosome bead count (genome resolution).
+    /// More beads = more DNA contour/volume + finer genome, at a heavier
+    /// obstacle set for the interior pack. No effect without a chromosome.
+    #[arg(long)]
+    chromosome_beads: Option<usize>,
 }
 
 /// CLI mirror of [`PlacementBackend`] (keeps `clap` out of parsimony-core).
@@ -199,6 +205,7 @@ fn run_pack(args: PackArgs) -> Result<()> {
         strict_bounds: !args.loose_bounds,
         backend: args.backend.into(),
         clearance_cell_size: args.cell_size,
+        chromosome_beads: args.chromosome_beads,
         ..PlacerConfig::default()
     };
     let t = Instant::now();

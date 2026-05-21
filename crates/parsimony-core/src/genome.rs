@@ -126,6 +126,58 @@ impl Genome {
         }
     }
 
+    /// Split the circular genome into `domains` arcs at the **largest
+    /// intergenic gaps** (≈ operon / transcription-unit boundaries) and return
+    /// a bead count per arc, proportional to its bp span (summing to ~`total_
+    /// beads`, each ≥ 2). Drives the rosette's plectoneme domains so they
+    /// correspond to real gene clusters instead of being evenly spaced — while
+    /// keeping bp/bead ~constant so the bp↔arc mapping (for RNAP) stays linear.
+    pub fn domain_bead_allocation(&self, total_beads: usize, domains: usize) -> Vec<usize> {
+        let domains = domains.max(1);
+        if domains == 1 || self.genes.len() <= domains {
+            return vec![(total_beads / domains).max(2); domains];
+        }
+        let mut mids: Vec<u32> = self
+            .genes
+            .iter()
+            .map(|g| g.midpoint() % self.length_bp)
+            .collect();
+        mids.sort_unstable();
+        let n = mids.len();
+        // Circular gap after each gene midpoint, tagged with its index.
+        let gap_after = |i: usize| -> u32 {
+            let a = mids[i];
+            let b = if i + 1 < n { mids[i + 1] } else { mids[0] + self.length_bp };
+            b - a
+        };
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_unstable_by(|&x, &y| gap_after(y).cmp(&gap_after(x)));
+        // Boundary positions = midpoints of the `domains` largest gaps.
+        let mut bounds: Vec<u32> = idx
+            .iter()
+            .take(domains)
+            .map(|&i| {
+                let a = mids[i];
+                let b = if i + 1 < n { mids[i + 1] } else { mids[0] + self.length_bp };
+                ((a + b) / 2) % self.length_bp
+            })
+            .collect();
+        bounds.sort_unstable();
+        let m = bounds.len();
+        let spans: Vec<f64> = (0..m)
+            .map(|i| {
+                let a = bounds[i];
+                let b = if i + 1 < m { bounds[i + 1] } else { bounds[0] + self.length_bp };
+                (b - a) as f64
+            })
+            .collect();
+        let total_span: f64 = spans.iter().sum::<f64>().max(1.0);
+        spans
+            .iter()
+            .map(|&s| ((total_beads as f64 * s / total_span).round() as usize).max(2))
+            .collect()
+    }
+
     /// Genomic positions ([0,1) fractions) at which to seat each chromosome
     /// bound protein. `bound` is `(name, count)` of DNA-binding proteins
     /// (RNAP, DNAP); `abundances` is `(ingredient_name, count)` from the recipe
@@ -257,6 +309,18 @@ mod tests {
         assert!((g.fraction(0)).abs() < 1e-6);
         let f = g.fraction(g.length_bp / 2);
         assert!((f - 0.5).abs() < 1e-3, "got {f}");
+    }
+
+    #[test]
+    fn domain_allocation_is_nonuniform_and_sums() {
+        let g = Genome::from_csv(&table()).unwrap();
+        let alloc = g.domain_bead_allocation(90_000, 50);
+        assert_eq!(alloc.len(), 50);
+        let sum: usize = alloc.iter().sum();
+        assert!((sum as i64 - 90_000).abs() < 3_000, "sum {sum} ~ 90000");
+        assert!(alloc.iter().all(|&b| b >= 2));
+        let (mn, mx) = (*alloc.iter().min().unwrap(), *alloc.iter().max().unwrap());
+        assert!(mx > mn * 2, "transcription-coupled domains should vary: min {mn} max {mx}");
     }
 
     #[test]

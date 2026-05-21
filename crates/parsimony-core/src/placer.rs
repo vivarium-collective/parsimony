@@ -135,6 +135,10 @@ pub struct PlacerConfig {
     /// content-scaled (for whole-cell recipes); [`PlacementBackend::Legacy`]
     /// (default) is the original grid+valid_cells engine.
     pub backend: PlacementBackend,
+    /// Override the recipe's `chromosome.beads` (genome resolution). `None`
+    /// uses the recipe value. More beads = more contour/volume + finer genome,
+    /// at a heavier obstacle set for the interior pack.
+    pub chromosome_beads: Option<usize>,
 }
 
 impl Default for PlacerConfig {
@@ -147,6 +151,7 @@ impl Default for PlacerConfig {
             densify: false,
             densify_max_attempts: 20_000_000,
             backend: PlacementBackend::Legacy,
+            chromosome_beads: None,
         }
     }
 }
@@ -588,22 +593,33 @@ impl<'a> GreedyRandomPlacer<'a> {
         let Some((center, cell_r)) = self.chromosome_cell(chr) else {
             return;
         };
+        // Genome resolution: recipe value unless overridden (e.g. `pack
+        // --chromosome-beads`). More beads → more DNA contour/volume.
+        let beads = self.config.chromosome_beads.unwrap_or(chr.beads);
         let pts = match &chr.supercoil {
-            // `generate_nucleoid` is a rosette of `domains` plectoneme loops;
-            // `domains <= 1` falls back to a single global plectoneme.
-            Some(sc) => crate::fiber::generate_nucleoid(
-                cell_r,
-                chr.beads,
-                chr.spacing,
-                chr.bead_radius,
-                sc.radius,
-                sc.pitch,
-                sc.domains,
-                rng,
-            ),
-            None => {
-                crate::fiber::generate_fiber(cell_r, chr.beads, chr.spacing, chr.bead_radius, rng)
+            Some(sc) => {
+                // Per-domain bead allocation: transcription-coupled (each
+                // plectoneme domain sized to its gene-cluster bp span) when a
+                // genome is set, else evenly split. `domains <= 1` → single
+                // global plectoneme.
+                let alloc: Vec<usize> = chr
+                    .genome
+                    .as_ref()
+                    .filter(|_| sc.domains > 1)
+                    .and_then(|p| crate::genome::Genome::from_csv(p).ok())
+                    .map(|g| g.domain_bead_allocation(beads, sc.domains))
+                    .unwrap_or_else(|| vec![(beads / sc.domains.max(1)).max(2); sc.domains.max(1)]);
+                crate::fiber::generate_nucleoid(
+                    cell_r,
+                    &alloc,
+                    chr.spacing,
+                    chr.bead_radius,
+                    sc.radius,
+                    sc.pitch,
+                    rng,
+                )
             }
+            None => crate::fiber::generate_fiber(cell_r, beads, chr.spacing, chr.bead_radius, rng),
         };
         if !chr.proteins.is_empty() && pts.len() >= 2 {
             let fiber_world: Vec<Point3<f32>> =

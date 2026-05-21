@@ -19671,7 +19671,7 @@
   },
   "chromosome": {
     "genome": "../genome/mycoplasma_g37_genes.csv",
-    "beads": 8000,
+    "beads": 90000,
     "spacing": 22,
     "bead_radius": 10,
     "color": [
