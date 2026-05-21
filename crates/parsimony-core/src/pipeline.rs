@@ -217,8 +217,13 @@ impl Pipeline {
 
     /// Compute each stage's cache key + whether a cached result exists,
     /// without packing anything. Stages are returned in dependency order.
-    pub fn plan(&self, base_dir: &Path, cache_dir: &Path) -> Result<Vec<StagePlan>, PipelineError> {
-        let recipe = Recipe::from_file(base_dir.join(&self.recipe))?;
+    pub fn plan(
+        &self,
+        base_dir: &Path,
+        cache_dir: &Path,
+        proxy_lod: Option<usize>,
+    ) -> Result<Vec<StagePlan>, PipelineError> {
+        let recipe = Recipe::from_file_with_proxy_lod(base_dir.join(&self.recipe), proxy_lod)?;
         let order = topo_order(&self.stages)?;
         let mut keys: HashMap<&str, String> = HashMap::new();
         let mut plans = Vec::with_capacity(order.len());
@@ -246,8 +251,9 @@ impl Pipeline {
         base_dir: &Path,
         cache_dir: &Path,
         force: bool,
+        proxy_lod: Option<usize>,
     ) -> Result<PipelineRun, PipelineError> {
-        let recipe = Recipe::from_file(base_dir.join(&self.recipe))?;
+        let recipe = Recipe::from_file_with_proxy_lod(base_dir.join(&self.recipe), proxy_lod)?;
         std::fs::create_dir_all(cache_dir)?;
         let order = topo_order(&self.stages)?;
 
@@ -823,7 +829,7 @@ mod tests {
         let mut pipeline = two_stage_pipeline();
 
         // First run: nothing cached, both stages execute.
-        let run1 = pipeline.run(&base, &cache, false).unwrap();
+        let run1 = pipeline.run(&base, &cache, false, None).unwrap();
         assert_eq!(run1.reports.len(), 2);
         assert!(run1.reports.iter().all(|r| !r.from_cache));
         let interior = run1.reports.iter().find(|r| r.id == "interior").unwrap();
@@ -834,12 +840,12 @@ mod tests {
         assert_eq!(run1.merged.placements.len(), interior.placed);
 
         // Second run, unchanged: both stages come from cache.
-        let run2 = pipeline.run(&base, &cache, false).unwrap();
+        let run2 = pipeline.run(&base, &cache, false, None).unwrap();
         assert!(run2.reports.iter().all(|r| r.from_cache), "all cached on rerun");
 
         // Re-roll only the interior: chromosome stays cached, interior repacks.
         pipeline.stages[1].seed = Some(0xBEEF);
-        let run3 = pipeline.run(&base, &cache, false).unwrap();
+        let run3 = pipeline.run(&base, &cache, false, None).unwrap();
         let chrom = run3.reports.iter().find(|r| r.id == "chromosome").unwrap();
         let inter = run3.reports.iter().find(|r| r.id == "interior").unwrap();
         assert!(chrom.from_cache, "chromosome must be reused");
@@ -874,8 +880,8 @@ mod tests {
         std::fs::write(base.join("recipe.json"), RECIPE).unwrap();
         let pipeline = two_stage_pipeline();
 
-        pipeline.run(&base, &cache, false).unwrap();
-        let forced = pipeline.run(&base, &cache, true).unwrap();
+        pipeline.run(&base, &cache, false, None).unwrap();
+        let forced = pipeline.run(&base, &cache, true, None).unwrap();
         assert!(forced.reports.iter().all(|r| !r.from_cache), "--force ignores cache");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -902,11 +908,11 @@ mod tests {
         std::fs::write(base.join("recipe.json"), RECIPE).unwrap();
         let pipeline = two_stage_pipeline();
 
-        let plan_before = pipeline.plan(&base, &cache).unwrap();
+        let plan_before = pipeline.plan(&base, &cache, None).unwrap();
         assert!(plan_before.iter().all(|s| !s.cached), "nothing cached yet");
 
-        let run = pipeline.run(&base, &cache, false).unwrap();
-        let plan_after = pipeline.plan(&base, &cache).unwrap();
+        let run = pipeline.run(&base, &cache, false, None).unwrap();
+        let plan_after = pipeline.plan(&base, &cache, None).unwrap();
         assert!(plan_after.iter().all(|s| s.cached), "all cached after a run");
         // Keys are stable between plan and run.
         for (p, r) in plan_after.iter().zip(run.reports.iter()) {

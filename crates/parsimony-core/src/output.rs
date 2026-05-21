@@ -245,8 +245,16 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         }
     }
 
+    // Cache-busting token for the viewer's IndexedDB mesh cache: a fresh value
+    // each write, so regenerating the pack/meshes invalidates cached geometry
+    // (which is keyed by URL and would otherwise serve stale meshes).
+    let cache_version = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     json!({
         "format": "parsimony.pack.v1",
+        "cache_version": cache_version,
         "recipe_name": snapshot.recipe_name,
         "seed": snapshot.seed,
         "bounds": {

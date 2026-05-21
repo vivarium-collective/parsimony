@@ -282,10 +282,22 @@ pub struct SupercoilSpec {
 impl Recipe {
     pub fn from_json_str(src: &str) -> Result<Self, RecipeError> {
         let raw: RawRecipe = serde_json::from_str(src)?;
-        resolve(raw, None)
+        resolve(raw, None, None)
     }
 
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, RecipeError> {
+        Self::from_file_with_proxy_lod(path, None)
+    }
+
+    /// Like [`Recipe::from_file`], but builds each mesh ingredient's collision
+    /// proxy from a chosen LOD: `proxy_lod` indexes `mesh_lods` (0 = coarsest,
+    /// clamped per ingredient); `None` uses the finest. A coarser proxy LOD is
+    /// far lighter to load + voxelise at whole-cell scale and barely changes
+    /// the result, since the proxy is voxelised at `proxy_voxel_size` regardless.
+    pub fn from_file_with_proxy_lod(
+        path: impl AsRef<std::path::Path>,
+        proxy_lod: Option<usize>,
+    ) -> Result<Self, RecipeError> {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| RecipeError::Io(e.to_string()))?;
@@ -293,7 +305,7 @@ impl Recipe {
         // Mesh-ingredient paths in the recipe are resolved relative to
         // the recipe file's parent directory.
         let base = path.parent().map(|p| p.to_path_buf());
-        resolve(raw, base.as_deref())
+        resolve(raw, base.as_deref(), proxy_lod)
     }
 }
 
@@ -323,7 +335,11 @@ pub enum RecipeError {
 
 // ---------- resolution ----------
 
-fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recipe, RecipeError> {
+fn resolve(
+    raw: RawRecipe,
+    recipe_dir: Option<&std::path::Path>,
+    proxy_lod: Option<usize>,
+) -> Result<Recipe, RecipeError> {
     let bounding_box = Aabb::new(
         nalgebra::Point3::new(raw.bounding_box[0][0], raw.bounding_box[0][1], raw.bounding_box[0][2]),
         nalgebra::Point3::new(raw.bounding_box[1][0], raw.bounding_box[1][1], raw.bounding_box[1][2]),
@@ -476,11 +492,16 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
                     })
                     .collect();
 
-                // The collision proxy uses the FINEST LOD (last
-                // entry in the array). Load it.
-                let (full, _, _) = resolved_lods
-                    .last()
-                    .expect("resolved_lods non-empty checked above");
+                // Collision-proxy LOD: `proxy_lod` (0 = coarsest) clamped to
+                // the available LODs; default (None) is the finest (last
+                // entry). Coarser is much lighter to load + voxelise at
+                // whole-cell scale and barely changes the proxy, since it's
+                // voxelised at `proxy_voxel_size` either way.
+                let lod_idx = match proxy_lod {
+                    Some(i) => i.min(resolved_lods.len() - 1),
+                    None => resolved_lods.len() - 1,
+                };
+                let (full, _, _) = &resolved_lods[lod_idx];
                 let mut trimesh = crate::ingredient::obj::load_trimesh(full)
                     .map_err(|e| RecipeError::InvalidObject {
                         name: name.clone(),

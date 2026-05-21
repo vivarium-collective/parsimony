@@ -501,8 +501,12 @@ const geomMemCache = new Map(); // resolvedUrl -> { geom, robustR }
 // stored aggressively-smoothed-and-collapsed geometry from a pure
 // Laplacian pass; v4 stores volume-preserving Taubin-smoothed
 // geometry instead, so refresh re-fetches and re-smooths cleanly.
-const IDB_NAME = "parsimony-viewer-v7";
+const IDB_NAME = "parsimony-viewer-v8";
 const IDB_STORE = "geoms";
+// Cache-busting token from the pack's `cache_version`, prefixed onto every IDB
+// key so regenerating the pack/meshes invalidates the cached geometry instead
+// of serving stale meshes by URL. Set per pack in buildScene.
+let packCacheVersion = "0";
 let _idbPromise = null;
 
 function openIdb() {
@@ -537,6 +541,7 @@ let cacheMisses = 0;
 let cacheWriteErrors = 0;
 
 async function idbGet(key) {
+  key = packCacheVersion + ":" + key;
   const db = await openIdb();
   if (!db) return null;
   return new Promise((resolve) => {
@@ -558,6 +563,7 @@ async function idbGet(key) {
 }
 
 async function idbPut(key, value) {
+  key = packCacheVersion + ":" + key;
   const db = await openIdb();
   if (!db) return;
   await new Promise((resolve) => {
@@ -1029,6 +1035,9 @@ async function buildScene(doc, fileName) {
   cacheHits = 0;
   cacheMisses = 0;
   cacheWriteErrors = 0;
+  // Bust the IDB mesh cache when the pack (and thus possibly the meshes) was
+  // regenerated. Falls back to the filename for packs without a version.
+  packCacheVersion = String(doc.cache_version ?? fileName ?? "0");
 
   if (doc.format !== "parsimony.pack.v1") {
     throw new Error(

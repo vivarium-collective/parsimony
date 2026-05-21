@@ -11,6 +11,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod mesh_gen;
+
 use parsimony_core::{
     write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
     PlacementBackend, Pipeline, PlacerConfig, PlacerOutcome, Recipe,
@@ -101,6 +103,13 @@ struct PackArgs {
     /// obstacle set for the interior pack. No effect without a chromosome.
     #[arg(long)]
     chromosome_beads: Option<usize>,
+
+    /// Build mesh collision proxies from this LOD index (0 = coarsest;
+    /// clamped per ingredient). Default = finest. Proxies are voxelised at
+    /// `proxy_voxel_size` regardless, so a coarse LOD (near that resolution)
+    /// packs far faster/lighter at whole-cell scale with ~the same result.
+    #[arg(long)]
+    proxy_lod: Option<usize>,
 }
 
 /// CLI mirror of [`PlacementBackend`] (keeps `clap` out of parsimony-core).
@@ -189,7 +198,7 @@ fn ensure_git() -> Result<()> {
 }
 
 fn run_pack(args: PackArgs) -> Result<()> {
-    let recipe = Recipe::from_file(&args.recipe)
+    let recipe = Recipe::from_file_with_proxy_lod(&args.recipe, args.proxy_lod)
         .with_context(|| format!("loading recipe `{}`", args.recipe.display()))?;
     let total_requested: u32 = recipe.directives.iter().map(|d| d.count).sum();
     if !args.quiet {
@@ -716,11 +725,10 @@ fn run_compare(args: CompareArgs) -> Result<()> {
 }
 
 // ───── mesh ─────────────────────────────────────────────────────────
-// Generate mesh LODs from PDB/CIF structures. The heavy lifting (vdW
-// signed-distance field + marching cubes) lives in scripts/pdb_to_mesh.py
-// (scientific python deps via uv); this subcommand is the CLI front that
-// drives it over a structure — or a whole directory — at each LOD voxel
-// size, writing <slug>.lod<N>.obj. Run from the repo root.
+// Generate mesh LODs from PDB/mmCIF structures, natively (see mesh_gen):
+// VdW SDF → gaussian smooth → surface nets → LOD downsample → OBJ. Takes a
+// structure file, a 4-char RCSB ID (fetched + cached under examples/pdb_cache),
+// or a whole directory, writing <slug>.lod<N>.obj per LOD voxel size.
 #[derive(Debug, Parser)]
 struct MeshArgs {
     /// A PDB/CIF file, a 4-char RCSB ID, or a directory of them.
@@ -736,25 +744,13 @@ struct MeshArgs {
 }
 
 fn run_mesh(args: MeshArgs) -> Result<()> {
-    let script = Path::new("scripts/pdb_to_mesh.py");
-    if !script.exists() {
-        anyhow::bail!("{} not found — run `parsimony mesh` from the repo root", script.display());
-    }
-    ensure_uv()?;
-    let lods: Vec<f32> = args
-        .lods
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    if lods.is_empty() {
-        anyhow::bail!("no valid --lods (expected e.g. 16,8,4,2.5)");
-    }
+    let lods = parse_lods(&args.lods)?;
     fs::create_dir_all(&args.out_dir)?;
 
-    // Inputs: a directory of .pdb/.cif, a single file, or a PDB ID.
+    // Inputs: a directory of .pdb/.cif, a single file, or a 4-char PDB ID.
     let p = Path::new(&args.path);
-    let inputs: Vec<String> = if p.is_dir() {
-        let mut found: Vec<String> = fs::read_dir(p)?
+    let inputs: Vec<PathBuf> = if p.is_dir() {
+        let mut found: Vec<PathBuf> = fs::read_dir(p)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|pp| {
                 pp.extension()
@@ -762,67 +758,134 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
                     .map(|x| x.eq_ignore_ascii_case("pdb") || x.eq_ignore_ascii_case("cif"))
                     .unwrap_or(false)
             })
-            .map(|pp| pp.to_string_lossy().into_owned())
             .collect();
         found.sort();
         found
     } else {
-        vec![args.path.clone()] // file path or PDB ID
+        vec![resolve_structure(&args.path)?]
     };
-    if inputs.is_empty() {
-        anyhow::bail!("no .pdb/.cif inputs under {}", args.path);
-    }
+    anyhow::ensure!(!inputs.is_empty(), "no .pdb/.cif inputs under {}", args.path);
 
     let (mut ok, mut failed) = (0usize, 0usize);
     for input in &inputs {
-        let slug = Path::new(input)
+        let slug = input
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(input.as_str())
+            .unwrap_or("mesh")
             .to_string();
-        for (i, voxel) in lods.iter().enumerate() {
-            let out = args.out_dir.join(format!("{slug}.lod{i}.obj"));
-            eprint!("  {slug} lod{i} (res {voxel} Å) … ");
-            let st = std::process::Command::new("uv")
-                .arg("run")
-                .arg(script)
-                .arg(input)
-                .arg("--out")
-                .arg(&out)
-                .arg("--resolution")
-                .arg(voxel.to_string())
-                .status();
-            match st {
-                Ok(s) if s.success() => {
-                    eprintln!("→ {}", out.display());
-                    ok += 1;
-                }
-                Ok(s) => {
-                    eprintln!("FAILED ({s})");
-                    failed += 1;
-                }
-                Err(e) => {
-                    eprintln!("FAILED ({e})");
-                    failed += 1;
-                }
+        eprint!("  {slug} ({} LODs) … ", lods.len());
+        match mesh_one(input, &lods, &slug, &args.out_dir) {
+            Ok(n) => {
+                eprintln!("→ {n} verts (finest)");
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("FAILED ({e})");
+                failed += 1;
             }
         }
     }
-    eprintln!("mesh: {ok} OBJs generated, {failed} failed → {}", args.out_dir.display());
+    eprintln!("mesh: {ok} ok, {failed} failed → {}", args.out_dir.display());
     if failed > 0 {
         anyhow::bail!("{failed} mesh generation(s) failed");
     }
     Ok(())
 }
 
+/// Parse "16,8,4,1.5" → `[16, 8, 4, 1.5]`.
+fn parse_lods(s: &str) -> Result<Vec<f32>> {
+    let lods: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    anyhow::ensure!(!lods.is_empty(), "no valid --lods (expected e.g. 16,8,4,1.5)");
+    Ok(lods)
+}
+
+/// Mesh one structure file into `<out_dir>/<slug>.lod<N>.obj` per LOD.
+/// Returns the finest LOD's vertex count.
+fn mesh_one(path: &Path, lods: &[f32], slug: &str, out_dir: &Path) -> Result<usize> {
+    let atoms = mesh_gen::load_atoms(path)?;
+    let meshes = mesh_gen::mesh_lods(&atoms, lods)?;
+    let (mut finest_verts, mut finest_res) = (0usize, f32::INFINITY);
+    for (i, (res, mesh)) in lods.iter().zip(meshes.iter()).enumerate() {
+        let out = out_dir.join(format!("{slug}.lod{i}.obj"));
+        let header = format!(
+            "parsimony mesh: {slug} (source {})\natoms: {}  voxel: {res} Å  verts: {}  tris: {}",
+            path.display(),
+            atoms.len(),
+            mesh.0.len(),
+            mesh.1.len()
+        );
+        mesh_gen::write_obj(mesh, &out, &header)?;
+        if *res < finest_res {
+            finest_res = *res;
+            finest_verts = mesh.0.len();
+        }
+    }
+    Ok(finest_verts)
+}
+
+/// Resolve a structure argument to a local file: an existing path is used as
+/// is; a 4-char RCSB ID is taken from (or fetched into) examples/pdb_cache,
+/// trying PDB then mmCIF.
+fn resolve_structure(arg: &str) -> Result<PathBuf> {
+    let p = Path::new(arg);
+    if p.exists() {
+        return Ok(p.to_path_buf());
+    }
+    let id = arg.trim();
+    anyhow::ensure!(
+        id.len() == 4 && id.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{arg} is neither an existing file nor a 4-char PDB ID"
+    );
+    let cache = Path::new("examples/pdb_cache");
+    fs::create_dir_all(cache).ok();
+    let lower = id.to_lowercase();
+    for ext in ["pdb", "cif"] {
+        let c = cache.join(format!("{lower}.{ext}"));
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    for ext in ["pdb", "cif"] {
+        let url = format!("https://files.rcsb.org/download/{}.{ext}", id.to_uppercase());
+        let out = cache.join(format!("{lower}.{ext}"));
+        eprint!("  fetching {url} … ");
+        match fetch_to(&url, &out) {
+            Ok(path) => {
+                eprintln!("ok");
+                return Ok(path);
+            }
+            Err(e) => eprintln!("({e})"),
+        }
+    }
+    anyhow::bail!("could not fetch structure {id} from RCSB")
+}
+
+/// Download `url` to `out`, returning its path. Native HTTP (no curl/python).
+/// Publishes atomically (unique temp + rename) so that when several species
+/// share one RCSB ID and fetch it concurrently, a reader never sees a
+/// half-written file.
+fn fetch_to(url: &str, out: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let resp = ureq::get(url).call().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)?;
+    anyhow::ensure!(!buf.is_empty(), "empty response");
+    let tmp = out.with_extension(format!("tmp{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    fs::write(&tmp, &buf)?;
+    fs::rename(&tmp, out)?;
+    Ok(out.to_path_buf())
+}
+
 // ───── translate-mycoplasma ──────────────────────────────────────────
 // The whole-cell Mycoplasma recipe comes from the cellPACK data repo
-// (Maritan et al.). This subcommand folds the two manual steps — clone
-// the data repo, then run the translator — into one command, the same
-// way `mesh` wraps pdb_to_mesh.py. The translator itself (recipe walk +
-// batch marching-cubes meshing) stays in scripts/translate_mycoplasma.py
-// because it shares pdb_to_mesh.py's scientific-Python deps via uv. Run
-// from the repo root.
+// (Maritan et al.). This subcommand does the whole thing natively (no
+// Python): clone the data repo if needed, walk its curated recipe, mesh
+// each species' structure with the native VdW mesher (mesh_gen), and
+// compose a parsimony recipe — proteins + a coarse lipid bilayer, plus the
+// chromosome (genome-driven supercoil with instanced dsDNA segments), its
+// bound RNA/DNA polymerases, and free + nascent mRNA. Reproducible from one
+// command. Run from the repo root.
 #[derive(Debug, Parser)]
 struct TranslateMycoplasmaArgs {
     /// Git URL of the cellPACK Mycoplasma data repo.
@@ -842,24 +905,225 @@ struct TranslateMycoplasmaArgs {
     out_meshes: PathBuf,
 
     /// LOD voxel sizes in Å (coarse→fine), comma-separated.
-    #[arg(long, default_value = "16,8,4,2.5")]
+    #[arg(long, default_value = "16,8,4,1.5")]
     lods: String,
 
     /// Most-abundant interior species to include (0 = all; 30 = the demo).
     #[arg(long, default_value_t = 0)]
     top_n: u32,
+
+    /// Cell sphere radius in Å.
+    #[arg(long, default_value_t = 2000.0)]
+    cell_radius: f32,
+
+    /// Coarse-grained bilayer lipids tiled over the surface (0 disables).
+    #[arg(long, default_value_t = 40000)]
+    lipid_count: u32,
+
+    /// Gene-annotation CSV for the genome (referenced by the chromosome block,
+    /// path resolved relative to the output recipe).
+    #[arg(long, default_value = "examples/genome/mycoplasma_g37_genes.csv")]
+    genome: PathBuf,
+
+    /// Re-mesh every species even if its OBJ files already exist (needed when
+    /// changing --lods, since meshes are otherwise cached by filename).
+    #[arg(long)]
+    force: bool,
+}
+
+/// cellPACK curated-recipe JSON (only the fields we read).
+#[derive(serde::Deserialize)]
+struct CpRoot {
+    #[serde(rename = "Compartments", default)]
+    compartments: Vec<CpOuter>,
+}
+#[derive(serde::Deserialize)]
+struct CpOuter {
+    #[serde(rename = "Compartments", default)]
+    compartments: Vec<CpRegion>,
+}
+#[derive(serde::Deserialize)]
+struct CpRegion {
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "IngredientGroups", default)]
+    groups: Vec<CpGroup>,
+}
+#[derive(serde::Deserialize)]
+struct CpGroup {
+    #[serde(rename = "Ingredients", default)]
+    ingredients: Vec<CpIngredient>,
+}
+#[derive(serde::Deserialize, Clone)]
+struct CpIngredient {
+    name: String,
+    #[serde(rename = "nbMol", default)]
+    nb_mol: u64,
+    #[serde(default)]
+    source: Option<CpSource>,
+}
+#[derive(serde::Deserialize, Clone)]
+struct CpSource {
+    #[serde(default)]
+    pdb: Option<String>,
+}
+
+/// Colour palette cycled across species (matches the former Python).
+const TRANSLATE_PALETTE: [[f32; 3]; 10] = [
+    [0.85, 0.35, 0.35], [0.95, 0.62, 0.35], [0.95, 0.85, 0.45], [0.55, 0.85, 0.45],
+    [0.45, 0.85, 0.65], [0.45, 0.75, 0.95], [0.55, 0.55, 0.95], [0.80, 0.55, 0.85],
+    [0.95, 0.55, 0.75], [0.75, 0.55, 0.45],
+];
+
+/// Sort by descending abundance, keep the top `n` (0 = all).
+fn cp_select(mut ings: Vec<CpIngredient>, n: u32) -> Vec<CpIngredient> {
+    ings.sort_by(|a, b| b.nb_mol.cmp(&a.nb_mol));
+    if n > 0 {
+        ings.truncate(n as usize);
+    }
+    ings
+}
+
+/// Find a species' structure file in cellPACK_Data/proteins/: a 4-char ID
+/// lives as <ID>_BU1_.cif / <ID>.cif, or `source.pdb` is a literal filename.
+fn find_structure_file(name: &str, src_pdb: &str, proteins_dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !src_pdb.is_empty() {
+        if src_pdb.len() == 4 && src_pdb.chars().all(|c| c.is_ascii_alphanumeric()) {
+            candidates.push(proteins_dir.join(format!("{}_BU1_.cif", src_pdb.to_uppercase())));
+            candidates.push(proteins_dir.join(format!("{}.cif", src_pdb.to_uppercase())));
+            candidates.push(proteins_dir.join(format!("{}.cif", src_pdb.to_lowercase())));
+        }
+        candidates.push(proteins_dir.join(src_pdb));
+        if let Some(stem) = Path::new(src_pdb).file_stem().and_then(|s| s.to_str()) {
+            candidates.push(proteins_dir.join(format!("{stem}.cif")));
+            candidates.push(proteins_dir.join(format!("{stem}.pdb")));
+            candidates.push(proteins_dir.join(format!("{stem}_BU1_.cif")));
+        }
+    }
+    candidates.push(proteins_dir.join(format!("{name}.cif")));
+    candidates.push(proteins_dir.join(format!("{name}.pdb")));
+    candidates.into_iter().find(|c| c.exists())
+}
+
+/// Extract an RCSB PDB ID from a `source.pdb` reference for fetching: a bare
+/// 4-char ID (`1abc`) or the leading ID of a filename (`6rut_bu1.pdb` → `6rut`).
+/// RCSB IDs start with a digit, which avoids matching cellPACK's computed
+/// names (`MG_…`, `computed.pdb`) that should only ever be local.
+fn pdb_id_from(src: &str) -> Option<String> {
+    let stem = Path::new(src.trim()).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let head = stem.get(..4)?;
+    (head.chars().all(|c| c.is_ascii_alphanumeric()) && head.as_bytes()[0].is_ascii_digit())
+        .then(|| head.to_string())
+}
+
+/// `target` expressed relative to `base_dir` (with `..`), forward-slashed.
+fn relativize(target: &Path, base_dir: &Path) -> String {
+    let t: Vec<_> = target.components().collect();
+    let b: Vec<_> = base_dir.components().collect();
+    let mut i = 0;
+    while i < t.len() && i < b.len() && t[i] == b[i] {
+        i += 1;
+    }
+    let mut parts: Vec<String> = std::iter::repeat("..".to_string()).take(b.len() - i).collect();
+    for c in &t[i..] {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    parts.join("/")
+}
+
+/// Mesh a structure into `<out_dir>/<slug>.lod<N>.obj` per LOD (cached: skipped
+/// if all already exist) and return its parsimony mesh-ingredient spec.
+fn mesh_to_spec(
+    struct_path: &Path,
+    slug: &str,
+    lods: &[f32],
+    out_dir: &Path,
+    recipe_dir: &Path,
+    color: [f32; 3],
+    proxy_voxel: f32,
+    force: bool,
+) -> Result<serde_json::Value> {
+    let obj_paths: Vec<PathBuf> = (0..lods.len())
+        .map(|i| out_dir.join(format!("{slug}.lod{i}.obj")))
+        .collect();
+    if force || !obj_paths.iter().all(|p| p.exists()) {
+        let atoms = mesh_gen::load_atoms(struct_path)?;
+        let meshes = mesh_gen::mesh_lods(&atoms, lods)?;
+        for (i, (res, mesh)) in lods.iter().zip(meshes.iter()).enumerate() {
+            let header = format!(
+                "parsimony translate-mycoplasma: {slug} (source {})\natoms: {}  voxel: {res} Å  verts: {}  tris: {}",
+                struct_path.display(),
+                atoms.len(),
+                mesh.0.len(),
+                mesh.1.len()
+            );
+            mesh_gen::write_obj(mesh, &obj_paths[i], &header)?;
+        }
+    }
+    let lod_specs: Vec<serde_json::Value> = obj_paths
+        .iter()
+        .zip(lods)
+        .map(|(p, vs)| serde_json::json!({ "path": relativize(p, recipe_dir), "voxel_size": vs }))
+        .collect();
+    Ok(serde_json::json!({
+        "type": "mesh",
+        "color": color,
+        "proxy_voxel_size": proxy_voxel,
+        "mesh_lods": lod_specs,
+    }))
+}
+
+/// Mesh every species in a region in parallel, returning `(slug, spec, count)`
+/// for those whose structure was found.
+fn mesh_cp_region(
+    sel: &[CpIngredient],
+    pal_off: usize,
+    proteins_dir: &Path,
+    lods: &[f32],
+    out_meshes: &Path,
+    recipe_dir: &Path,
+    force: bool,
+) -> Vec<(String, serde_json::Value, u64)> {
+    use rayon::prelude::*;
+    let proxy = (lods.iter().cloned().fold(f32::INFINITY, f32::min) * 2.5).max(4.0);
+    sel.par_iter()
+        .enumerate()
+        .filter_map(|(idx, ing)| {
+            let slug = ing.name.replace([' ', '/'], "_");
+            let src = ing.source.as_ref().and_then(|s| s.pdb.clone()).unwrap_or_default();
+            // Prefer the local cellPACK structure; otherwise cellPACK often
+            // references an RCSB ID it didn't ship (bare "1abc", or a filename
+            // like "6rut_bu1.pdb") — pull the ID and fetch it.
+            let struct_path = match find_structure_file(&ing.name, &src, proteins_dir) {
+                Some(p) => p,
+                None => match pdb_id_from(&src) {
+                    Some(id) => match resolve_structure(&id) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("  ! {slug}: fetch {id} failed ({e})");
+                            return None;
+                        }
+                    },
+                    None => {
+                        eprintln!("  ! {slug}: no structure file (pdb={src:?})");
+                        return None;
+                    }
+                },
+            };
+            let color = TRANSLATE_PALETTE[(idx + pal_off) % TRANSLATE_PALETTE.len()];
+            match mesh_to_spec(&struct_path, &slug, lods, out_meshes, recipe_dir, color, proxy, force) {
+                Ok(spec) => Some((slug, spec, ing.nb_mol)),
+                Err(e) => {
+                    eprintln!("  ! {slug}: {e}");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
-    let script = Path::new("scripts/translate_mycoplasma.py");
-    if !script.exists() {
-        anyhow::bail!(
-            "{} not found — run `parsimony translate-mycoplasma` from the repo root",
-            script.display()
-        );
-    }
-    ensure_uv()?;
-
     // Clone the data repo if its data dir is missing (idempotent otherwise).
     let data_dir = args.cache_dir.join("cellPACK_Data");
     if data_dir.exists() {
@@ -875,46 +1139,260 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
             .arg(&args.cache_dir)
             .status()
             .context("running git clone")?;
-        if !st.success() {
-            anyhow::bail!("git clone failed ({st})");
-        }
+        anyhow::ensure!(st.success(), "git clone failed ({st})");
     }
 
     fs::create_dir_all(&args.out_meshes)?;
-    if let Some(parent) = args.out_recipe.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+    let recipe_dir = args.out_recipe.parent().unwrap_or(Path::new(".")).to_path_buf();
+    fs::create_dir_all(&recipe_dir).ok();
+    let lods = parse_lods(&args.lods)?;
+
+    // Locate + parse the curated cellPACK recipe.
+    let recipes_dir = data_dir.join("recipes");
+    let recipe_path = fs::read_dir(&recipes_dir)
+        .with_context(|| format!("reading {}", recipes_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map(|n| n.starts_with("mg_curated_clean") && n.ends_with("serialized.json"))
+                .unwrap_or(false)
+        })
+        .with_context(|| format!("no mg_curated_clean*serialized.json under {}", recipes_dir.display()))?;
+    eprintln!("reading {}", recipe_path.display());
+    let cp: CpRoot = serde_json::from_reader(std::io::BufReader::new(fs::File::open(&recipe_path)?))
+        .context("parsing cellPACK recipe")?;
+
+    // Walk to the interior + surface ingredient groups.
+    let (mut interior, mut surface) = (Vec::new(), Vec::new());
+    for outer in &cp.compartments {
+        for region in &outer.compartments {
+            let ings: Vec<CpIngredient> =
+                region.groups.iter().flat_map(|g| g.ingredients.iter().cloned()).collect();
+            match region.name.as_str() {
+                "interior" => interior = ings,
+                "surface" => surface = ings,
+                _ => {}
+            }
+        }
+    }
+    let interior = cp_select(interior, args.top_n);
+    let surface = cp_select(surface, args.top_n);
+    eprintln!(
+        "selected {} interior + {} surface species; meshing at LODs [{}]…",
+        interior.len(),
+        surface.len(),
+        args.lods
+    );
+
+    let proteins_dir = data_dir.join("proteins");
+    let interior_meshed =
+        mesh_cp_region(&interior, 0, &proteins_dir, &lods, &args.out_meshes, &recipe_dir, args.force);
+    let surface_meshed =
+        mesh_cp_region(&surface, 5, &proteins_dir, &lods, &args.out_meshes, &recipe_dir, args.force);
+    let skipped = (interior.len() - interior_meshed.len()) + (surface.len() - surface_meshed.len());
+    let (n_interior, n_surface) = (interior_meshed.len(), surface_meshed.len());
+
+    let mut objects = serde_json::Map::new();
+    let mut interior_entries: Vec<serde_json::Value> = Vec::new();
+    let mut surface_entries: Vec<serde_json::Value> = Vec::new();
+    for (slug, spec, n) in interior_meshed {
+        objects.insert(slug.clone(), spec);
+        interior_entries.push(serde_json::json!({ "object": slug, "count": n }));
+    }
+    for (slug, spec, n) in surface_meshed {
+        objects.insert(slug.clone(), spec);
+        surface_entries.push(serde_json::json!({ "object": slug, "count": n }));
     }
 
-    eprintln!(
-        "translating mycoplasma (top-n {}, lods {}) → {}",
-        args.top_n,
-        args.lods,
-        args.out_recipe.display()
+    // Special ingredients for the chromosome + transcription machinery, meshed
+    // from cached reference structures (examples/pdb_meshes, beside the recipe).
+    let special_dir = args
+        .out_meshes
+        .parent()
+        .unwrap_or(Path::new("examples/pdb_meshes"))
+        .to_path_buf();
+    // dna_segment: real B-DNA dodecamer (1BNA); local Z is the helix axis.
+    let dna = resolve_structure("1BNA")?;
+    let mut seg = mesh_to_spec(&dna, "1BNA", &[12.0, 6.0, 3.0, 1.5], &special_dir, &recipe_dir, [0.30, 0.55, 0.85], 6.0, args.force)?;
+    seg["principal_vector"] = serde_json::json!([0, 0, 1]);
+    objects.insert("dna_segment".into(), seg);
+    // RNA polymerase (1hqm) + DNA polymerase (2hpi) ride the chromosome.
+    let rnap = resolve_structure("1hqm")?;
+    objects.insert(
+        "rnap".into(),
+        mesh_to_spec(&rnap, "1hqm", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.96, 0.85, 0.2], 12.0, args.force)?,
     );
-    let st = std::process::Command::new("uv")
-        .arg("run")
-        .arg(script)
-        .arg("--cellpack-data")
-        .arg(&data_dir)
-        .arg("--out-recipe")
-        .arg(&args.out_recipe)
-        .arg("--out-meshes")
-        .arg(&args.out_meshes)
-        .arg("--lods")
-        .arg(&args.lods)
-        .arg("--top-n")
-        .arg(args.top_n.to_string())
-        .status()
-        .context("running translate_mycoplasma.py via uv")?;
-    if !st.success() {
-        anyhow::bail!("mycoplasma translation failed ({st})");
+    let dnap = resolve_structure("2hpi")?;
+    objects.insert(
+        "dnap".into(),
+        mesh_to_spec(&dnap, "2hpi", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.2, 0.9, 0.95], 10.0, args.force)?,
+    );
+    // mRNA: a coarse linear bead chain (the viewer tiles a real RNA strand
+    // along it). Free copies in the cytoplasm, nascent copies on the genome.
+    objects.insert(
+        "mrna".into(),
+        serde_json::json!({
+            "type": "multi_sphere",
+            "color": [0.95, 0.55, 0.15],
+            "principal_vector": [1.0, 0.0, 0.0],
+            "positions": [[-72,0,0],[-56,7,2],[-40,-4,-3],[-24,6,4],[-8,-5,-2],[8,6,3],[24,-4,-4],[40,7,2],[56,-3,-3],[72,2,0]],
+            "radii": [9,9,9,9,9,9,9,9,9,9],
+        }),
+    );
+    // Coarse-grained bilayer-spanning lipid, tiled over the cell surface.
+    if args.lipid_count > 0 {
+        objects.insert(
+            "lipid".into(),
+            serde_json::json!({
+                "type": "multi_sphere",
+                "color": [0.96, 0.86, 0.55],
+                "positions": [[0,0,24],[0,0,17],[0,0,11],[0,0,5],[0,0,-5],[0,0,-11],[0,0,-17],[0,0,-24]],
+                "radii": [4.5,3.0,2.7,2.5,2.5,2.7,3.0,4.5],
+                "principal_vector": [0,0,1],
+                "packing_mode": "tiled",
+            }),
+        );
+        surface_entries.push(serde_json::json!({ "object": "lipid", "count": args.lipid_count }));
     }
+    // Free cytoplasmic mRNA (nascent mRNA + polymerases ride the chromosome).
+    interior_entries.insert(0, serde_json::json!({ "object": "mrna", "count": 250 }));
+
+    let n_objects = objects.len();
+    let r = args.cell_radius;
+    let recipe = serde_json::json!({
+        "name": "mycoplasma_genitalium",
+        "version": "0.1.0",
+        "format_version": "2.1-parsimony",
+        "description": format!(
+            "Mycoplasma genitalium, translated natively from ccsb-scripps/MycoplasmaGenitalium \
+             (Maritan et al., JMB 2022). {n_interior} interior + {n_surface} surface species, \
+             VdW-surface meshed at LODs [{}]. Sphere cell of radius {r:.0} Å with a genome-driven \
+             supercoiled chromosome (instanced dsDNA segments), bound RNA/DNA polymerases, and \
+             free + nascent mRNA.",
+            args.lods,
+        ),
+        "bounding_box": [[-r - 50.0, -r - 50.0, -r - 50.0], [r + 50.0, r + 50.0, r + 50.0]],
+        "objects": serde_json::Value::Object(objects),
+        "composition": {
+            "space": { "regions": { "interior": ["cell"] } },
+            "cell": {
+                "compartment": { "kind": "sphere", "center": [0, 0, 0], "radius": r },
+                "regions": { "interior": interior_entries, "surface": surface_entries },
+            },
+        },
+        "chromosome": {
+            "genome": relativize(&args.genome, &recipe_dir),
+            "segment": "dna_segment",
+            "beads": 90000,
+            "spacing": 22,
+            "bead_radius": 10,
+            "color": [0.86, 0.30, 0.42],
+            "supercoil": { "radius": 80, "pitch": 120, "domains": 50 },
+            "proteins": [
+                { "object": "mrna", "count": 150 },
+                { "object": "rnap", "count": 250 },
+                { "object": "dnap", "count": 24 }
+            ],
+        },
+    });
+
+    fs::write(&args.out_recipe, serde_json::to_string_pretty(&recipe)?)
+        .with_context(|| format!("writing {}", args.out_recipe.display()))?;
     eprintln!(
-        "wrote recipe {} and meshes under {}",
+        "wrote {} — {n_objects} objects ({n_interior} interior + {n_surface} surface species, \
+         {skipped} skipped), meshes under {}",
         args.out_recipe.display(),
         args.out_meshes.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod translate_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_selects_cellpack_recipe() {
+        // Minimal shape of a cellPACK curated recipe.
+        let json = r#"{ "Compartments": [{ "Compartments": [
+            {"name":"interior","IngredientGroups":[{"Ingredients":[
+                {"name":"A","nbMol":10,"source":{"pdb":"1abc"}},
+                {"name":"B","nbMol":50},
+                {"name":"C","nbMol":30,"source":{"pdb":"computed.pdb"}}
+            ]}]},
+            {"name":"surface","IngredientGroups":[{"Ingredients":[
+                {"name":"S1","nbMol":5}
+            ]}]}
+        ]}]}"#;
+        let cp: CpRoot = serde_json::from_str(json).unwrap();
+        let (mut interior, mut surface) = (Vec::new(), Vec::new());
+        for o in &cp.compartments {
+            for r in &o.compartments {
+                let ings: Vec<CpIngredient> =
+                    r.groups.iter().flat_map(|g| g.ingredients.iter().cloned()).collect();
+                match r.name.as_str() {
+                    "interior" => interior = ings,
+                    "surface" => surface = ings,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(interior.len(), 3);
+        assert_eq!(surface.len(), 1);
+        // top-2 by abundance → B(50), C(30).
+        let top = cp_select(interior, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].name, "B");
+        assert_eq!(top[0].nb_mol, 50);
+        assert_eq!(top[1].name, "C");
+    }
+
+    #[test]
+    fn relativize_sibling_dirs() {
+        assert_eq!(
+            relativize(
+                Path::new("examples/pdb_meshes/mycoplasma/X.lod0.obj"),
+                Path::new("examples/recipes"),
+            ),
+            "../pdb_meshes/mycoplasma/X.lod0.obj"
+        );
+        assert_eq!(
+            relativize(Path::new("examples/genome/g.csv"), Path::new("examples/recipes")),
+            "../genome/g.csv"
+        );
+    }
+
+    #[test]
+    fn extracts_rcsb_id_for_fetch() {
+        // Bare ID, and a filename with an embedded biological-unit ID.
+        assert_eq!(pdb_id_from("1abc").as_deref(), Some("1abc"));
+        assert_eq!(pdb_id_from("5MG3").as_deref(), Some("5MG3"));
+        assert_eq!(pdb_id_from("6rut_bu1.pdb").as_deref(), Some("6rut"));
+        // cellPACK's computed names (no leading digit) stay local-only.
+        assert_eq!(pdb_id_from("MG_191_MONOMER"), None);
+        assert_eq!(pdb_id_from("computed.pdb"), None);
+    }
+
+    #[test]
+    fn finds_structure_by_pdb_id_then_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let pd = dir.path();
+        std::fs::write(pd.join("1ABC_BU1_.cif"), "x").unwrap();
+        std::fs::write(pd.join("computed.pdb"), "x").unwrap();
+        // 4-char ID prefers the biological-unit CIF.
+        assert_eq!(
+            find_structure_file("A", "1abc", pd).unwrap().file_name().unwrap(),
+            "1ABC_BU1_.cif"
+        );
+        // Literal filename reference.
+        assert_eq!(
+            find_structure_file("C", "computed.pdb", pd).unwrap().file_name().unwrap(),
+            "computed.pdb"
+        );
+        // Nothing matches.
+        assert!(find_structure_file("Z", "9zzz", pd).is_none());
+    }
 }
 
 // ───── render ────────────────────────────────────────────────────────
@@ -1113,6 +1591,11 @@ enum PipelineAction {
         /// settle residual clashes at stage boundaries (0 = off).
         #[arg(long, default_value_t = 0)]
         relax: usize,
+        /// Build mesh collision proxies from this LOD index (0 = coarsest;
+        /// clamped per ingredient). Default = finest. A coarse LOD near the
+        /// proxy resolution packs far faster/lighter at whole-cell scale.
+        #[arg(long)]
+        proxy_lod: Option<usize>,
     },
     /// Show each stage's cache key and whether it's fresh (cached) or stale.
     Status {
@@ -1124,6 +1607,10 @@ enum PipelineAction {
         /// Project root (for the default cache location).
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Proxy LOD to compute keys against (must match the `run` value for
+        /// the displayed fresh/stale state to be accurate). Default = finest.
+        #[arg(long)]
+        proxy_lod: Option<usize>,
     },
     /// Empty the staged cache so the next `run` repacks every stage from
     /// scratch. (`run --force` recomputes but keeps writing into the cache;
@@ -1150,6 +1637,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
             cache_dir,
             root,
             relax,
+            proxy_lod,
         } => {
             let pipeline = Pipeline::load(&file)
                 .with_context(|| format!("loading pipeline `{}`", file.display()))?;
@@ -1158,7 +1646,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
 
             let t = Instant::now();
             let mut run = pipeline
-                .run(base_dir, &cache_dir, force)
+                .run(base_dir, &cache_dir, force, proxy_lod)
                 .with_context(|| format!("running pipeline `{}`", pipeline.name))?;
             let elapsed = t.elapsed();
 
@@ -1215,12 +1703,13 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
             file,
             cache_dir,
             root,
+            proxy_lod,
         } => {
             let pipeline = Pipeline::load(&file)
                 .with_context(|| format!("loading pipeline `{}`", file.display()))?;
             let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
             let cache_dir = cache_dir.unwrap_or_else(|| root.join(".parsimony/cache"));
-            let plans = pipeline.plan(base_dir, &cache_dir)?;
+            let plans = pipeline.plan(base_dir, &cache_dir, proxy_lod)?;
 
             println!(
                 "pipeline `{}` — {} stages (cache: {})",
