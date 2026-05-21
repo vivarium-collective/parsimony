@@ -11,7 +11,7 @@
 //! adds plectonemic supercoiling — an interwound double helix wound along
 //! a confined backbone axis; on-fiber DNA-binding proteins come next.
 
-use nalgebra::{Point3, Rotation3, Unit, Vector3};
+use nalgebra::{Matrix3, Point3, Rotation3, Unit, UnitQuaternion, Vector3};
 use rand::Rng;
 
 /// Uniformly random unit vector (rejection-sampled in the unit ball).
@@ -341,6 +341,65 @@ pub fn generate_nucleoid<R: Rng>(
     out
 }
 
+/// Per-segment transforms for tiling a DNA-segment mesh along a bead path:
+/// sample the path every `seg_step` Å of contour and return `(position,
+/// rotation)` where the segment's local +Z (its helix axis) is aligned to the
+/// path tangent and rolled about it by the cumulative duplex twist
+/// (`twist_rad_per_a` rad per Å of contour) so consecutive segments tile into a
+/// continuous, real-scale double helix. Used to render the chromosome as ~tens
+/// of thousands of instances of one shared dsDNA mesh (LOD/cel like proteins),
+/// instead of a bespoke tube.
+pub fn dna_segment_transforms(
+    path: &[Point3<f32>],
+    seg_step: f32,
+    twist_rad_per_a: f32,
+) -> Vec<(Point3<f32>, UnitQuaternion<f32>)> {
+    if path.len() < 2 || seg_step <= 1e-3 {
+        return Vec::new();
+    }
+    let frames = frames_along(path);
+    let mut cum = vec![0.0_f32; path.len()];
+    for i in 1..path.len() {
+        cum[i] = cum[i - 1] + (path[i] - path[i - 1]).norm();
+    }
+    let total = cum[path.len() - 1];
+    if total <= seg_step {
+        return Vec::new();
+    }
+    let n = (total / seg_step).floor() as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    let mut i = 0; // monotonic — `s` only increases, so never rescan from 0
+    for k in 0..=n {
+        let s = (k as f32 * seg_step).min(total);
+        while i + 1 < path.len() && cum[i + 1] <= s {
+            i += 1;
+        }
+        let i1 = (i + 1).min(path.len() - 1);
+        let seg = (cum[i1] - cum[i]).max(1e-6);
+        let t = ((s - cum[i]) / seg).clamp(0.0, 1.0);
+        let pos = path[i] + (path[i1] - path[i]) * t;
+        let tang = (frames[i].0 * (1.0 - t) + frames[i1].0 * t)
+            .try_normalize(1e-6)
+            .unwrap_or(frames[i].0);
+        let mut n1 = frames[i].1 * (1.0 - t) + frames[i1].1 * t;
+        n1 = (n1 - tang * tang.dot(&n1))
+            .try_normalize(1e-6)
+            .unwrap_or_else(|| perp(tang));
+        let n2 = tang.cross(&n1);
+        // Roll N1 about the tangent by the cumulative twist, then build the
+        // rotation mapping local (X,Y,Z) → (x, tang×x, tang).
+        let tw = s * twist_rad_per_a;
+        let x = (n1 * tw.cos() + n2 * tw.sin())
+            .try_normalize(1e-6)
+            .unwrap_or(n1);
+        let y = tang.cross(&x);
+        let r = Matrix3::from_columns(&[x, y, tang]);
+        let q = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r));
+        out.push((pos, q));
+    }
+    out
+}
+
 /// Per-vertex rotation-minimizing frames `(T, N1, N2)` along a polyline.
 /// Each normal is carried forward by the rotation that maps the previous
 /// tangent onto the current one, then re-orthogonalised — avoiding the
@@ -544,5 +603,26 @@ mod tests {
             generate_nucleoid(cell, &[1500], step, bead, scr, pitch, &mut c),
             generate_supercoiled_fiber(cell, 1500, step, bead, scr, pitch, &mut e),
         );
+    }
+
+    #[test]
+    fn dna_segment_transforms_tile_and_orient() {
+        // Straight path along +x.
+        let path: Vec<Point3<f32>> =
+            (0..=100).map(|i| Point3::new(i as f32 * 10.0, 0.0, 0.0)).collect();
+        let xf = dna_segment_transforms(&path, 40.0, 0.176);
+        assert!(xf.len() > 20, "expected many segments, got {}", xf.len());
+        // Positions advance ~seg_step along the path and stay on it.
+        assert!((xf[1].0.x - 40.0).abs() < 2.0);
+        for (p, _) in &xf {
+            assert!(p.y.abs() < 1e-3 && p.z.abs() < 1e-3, "off-path {p}");
+        }
+        // Local +Z (helix axis) maps to the tangent (+x).
+        let zmap = xf[0].1 * Vector3::z();
+        assert!((zmap - Vector3::x()).norm() < 1e-3, "z→tangent failed: {zmap}");
+        // Cumulative twist rolls the cross-section between segments.
+        let x0 = xf[0].1 * Vector3::x();
+        let x5 = xf[5].1 * Vector3::x();
+        assert!((x0 - x5).norm() > 0.1, "twist should roll the cross-section");
     }
 }

@@ -16,6 +16,18 @@
     ]
   ],
   "objects": {
+    "dna_segment": {
+      "type": "mesh",
+      "color": [0.30, 0.55, 0.85],
+      "principal_vector": [0, 0, 1],
+      "proxy_voxel_size": 6.0,
+      "mesh_lods": [
+        {"path": "../pdb_meshes/1BNA.lod0.obj", "voxel_size": 12.0},
+        {"path": "../pdb_meshes/1BNA.lod1.obj", "voxel_size": 6.0},
+        {"path": "../pdb_meshes/1BNA.lod2.obj", "voxel_size": 3.0},
+        {"path": "../pdb_meshes/1BNA.lod3.obj", "voxel_size": 1.5}
+      ]
+    },
     "mrna": {
       "type": "multi_sphere",
       "color": [0.95, 0.55, 0.15],
@@ -19671,6 +19683,7 @@
   },
   "chromosome": {
     "genome": "../genome/mycoplasma_g37_genes.csv",
+    "segment": "dna_segment",
     "beads": 90000,
     "spacing": 22,
     "bead_radius": 10,

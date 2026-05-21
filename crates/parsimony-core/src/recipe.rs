@@ -60,6 +60,11 @@ struct RawChromosome {
     /// (genes, abundance-weighted) instead of uniformly along the fiber.
     #[serde(default)]
     genome: Option<String>,
+    /// Ingredient name of a per-bead dsDNA mesh. When set, the chromosome is
+    /// rendered as instanced LOD segments of it (molecular, Goodsell-shaded)
+    /// tiled along the genome path, instead of a single smooth tube.
+    #[serde(default)]
+    segment: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -261,6 +266,8 @@ pub struct ChromosomeSpec {
     pub proteins: Vec<(String, u32)>,
     /// Resolved path to the gene-annotation CSV, if the recipe set `genome`.
     pub genome: Option<std::path::PathBuf>,
+    /// Ingredient name of the per-bead dsDNA mesh (instanced LOD rendering).
+    pub segment: Option<String>,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -592,6 +599,7 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
                 Some(dir) => dir.join(g),
                 None => std::path::PathBuf::from(g),
             }),
+            segment: c.segment,
         }),
     })
 }

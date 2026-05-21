@@ -191,34 +191,58 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         })
         .collect();
 
-    // Genome fiber, if the placer generated one — emitted as an extra
-    // `fiber` ingredient + a placement at the cell centre.
+    // The genome, if the placer generated one. When the recipe configures a
+    // `segment` ingredient (a per-bead dsDNA mesh), render it the molecular way
+    // — tile that shared mesh along the path as ~tens of thousands of instances
+    // (one per ~12 bp), oriented + twisted into a continuous helix, so it goes
+    // through the same InstancedMesh + per-instance LOD + cel/outline path as
+    // proteins. Otherwise fall back to a single smooth `fiber` tube.
     if let Some(chr) = &snapshot.chromosome {
-        let id = ingredients.len() as u64;
-        let enc = chr
-            .points
-            .iter()
-            .map(|p| p.coords.norm())
-            .fold(0.0_f32, f32::max)
-            + chr.radius;
-        ingredients.push(json!({
-            "id": id,
-            "name": "chromosome",
-            "color": chr.color,
-            "shape": {
-                "kind": "fiber",
-                "points": chr.points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>(),
-                "radius": chr.radius,
-                "enclosing_radius": enc,
-            },
-        }));
-        placements.push(json!({
-            "uid": placements.len() as u64,
-            "ingredient": id,
-            "compartment": 0,
-            "position": [chr.center.x, chr.center.y, chr.center.z],
-            "rotation": [1.0, 0.0, 0.0, 0.0],
-        }));
+        let seg = recipe
+            .chromosome
+            .as_ref()
+            .and_then(|c| c.segment.as_ref())
+            .and_then(|name| recipe.ingredients.get_index_of(name));
+        if let Some(seg_id) = seg {
+            let world: Vec<_> = chr.points.iter().map(|p| chr.center + p.coords).collect();
+            let seg_step = 12.0 * 3.4; // ~12 bp per 1BNA segment, 3.4 Å/bp
+            let twist = std::f32::consts::TAU / (10.5 * 3.4); // B-DNA: 10.5 bp/turn
+            for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, twist) {
+                placements.push(json!({
+                    "uid": placements.len() as u64,
+                    "ingredient": seg_id as u64,
+                    "compartment": 0,
+                    "position": [pos.x, pos.y, pos.z],
+                    "rotation": [rot.w, rot.i, rot.j, rot.k],
+                }));
+            }
+        } else {
+            let id = ingredients.len() as u64;
+            let enc = chr
+                .points
+                .iter()
+                .map(|p| p.coords.norm())
+                .fold(0.0_f32, f32::max)
+                + chr.radius;
+            ingredients.push(json!({
+                "id": id,
+                "name": "chromosome",
+                "color": chr.color,
+                "shape": {
+                    "kind": "fiber",
+                    "points": chr.points.iter().map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>(),
+                    "radius": chr.radius,
+                    "enclosing_radius": enc,
+                },
+            }));
+            placements.push(json!({
+                "uid": placements.len() as u64,
+                "ingredient": id,
+                "compartment": 0,
+                "position": [chr.center.x, chr.center.y, chr.center.z],
+                "rotation": [1.0, 0.0, 0.0, 0.0],
+            }));
+        }
     }
 
     json!({

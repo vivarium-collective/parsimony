@@ -32,7 +32,6 @@ const toggleAxes = document.getElementById("toggle-axes");
 const toggleGrid = document.getElementById("toggle-bg-grid");
 const toggleSpin = document.getElementById("toggle-spin");
 const toggleMembrane = document.getElementById("toggle-membrane");
-const toggleFiber = document.getElementById("toggle-fiber");
 const sliceAxis = document.getElementById("slice-axis");
 const slicePos = document.getElementById("slice-pos");
 const slicePosValue = document.getElementById("slice-pos-value");
@@ -243,8 +242,6 @@ let bboxLines = null;
 // Compartment surfaces (the "membrane"): translucent shells for sphere
 // compartments (the cell envelope). Rebuilt per packing, disposed with it.
 let compartmentMeshes = [];
-// Chromosome / fiber tubes, rebuilt per packing, disposed with it.
-let fiberMeshes = [];
 // Each entry tracks one ingredient type and all of its LOD slots.
 // `fallbackSphere` is the placeholder used before any OBJ arrives or
 // when no LOD is loaded for an instance's desired level. `lods[i]`
@@ -332,12 +329,6 @@ function clearPacking() {
   }
   instancedMeshes = [];
   disposeCompartments();
-  for (const m of fiberMeshes) {
-    scene.remove(m);
-    m.geometry.dispose();
-    m.material.dispose();
-  }
-  fiberMeshes = [];
   if (bboxLines) {
     scene.remove(bboxLines);
     bboxLines.geometry.dispose();
@@ -1022,128 +1013,15 @@ function buildImpostorMembrane(doc) {
   }
 }
 
-// ───── chromosome / genome fiber ─────────────────────────────────────
-// A `fiber` ingredient (e.g. the chromosome) is a polyline of bead
-// centres. We render it as one smooth tube through the beads
-// (Catmull-Rom), per placement — cheap (a single mesh) and reads as a
-// continuous chromosome threading the cell.
-// Plectonemic supercoil, grounded in Maritan 2022 / Goodsell's LatticeNucleoids:
-// the bacterial chromosome is a coarse supercoiled loop — two interwound
-// plectoneme arms — so the tube's PATH already is the supercoil (our
-// generator lays the genome out as one superhelix, back as the complementary
-// one). We render that honestly: the two arms in two related blues (Maritan
-// renders DNA blue; orange is reserved for RNA). Then, only when the camera
-// is close, a duplex hint fades in on each arm (dark base-stack core +
-// asymmetric major/minor grooves + faint base-pair rungs) — coil-within-a-
-// coil: duplex up close, plectoneme at cell scale. The duplex pitch is
-// illustrative (each bead is hundreds of bp, so a literal duplex would be
-// sub-pixel) — same "suggestion at the protein-mesh realism level" idea.
-const HELIX_PITCH_PER_RADIUS = 4.0;  // duplex-hint pitch = tube radius × this (close zoom)
-const HELIX_RADIAL_SEG = 14;         // tube cross-section facets
-const HELIX_STRAND_EDGE = 0.5;       // duplex backbone width (lower = wider)
-const HELIX_MINOR_OFFSET = 0.42;     // strand-B offset (<0.5 → asymmetric major/minor grooves)
-const HELIX_RUNGS_PER_TURN = 1.0;    // base-pair rung hint frequency
-const HELIX_FADE_NEAR = 250.0;       // Å camera distance: duplex fully shown
-const HELIX_FADE_FAR = 1400.0;       // Å camera distance: duplex gone (flat arms)
-const HELIX_ARM_A = [0.20, 0.42, 0.72]; // deep blue (outgoing plectoneme arm)
-const HELIX_ARM_B = [0.41, 0.63, 0.87]; // light blue (return arm)
-
-// MeshStandardMaterial (still scene-lit) with the helix logic injected. Driven
-// by a per-vertex `aHelix` baked at build time: x = turns-along (continuous),
-// y = around 0..1, z = 0..1 along the whole tube (splits the two arms at the
-// apex). `vViewDist` (view-space distance) drives the close-zoom LOD fade.
-function makeFiberMaterial() {
-  const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(0.3, 0.5, 0.8),
-    roughness: 0.5,
-    metalness: 0.05,
-  });
-  const v3 = (c) => `vec3(${c[0].toFixed(4)}, ${c[1].toFixed(4)}, ${c[2].toFixed(4)})`;
-  const f = (x) => x.toFixed(4);
-  mat.onBeforeCompile = (shader) => {
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        "#include <common>",
-        "#include <common>\nattribute vec3 aHelix;\nvarying vec3 vHelix;\nvarying float vViewDist;",
-      )
-      .replace(
-        "#include <begin_vertex>",
-        "#include <begin_vertex>\n  vHelix = aHelix;\n  vViewDist = length((modelViewMatrix * vec4(position, 1.0)).xyz);",
-      );
-    shader.fragmentShader = shader.fragmentShader
-      .replace(
-        "#include <common>",
-        "#include <common>\nvarying vec3 vHelix;\nvarying float vViewDist;",
-      )
-      .replace(
-        "#include <color_fragment>",
-        `#include <color_fragment>
-        {
-          // Two interwound plectoneme arms (outgoing vs return half of the tube).
-          float arm = smoothstep(0.48, 0.52, vHelix.z);
-          vec3 base = mix(${v3(HELIX_ARM_A)}, ${v3(HELIX_ARM_B)}, arm);
-          // Duplex hint per arm, faded in only up close so it never aliases far out.
-          float detail = 1.0 - smoothstep(${f(HELIX_FADE_NEAR)}, ${f(HELIX_FADE_FAR)}, vViewDist);
-          if (detail > 0.001) {
-            float phase = vHelix.y - vHelix.x;
-            float dA = cos(6.2831853 * phase);                       // backbone A
-            float dB = cos(6.2831853 * (phase - ${f(HELIX_MINOR_OFFSET)})); // backbone B
-            float rA = smoothstep(${f(HELIX_STRAND_EDGE)}, 1.0, dA);
-            float rB = smoothstep(${f(HELIX_STRAND_EDGE)}, 1.0, dB);
-            vec3 dup = base * 0.35;                                  // dark base-stack core / grooves
-            dup = mix(dup, base * 1.25, max(rA, rB));                // lit backbones (same arm hue)
-            float groove = 1.0 - max(rA, rB);
-            float rung = smoothstep(0.85, 1.0, cos(6.2831853 * vHelix.x * ${f(HELIX_RUNGS_PER_TURN)}));
-            dup = mix(dup, base * 1.5, 0.25 * rung * groove);        // faint base-pair rungs
-            base = mix(base, dup, detail);
-          }
-          diffuseColor.rgb = base;
-        }`,
-      );
-  };
-  return mat;
-}
-
-function buildFiber(ing, placements) {
-  const sh = ing.shape;
-  if (!Array.isArray(sh.points) || sh.points.length < 2) return;
-  const mat = makeFiberMaterial();
-  const radius = sh.radius || 8;
-  const pitch = radius * HELIX_PITCH_PER_RADIUS;
-  const radialSeg = HELIX_RADIAL_SEG;
-  const vertsPerRing = radialSeg + 1;
-  for (const p of placements) {
-    const [ox, oy, oz] = p.position;
-    const cps = sh.points.map(
-      (pt) => new THREE.Vector3(pt[0] + ox, pt[1] + oy, pt[2] + oz),
-    );
-    const curve = new THREE.CatmullRomCurve3(cps, false, "catmullrom", 0.5);
-    const tubular = Math.min(8000, sh.points.length * 3);
-    const geom = new THREE.TubeGeometry(curve, tubular, radius, radialSeg, false);
-
-    // Per-vertex helix coords. TubeGeometry is ring-major: (tubular+1) rings ×
-    // (radialSeg+1) verts. x = arcLen/pitch (continuous turns-along), y =
-    // around 0..1 (cos() makes the v=0/v=1 seam free), z = ring/tubular (0..1
-    // along the whole tube → arm split at ~0.5, the plectoneme apex).
-    const lengths = curve.getLengths(tubular);
-    const n = geom.attributes.position.count;
-    const aHelix = new Float32Array(n * 3);
-    for (let k = 0; k < n; k++) {
-      const ring = Math.floor(k / vertsPerRing);
-      const j = k % vertsPerRing;
-      aHelix[k * 3] = (lengths[Math.min(ring, lengths.length - 1)] || 0) / pitch;
-      aHelix[k * 3 + 1] = j / radialSeg;
-      aHelix[k * 3 + 2] = ring / tubular;
-    }
-    geom.setAttribute("aHelix", new THREE.BufferAttribute(aHelix, 3));
-
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.frustumCulled = false;
-    mesh.visible = !toggleFiber || toggleFiber.checked;
-    scene.add(mesh);
-    fiberMeshes.push(mesh);
-  }
-}
+// ───── chromosome / genome ───────────────────────────────────────────
+// The chromosome is no longer a bespoke tube. The packer emits it as tens of
+// thousands of `dna_segment` mesh instances — one shared real-dsDNA mesh
+// (1BNA) tiled every ~12 bp along the genome path and rolled by the duplex
+// twist so the instances form a continuous, real-scale double helix. It is a
+// plain mesh ingredient, so it renders through the same instanced-mesh +
+// per-instance LOD + cel/outline path as every protein: molecular up close,
+// Goodsell-shaded, and naturally LOD'd to a cigar at cell scale. No special
+// fiber/helix code path remains in the viewer.
 
 // Build the scene from a `parsimony.pack.v1` document.
 async function buildScene(doc, fileName) {
@@ -1199,11 +1077,6 @@ async function buildScene(doc, fileName) {
     // The lipid bilayer is drawn as a generated impostor membrane
     // (buildImpostorMembrane), not as packed multi_sphere instances.
     if (ing.name === "lipid") continue;
-    // The chromosome (a fiber) is drawn as a tube, not instanced spheres.
-    if (ing.shape && ing.shape.kind === "fiber") {
-      buildFiber(ing, pts);
-      continue;
-    }
     const colorArr = ing.color || [0.5, 0.5, 0.5];
     const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
     const enc = ing.shape.enclosing_radius || ing.shape.radius || 1.0;
@@ -1940,11 +1813,6 @@ toggleSpin.addEventListener("change", () => {
 if (toggleMembrane) {
   toggleMembrane.addEventListener("change", () => {
     for (const m of compartmentMeshes) m.visible = toggleMembrane.checked;
-  });
-}
-if (toggleFiber) {
-  toggleFiber.addEventListener("change", () => {
-    for (const m of fiberMeshes) m.visible = toggleFiber.checked;
   });
 }
 sliceAxis.addEventListener("change", applyClippingPlane);
