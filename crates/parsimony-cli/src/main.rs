@@ -88,6 +88,13 @@ struct PackArgs {
     /// scales to far larger / sparser domains.
     #[arg(long, value_enum, default_value_t = Backend::Legacy)]
     backend: Backend,
+
+    /// Override the legacy clearance-grid cell size, in Å (default:
+    /// largest-ingredient-radius / 8). Smaller = finer grid (better
+    /// resolution for small ingredients, more cells/memory). Used to
+    /// explore adaptive cell sizing vs the octree. No effect on `octree`.
+    #[arg(long)]
+    cell_size: Option<f32>,
 }
 
 /// CLI mirror of [`PlacementBackend`] (keeps `clap` out of parsimony-core).
@@ -191,6 +198,7 @@ fn run_pack(args: PackArgs) -> Result<()> {
     let placer_config = PlacerConfig {
         strict_bounds: !args.loose_bounds,
         backend: args.backend.into(),
+        clearance_cell_size: args.cell_size,
         ..PlacerConfig::default()
     };
     let t = Instant::now();

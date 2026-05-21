@@ -978,11 +978,16 @@ function buildCompartments(doc) {
 // placements. This is how cellPACK/Maritan render dense membranes.
 //
 // Tunables (eyeball + adjust):
-const MEMBRANE_SPACING = 11;       // Å between lipids in a leaflet (smaller = denser)
+const MEMBRANE_SPACING = 8.5;      // Å between lipids in a leaflet (smaller = denser).
+                                   // ~72 Å²/lipid ≈ a real membrane (~76); was 11
+                                   // (≈1.6× sparse) back when a locked GPU looked like a
+                                   // perf wall. Impostors are ~free, so this is the knob.
 const MEMBRANE_THICKNESS = 40;     // Å total bilayer thickness (centred on the cell surface)
 const MEMBRANE_HEAD_RADIUS = 5;    // Å headgroup impostor radius
 const MEMBRANE_TAIL_RADIUS = 4.0;  // Å tail-bead impostor radius (fat enough to read as a continuous strand)
-const MEMBRANE_MAX_POINTS = 3000000;
+const MEMBRANE_MAX_POINTS = 5000000; // safety cap on impostor points. Headroom so it does
+                                   // NOT throttle real density for the 2000 Å cell
+                                   // (~4.2M points at spacing 8.5); only binds for bigger cells.
 
 function makeImpostorMaterial(headColor) {
   return new THREE.ShaderMaterial({
