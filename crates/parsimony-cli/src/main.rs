@@ -1281,6 +1281,11 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
     if args.lipid_count > 0 {
         let lipid_cif = fetch_ligand("LHG")?; // 1,2-dipalmitoyl-sn-glycero-3-phosphoglycerol
         let mut latoms = mesh_gen::load_atoms(&lipid_cif)?;
+        // Drop hydrogens (VdW ~1.2 Å). The CCD ships explicit H, and on the
+        // thin acyl tails each C–H spikes past the carbon tube at 1.5 Å — so we
+        // mesh the heavy-atom surface, matching the (H-free) protein/DNA/RNA
+        // structures from RCSB.
+        latoms.retain(|a| a.radius > 1.3);
         mesh_gen::reorient_atoms_to_z(&mut latoms);
         // The phosphate/glycerol head is oxygen-rich (VdW ~1.52 Å) while the
         // tails are carbon — so put the O-heavy end at +Z. That makes the
@@ -1293,6 +1298,12 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
             for a in latoms.iter_mut() {
                 a.pos.z = -a.pos.z;
             }
+        }
+        // Fatten the heavy atoms so the thin acyl tails mesh as smooth tubes
+        // instead of a row of per-atom bumps (the residual spikiness). Done
+        // after the O-based head test, which keys off the real oxygen radius.
+        for a in latoms.iter_mut() {
+            a.radius += 0.8;
         }
         let zmax = latoms.iter().map(|a| a.pos.z.abs()).fold(0.0_f32, f32::max).max(1.0);
         // One bilayer-spanning pair: the lipid + its Z-mirror, tails meeting at
@@ -1338,7 +1349,11 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
                 }
             }
         }
-        let lipid_lods = [8.0_f32, 4.0, 2.0, 1.5];
+        // Coarser than the proteins on purpose: the acyl tails are thin
+        // single-atom chains, so a fine voxel resolves every atom as a bump
+        // ("spiky"). At ~2.5 Å the atoms merge into smooth tubes — plenty for a
+        // membrane that's small on screen.
+        let lipid_lods = [10.0_f32, 5.0, 2.5];
         let lipid_objs: Vec<PathBuf> = (0..lipid_lods.len())
             .map(|i| special_dir.join(format!("lipid.lod{i}.obj")))
             .collect();

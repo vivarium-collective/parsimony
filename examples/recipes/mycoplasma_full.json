@@ -21205,19 +21205,15 @@
       "mesh_lods": [
         {
           "path": "../pdb_meshes/lipid.lod0.obj",
-          "voxel_size": 8.0
+          "voxel_size": 10.0
         },
         {
           "path": "../pdb_meshes/lipid.lod1.obj",
-          "voxel_size": 4.0
+          "voxel_size": 5.0
         },
         {
           "path": "../pdb_meshes/lipid.lod2.obj",
-          "voxel_size": 2.0
-        },
-        {
-          "path": "../pdb_meshes/lipid.lod3.obj",
-          "voxel_size": 1.5
+          "voxel_size": 2.5
         }
       ],
       "packing_mode": "tiled",
