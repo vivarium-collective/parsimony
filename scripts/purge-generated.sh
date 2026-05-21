@@ -55,25 +55,26 @@ if [[ "${ans:-}" != [yY] ]]; then
 fi
 
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "!! uncommitted changes present — git-filter-repo needs a clean tree." >&2
+  echo "!! uncommitted changes present — git filter-branch needs a clean tree." >&2
   echo "   commit or stash everything, then re-run." >&2
   exit 1
 fi
 
-if command -v git-filter-repo >/dev/null 2>&1; then
-  git filter-repo --force \
-    --path examples/pdb_meshes \
-    --path examples/pdb_cache \
-    --path-glob 'viewer/data/*.pack.json' \
-    --invert-paths
-  echo
-  echo "history rewritten. filter-repo removed 'origin' — re-add and force-push:"
-  echo "  git remote add origin <url>"
-  echo "  git push --force origin <branch>"
-else
-  echo "!! git-filter-repo not installed." >&2
-  echo "   install:  pip install git-filter-repo   (then re-run this script)" >&2
-  echo "   or BFG:   bfg --delete-folders '{pdb_meshes,pdb_cache}' && \\" >&2
-  echo "             git reflog expire --expire=now --all && git gc --prune=now --aggressive" >&2
-  exit 1
-fi
+echo "rewriting history with git filter-branch (built into git — no extra tools)…"
+# --index-filter drops the paths from every commit's index (no checkout, fast);
+# --prune-empty removes commits that become empty. The inner double-quotes keep
+# the shell from expanding the glob so git matches it as a pathspec.
+export FILTER_BRANCH_SQUELCH_WARNING=1
+git filter-branch --force --prune-empty --index-filter \
+  'git rm -r --cached --ignore-unmatch examples/pdb_meshes examples/pdb_cache "viewer/data/*.pack.json"' \
+  -- --all
+
+# Drop filter-branch's backup refs and reclaim the space.
+rm -rf .git/refs/original/
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive
+
+echo
+echo "history rewritten + repacked — .git should be a few MB now. Force-push:"
+echo "  git push --force origin <branch>      # e.g. main"
+echo "(no remote yet?  run 'git remote add origin <url>' first)"
