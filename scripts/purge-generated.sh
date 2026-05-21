@@ -38,10 +38,12 @@ fi
 # ── Show what's still bloating history ──────────────────────────────────────
 echo
 echo "── largest blobs in history (MB) ──"
-git rev-list --objects --all \
+# `|| true`: head closes the pipe early, which trips pipefail+set -e otherwise.
+# `sort -k2`: sort by the size column (field 2), not the object hash (field 1).
+{ git rev-list --objects --all \
   | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' \
-  | sed -n 's/^blob //p' | sort -rn \
-  | awk '{ printf "  %7.1f  %s\n", $2/1048576, $3 }' | head -15
+  | sed -n 's/^blob //p' | sort -k2 -rn \
+  | awk '{ printf "  %7.1f  %s\n", $2/1048576, $3 }' | head -15; } || true
 echo "(if you see examples/pdb_meshes/*.obj above, Stage 2 is needed to push)"
 
 # ── Stage 2: purge from ALL history (destructive) ───────────────────────────
