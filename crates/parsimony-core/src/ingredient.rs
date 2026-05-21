@@ -333,6 +333,12 @@ pub struct Ingredient {
     /// Empty for non-mesh shapes. A single-LOD recipe lands here as
     /// a one-element vec.
     pub mesh_lods: Vec<MeshLod>,
+    /// Optional ingredient name of a per-bead segment mesh. When set on a
+    /// `MultiSphere` ingredient, the pack writer renders each instance as that
+    /// mesh tiled along its bead chain (e.g. mRNA → a real RNA strand), the
+    /// same idea as the chromosome's `dna_segment`. Pack/collision still use
+    /// the multi-sphere proxy; this only affects rendering output.
+    pub segment: Option<String>,
 }
 
 /// Sphere-tree generators for analytical shape primitives + a mesh

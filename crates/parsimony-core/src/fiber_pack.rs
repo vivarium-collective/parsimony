@@ -301,6 +301,7 @@ mod tests {
             packing_mode: PackingMode::Random,
             principal_vector: Vector3::z(),
             mesh_lods: vec![],
+            segment: None,
         }
     }
 

@@ -860,6 +860,24 @@ fn resolve_structure(arg: &str) -> Result<PathBuf> {
     anyhow::bail!("could not fetch structure {id} from RCSB")
 }
 
+/// Fetch an RCSB chemical-component (ligand) CCD definition — an mmCIF with
+/// atomic coordinates in `_chem_comp_atom` — into examples/pdb_cache. This is
+/// how we get real small molecules that aren't deposited as their own
+/// structure (e.g. a phospholipid).
+fn fetch_ligand(ccd: &str) -> Result<PathBuf> {
+    let cache = Path::new("examples/pdb_cache");
+    fs::create_dir_all(cache).ok();
+    let out = cache.join(format!("{}.cif", ccd.to_lowercase()));
+    if out.exists() {
+        return Ok(out);
+    }
+    let url = format!("https://files.rcsb.org/ligands/download/{}.cif", ccd.to_uppercase());
+    eprint!("  fetching ligand {url} … ");
+    let r = fetch_to(&url, &out);
+    eprintln!("{}", if r.is_ok() { "ok" } else { "failed" });
+    r
+}
+
 /// Download `url` to `out`, returning its path. Native HTTP (no curl/python).
 /// Publishes atomically (unique temp + rename) so that when several species
 /// share one RCSB ID and fetch it concurrently, a reader never sees a
@@ -916,8 +934,11 @@ struct TranslateMycoplasmaArgs {
     #[arg(long, default_value_t = 2000.0)]
     cell_radius: f32,
 
-    /// Coarse-grained bilayer lipids tiled over the surface (0 disables).
-    #[arg(long, default_value_t = 40000)]
+    /// Membrane lipid *patches* tiled over the cell surface (0 disables). Each
+    /// patch is one mesh baking a dense hex-packed disc of ~260 real lipids, so
+    /// a few thousand patches cover the cell at full density. More = denser
+    /// overlap (fewer gaps), heavier viewer.
+    #[arg(long, default_value_t = 16000)]
     lipid_count: u32,
 
     /// Gene-annotation CSV for the genome (referenced by the chromosome block,
@@ -1043,13 +1064,17 @@ fn mesh_to_spec(
     color: [f32; 3],
     proxy_voxel: f32,
     force: bool,
+    reorient_z: bool,
 ) -> Result<serde_json::Value> {
     let obj_paths: Vec<PathBuf> = (0..lods.len())
         .map(|i| out_dir.join(format!("{slug}.lod{i}.obj")))
         .collect();
     if force || !obj_paths.iter().all(|p| p.exists()) {
         let atoms = mesh_gen::load_atoms(struct_path)?;
-        let meshes = mesh_gen::mesh_lods(&atoms, lods)?;
+        let mut meshes = mesh_gen::mesh_lods(&atoms, lods)?;
+        if reorient_z {
+            mesh_gen::reorient_to_z(&mut meshes);
+        }
         for (i, (res, mesh)) in lods.iter().zip(meshes.iter()).enumerate() {
             let header = format!(
                 "parsimony translate-mycoplasma: {slug} (source {})\natoms: {}  voxel: {res} Å  verts: {}  tris: {}",
@@ -1112,7 +1137,7 @@ fn mesh_cp_region(
                 },
             };
             let color = TRANSLATE_PALETTE[(idx + pal_off) % TRANSLATE_PALETTE.len()];
-            match mesh_to_spec(&struct_path, &slug, lods, out_meshes, recipe_dir, color, proxy, force) {
+            match mesh_to_spec(&struct_path, &slug, lods, out_meshes, recipe_dir, color, proxy, force, false) {
                 Ok(spec) => Some((slug, spec, ing.nb_mol)),
                 Err(e) => {
                     eprintln!("  ! {slug}: {e}");
@@ -1214,22 +1239,29 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
         .to_path_buf();
     // dna_segment: real B-DNA dodecamer (1BNA); local Z is the helix axis.
     let dna = resolve_structure("1BNA")?;
-    let mut seg = mesh_to_spec(&dna, "1BNA", &[12.0, 6.0, 3.0, 1.5], &special_dir, &recipe_dir, [0.30, 0.55, 0.85], 6.0, args.force)?;
+    let mut seg = mesh_to_spec(&dna, "1BNA", &[12.0, 6.0, 3.0, 1.5], &special_dir, &recipe_dir, [0.30, 0.55, 0.85], 6.0, args.force, true)?;
     seg["principal_vector"] = serde_json::json!([0, 0, 1]);
     objects.insert("dna_segment".into(), seg);
+    // rna_segment: a real A-form RNA (1RNA), reoriented so its helix axis is Z,
+    // tiled along each mRNA's bead chain (RNA-orange).
+    let rna = resolve_structure("1RNA")?;
+    let mut rseg = mesh_to_spec(&rna, "1RNA", &[12.0, 6.0, 3.0, 1.5], &special_dir, &recipe_dir, [0.95, 0.55, 0.15], 6.0, args.force, true)?;
+    rseg["principal_vector"] = serde_json::json!([0, 0, 1]);
+    objects.insert("rna_segment".into(), rseg);
     // RNA polymerase (1hqm) + DNA polymerase (2hpi) ride the chromosome.
     let rnap = resolve_structure("1hqm")?;
     objects.insert(
         "rnap".into(),
-        mesh_to_spec(&rnap, "1hqm", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.96, 0.85, 0.2], 12.0, args.force)?,
+        mesh_to_spec(&rnap, "1hqm", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.96, 0.85, 0.2], 12.0, args.force, false)?,
     );
     let dnap = resolve_structure("2hpi")?;
     objects.insert(
         "dnap".into(),
-        mesh_to_spec(&dnap, "2hpi", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.2, 0.9, 0.95], 10.0, args.force)?,
+        mesh_to_spec(&dnap, "2hpi", &[16.0, 8.0, 4.0], &special_dir, &recipe_dir, [0.2, 0.9, 0.95], 10.0, args.force, false)?,
     );
-    // mRNA: a coarse linear bead chain (the viewer tiles a real RNA strand
-    // along it). Free copies in the cytoplasm, nascent copies on the genome.
+    // mRNA: a coarse linear bead chain that the pack writer renders as the
+    // rna_segment mesh tiled along it. Free copies in the cytoplasm, nascent
+    // copies on the genome.
     objects.insert(
         "mrna".into(),
         serde_json::json!({
@@ -1238,19 +1270,103 @@ fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
             "principal_vector": [1.0, 0.0, 0.0],
             "positions": [[-72,0,0],[-56,7,2],[-40,-4,-3],[-24,6,4],[-8,-5,-2],[8,6,3],[24,-4,-4],[40,7,2],[56,-3,-3],[72,2,0]],
             "radii": [9,9,9,9,9,9,9,9,9,9],
+            "segment": "rna_segment",
         }),
     );
-    // Coarse-grained bilayer-spanning lipid, tiled over the cell surface.
+    // Real phospholipid (a chemical component) meshed like everything else:
+    // orient it head-tail along Z, then mirror into a tail-to-tail bilayer pair
+    // so each surface placement is a full bilayer-spanning unit of real lipid
+    // atoms (Z = the bilayer normal, aligned to the radial direction at
+    // placement). Tiled densely over the cell surface.
     if args.lipid_count > 0 {
+        let lipid_cif = fetch_ligand("LHG")?; // 1,2-dipalmitoyl-sn-glycero-3-phosphoglycerol
+        let mut latoms = mesh_gen::load_atoms(&lipid_cif)?;
+        mesh_gen::reorient_atoms_to_z(&mut latoms);
+        // The phosphate/glycerol head is oxygen-rich (VdW ~1.52 Å) while the
+        // tails are carbon — so put the O-heavy end at +Z. That makes the
+        // mirrored pair deterministically heads-out / tails-in (a real
+        // bilayer), instead of a 50/50 coin flip that can bury the heads.
+        let is_o = |a: &mesh_gen::Atom| (a.radius - 1.52).abs() < 0.03;
+        let o_top = latoms.iter().filter(|a| is_o(a) && a.pos.z > 0.0).count();
+        let o_bot = latoms.iter().filter(|a| is_o(a) && a.pos.z < 0.0).count();
+        if o_bot > o_top {
+            for a in latoms.iter_mut() {
+                a.pos.z = -a.pos.z;
+            }
+        }
+        let zmax = latoms.iter().map(|a| a.pos.z.abs()).fold(0.0_f32, f32::max).max(1.0);
+        // One bilayer-spanning pair: the lipid + its Z-mirror, tails meeting at
+        // the midplane (z = 0), heads at the two surfaces (z = bilayer normal).
+        let pair: Vec<mesh_gen::Atom> = latoms
+            .iter()
+            .flat_map(|a| {
+                [
+                    mesh_gen::Atom { pos: nalgebra::Vector3::new(a.pos.x, a.pos.y, a.pos.z + zmax), radius: a.radius },
+                    mesh_gen::Atom { pos: nalgebra::Vector3::new(a.pos.x, a.pos.y, -a.pos.z - zmax), radius: a.radius },
+                ]
+            })
+            .collect();
+        // A membrane PATCH: a hex-packed disc of those pairs (with positional
+        // jitter so it isn't crystalline), baked into one mesh. A few thousand
+        // tiled+rolled patches then cover the cell at full lipid density for a
+        // tiny instance count — instead of millions of individual lipids.
+        let (patch_r, spacing) = (110.0_f32, 13.0_f32);
+        let dy = spacing * (3.0_f32).sqrt() / 2.0;
+        let rows = (patch_r / dy).ceil() as i32;
+        let cols = (patch_r / spacing).ceil() as i32 + 1;
+        let jit = |a: i32, b: i32| {
+            let v = (a as u32).wrapping_mul(73856093) ^ (b as u32).wrapping_mul(19349663);
+            ((v & 0xffff) as f32 / 65535.0 - 0.5) * spacing * 0.4
+        };
+        let mut patch: Vec<mesh_gen::Atom> = Vec::new();
+        let mut n_lipids = 0usize;
+        for j in -rows..=rows {
+            let y = j as f32 * dy;
+            let xoff = if j & 1 == 0 { 0.0 } else { spacing * 0.5 };
+            for i in -cols..=cols {
+                let x = i as f32 * spacing + xoff;
+                if x * x + y * y > patch_r * patch_r {
+                    continue;
+                }
+                let (jx, jy) = (jit(i, j), jit(j, i));
+                n_lipids += 1;
+                for a in &pair {
+                    patch.push(mesh_gen::Atom {
+                        pos: nalgebra::Vector3::new(a.pos.x + x + jx, a.pos.y + y + jy, a.pos.z),
+                        radius: a.radius,
+                    });
+                }
+            }
+        }
+        let lipid_lods = [8.0_f32, 4.0, 2.0, 1.5];
+        let lipid_objs: Vec<PathBuf> = (0..lipid_lods.len())
+            .map(|i| special_dir.join(format!("lipid.lod{i}.obj")))
+            .collect();
+        if args.force || !lipid_objs.iter().all(|p| p.exists()) {
+            let meshes = mesh_gen::mesh_lods(&patch, &lipid_lods)?;
+            for (i, (res, m)) in lipid_lods.iter().zip(meshes.iter()).enumerate() {
+                mesh_gen::write_obj(
+                    m,
+                    &lipid_objs[i],
+                    &format!("parsimony lipid patch ({n_lipids} LHG lipids)  voxel: {res} Å  verts: {}", m.0.len()),
+                )?;
+            }
+            eprintln!("lipid patch: {n_lipids} lipids meshed");
+        }
+        let lipid_lod_specs: Vec<serde_json::Value> = lipid_objs
+            .iter()
+            .zip(lipid_lods)
+            .map(|(p, vs)| serde_json::json!({ "path": relativize(p, &recipe_dir), "voxel_size": vs }))
+            .collect();
         objects.insert(
             "lipid".into(),
             serde_json::json!({
-                "type": "multi_sphere",
+                "type": "mesh",
                 "color": [0.96, 0.86, 0.55],
-                "positions": [[0,0,24],[0,0,17],[0,0,11],[0,0,5],[0,0,-5],[0,0,-11],[0,0,-17],[0,0,-24]],
-                "radii": [4.5,3.0,2.7,2.5,2.5,2.7,3.0,4.5],
-                "principal_vector": [0,0,1],
+                "principal_vector": [0, 0, 1],
+                "proxy_voxel_size": 12.0,
                 "packing_mode": "tiled",
+                "mesh_lods": lipid_lod_specs,
             }),
         );
         surface_entries.push(serde_json::json!({ "object": "lipid", "count": args.lipid_count }));

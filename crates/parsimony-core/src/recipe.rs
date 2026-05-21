@@ -140,6 +140,11 @@ struct RawObject {
     /// `mesh_lods` wins; the collision proxy uses the finest entry.
     #[serde(default)]
     mesh_lods: Option<Vec<RawMeshLod>>,
+    /// Optional ingredient name of a per-bead segment mesh. On a `multi_sphere`
+    /// ingredient, the pack writer renders each instance as that mesh tiled
+    /// along its bead chain (e.g. mRNA → a real RNA strand).
+    #[serde(default)]
+    segment: Option<String>,
     // (remaining cellPACK fields ignored until needed)
 }
 
@@ -546,6 +551,7 @@ fn resolve(
                     .map(|v| nalgebra::Vector3::new(v[0], v[1], v[2]))
                     .unwrap_or_else(|| nalgebra::Vector3::new(0.0, 0.0, 1.0)),
                 mesh_lods,
+                segment: obj.segment.clone(),
             },
         );
     }
@@ -685,6 +691,7 @@ fn merge_object(parent: RawObject, child: RawObject) -> RawObject {
         mesh_path: child.mesh_path.or(parent.mesh_path),
         proxy_voxel_size: child.proxy_voxel_size.or(parent.proxy_voxel_size),
         mesh_lods: child.mesh_lods.or(parent.mesh_lods),
+        segment: child.segment.or(parent.segment),
     }
 }
 

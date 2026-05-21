@@ -23,7 +23,7 @@
 use anyhow::{Context, Result};
 use fast_surface_nets::ndshape::RuntimeShape;
 use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
-use nalgebra::Vector3;
+use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 use std::path::Path;
 
 /// Fallback VdW radius (Å) for elements pdbtbx can't identify — carbon.
@@ -133,13 +133,22 @@ fn parse_cif_atoms(text: &str) -> Vec<Atom> {
                 break;
             }
         }
-        let col = |name: &str| tags.iter().position(|t| t == &format!("_atom_site.{name}"));
-        let (ix, iy, iz) = match (col("cartn_x"), col("cartn_y"), col("cartn_z")) {
-            (Some(a), Some(b), Some(c)) => (a, b, c),
-            _ => continue, // not the atom_site loop — keep scanning
+        // Find a column by trying suffixes in priority order — handles both
+        // structures (`_atom_site.cartn_x`) and ligand chemical components
+        // (`_chem_comp_atom.model_cartn_x`), so a fetched lipid CCD works too.
+        let col = |suffixes: &[&str]| -> Option<usize> {
+            suffixes.iter().find_map(|s| tags.iter().position(|t| t.ends_with(s)))
         };
-        let ielem = col("type_symbol");
-        let imodel = col("pdbx_pdb_model_num");
+        let (ix, iy, iz) = match (
+            col(&[".cartn_x", ".model_cartn_x", ".pdbx_model_cartn_x_ideal"]),
+            col(&[".cartn_y", ".model_cartn_y", ".pdbx_model_cartn_y_ideal"]),
+            col(&[".cartn_z", ".model_cartn_z", ".pdbx_model_cartn_z_ideal"]),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => continue, // not an atom loop — keep scanning
+        };
+        let ielem = col(&[".type_symbol"]);
+        let imodel = col(&[".pdbx_pdb_model_num"]);
         let ncol = tags.len();
         let mut first_model: Option<String> = None;
         while let Some(p) = lines.peek() {
@@ -494,6 +503,71 @@ pub fn mesh_lods(atoms: &[Atom], lods: &[f32]) -> Result<Vec<Mesh>> {
         }
     }
     Ok(meshes)
+}
+
+/// Rotate every LOD so the molecule's principal (longest) axis lies on +Z.
+/// Used for tiled *segment* meshes (dna_segment, rna_segment), whose local +Z
+/// the tiler aligns to the path tangent — so the helix axis must be Z
+/// regardless of how the source structure happened to be oriented. (Not used
+/// for placed ingredients, whose recipe rotations assume the native frame.)
+pub fn reorient_to_z(meshes: &mut [Mesh]) {
+    let fi = match meshes.iter().enumerate().max_by_key(|(_, m)| m.0.len()) {
+        Some((i, m)) if !m.0.is_empty() => i,
+        _ => return,
+    };
+    // Covariance of the (already centroid-centered) finest LOD.
+    let mut cov = Matrix3::zeros();
+    for v in &meshes[fi].0 {
+        let d = Vector3::new(v[0], v[1], v[2]);
+        cov += d * d.transpose();
+    }
+    let eig = cov.symmetric_eigen();
+    let mut imax = 0;
+    for i in 1..3 {
+        if eig.eigenvalues[i] > eig.eigenvalues[imax] {
+            imax = i;
+        }
+    }
+    let axis = eig.eigenvectors.column(imax).into_owned();
+    let rot = UnitQuaternion::rotation_between(&axis, &Vector3::z())
+        .unwrap_or_else(UnitQuaternion::identity);
+    for (verts, _) in meshes.iter_mut() {
+        for v in verts.iter_mut() {
+            let p = rot * Vector3::new(v[0], v[1], v[2]);
+            *v = [p.x, p.y, p.z];
+        }
+    }
+}
+
+/// Rotate + centre atoms so their principal (longest) axis lies on +Z. Used to
+/// orient a fetched lipid head-tail along Z before mirroring it into a bilayer.
+pub fn reorient_atoms_to_z(atoms: &mut [Atom]) {
+    if atoms.is_empty() {
+        return;
+    }
+    let mut mean = Vector3::zeros();
+    for a in atoms.iter() {
+        mean += a.pos;
+    }
+    mean /= atoms.len() as f32;
+    let mut cov = Matrix3::zeros();
+    for a in atoms.iter() {
+        let d = a.pos - mean;
+        cov += d * d.transpose();
+    }
+    let eig = cov.symmetric_eigen();
+    let mut imax = 0;
+    for i in 1..3 {
+        if eig.eigenvalues[i] > eig.eigenvalues[imax] {
+            imax = i;
+        }
+    }
+    let axis = eig.eigenvectors.column(imax).into_owned();
+    let rot = UnitQuaternion::rotation_between(&axis, &Vector3::z())
+        .unwrap_or_else(UnitQuaternion::identity);
+    for a in atoms.iter_mut() {
+        a.pos = rot * (a.pos - mean);
+    }
 }
 
 /// Write a triangle mesh as a Wavefront OBJ with a `#`-commented header.

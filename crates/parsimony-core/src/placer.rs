@@ -39,6 +39,21 @@ use crate::recipe::{ChromosomeSpec, PackingMode, PlacementDirective, Recipe, Reg
 
 /// Uniform random rotation on SO(3) via Shoemake's method. Pure 3D
 /// uniform — equiprobable orientation, no Euler-angle biasing.
+/// Random in-plane roll about a surface normal. Applied to tiled patches (e.g.
+/// lipid-membrane tiles) so neighbouring tiles don't share an orientation —
+/// the rotation jitter is what breaks up the repeated-tile look.
+fn random_roll<R: Rng>(
+    rot: UnitQuaternion<f32>,
+    n: nalgebra::Vector3<f32>,
+    rng: &mut R,
+) -> UnitQuaternion<f32> {
+    if n.norm() < 1e-6 {
+        return rot;
+    }
+    let ang: f32 = rng.gen_range(0.0..(2.0 * std::f32::consts::PI));
+    UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(n), ang) * rot
+}
+
 fn random_rotation<R: Rng>(rng: &mut R) -> UnitQuaternion<f32> {
     let u1: f32 = rng.gen_range(0.0..1.0);
     let u2: f32 = rng.gen_range(0.0..(2.0 * std::f32::consts::PI));
@@ -387,7 +402,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                     } else {
                         compartment.kind.sample_surface(&mut rng)
                     };
-                    let rot = align_to_normal(ingredient.principal_vector, n);
+                    let mut rot = align_to_normal(ingredient.principal_vector, n);
+                    if matches!(ingredient.packing_mode, PackingMode::Tiled) {
+                        rot = random_roll(rot, n, &mut rng);
+                    }
                     (p, rot)
                 }
             };
@@ -792,7 +810,11 @@ impl<'a> GreedyRandomPlacer<'a> {
                     } else {
                         compartment.kind.sample_surface(&mut rng)
                     };
-                    (p, align_to_normal(ingredient.principal_vector, n))
+                    let mut rot = align_to_normal(ingredient.principal_vector, n);
+                    if tiled {
+                        rot = random_roll(rot, n, &mut rng);
+                    }
+                    (p, rot)
                 }
             };
 

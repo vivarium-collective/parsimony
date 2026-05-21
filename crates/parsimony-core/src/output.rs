@@ -177,19 +177,43 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         })
         .collect();
 
-    let mut placements: Vec<Value> = snapshot
-        .placements
-        .iter()
-        .map(|p| {
-            json!({
-                "uid": p.instance_uid,
-                "ingredient": p.ingredient_id,
-                "compartment": p.compartment_id,
-                "position": [p.position.x, p.position.y, p.position.z],
-                "rotation": [p.rotation.w, p.rotation.i, p.rotation.j, p.rotation.k],
-            })
-        })
-        .collect();
+    let mut placements: Vec<Value> = Vec::with_capacity(snapshot.placements.len());
+    for p in &snapshot.placements {
+        // mRNA-style ingredients: a multi_sphere carrying a `segment` mesh
+        // renders as that mesh tiled along the instance's bead chain (a real
+        // RNA strand instead of beads), reusing the chromosome's segment tiler.
+        // The multi-sphere proxy was still used for packing/collision.
+        let seg = recipe
+            .ingredients
+            .get_index(p.ingredient_id as usize)
+            .and_then(|(_, ing)| match (&ing.shape, &ing.segment) {
+                (IngredientShape::MultiSphere { spheres }, Some(s)) if spheres.len() >= 2 => {
+                    recipe.ingredients.get_index_of(s.as_str()).map(|id| (spheres, id))
+                }
+                _ => None,
+            });
+        if let Some((spheres, seg_id)) = seg {
+            let path: Vec<_> = spheres.iter().map(|s| p.position + p.rotation * s.offset).collect();
+            let step = (path[1] - path[0]).norm().max(1.0); // ~one segment per bead
+            for (pos, rot) in crate::fiber::dna_segment_transforms(&path, step, 0.0) {
+                placements.push(json!({
+                    "uid": placements.len() as u64,
+                    "ingredient": seg_id as u64,
+                    "compartment": p.compartment_id,
+                    "position": [pos.x, pos.y, pos.z],
+                    "rotation": [rot.w, rot.i, rot.j, rot.k],
+                }));
+            }
+            continue;
+        }
+        placements.push(json!({
+            "uid": placements.len() as u64,
+            "ingredient": p.ingredient_id,
+            "compartment": p.compartment_id,
+            "position": [p.position.x, p.position.y, p.position.z],
+            "rotation": [p.rotation.w, p.rotation.i, p.rotation.j, p.rotation.k],
+        }));
+    }
 
     // The genome, if the placer generated one. When the recipe configures a
     // `segment` ingredient (a per-bead dsDNA mesh), render it the molecular way

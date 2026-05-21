@@ -1083,9 +1083,6 @@ async function buildScene(doc, fileName) {
   for (const [tid, pts] of byType.entries()) {
     const ing = ingredientById.get(tid);
     if (!ing) continue;
-    // The lipid bilayer is drawn as a generated impostor membrane
-    // (buildImpostorMembrane), not as packed multi_sphere instances.
-    if (ing.name === "lipid") continue;
     const colorArr = ing.color || [0.5, 0.5, 0.5];
     const color = new THREE.Color(colorArr[0], colorArr[1], colorArr[2]);
     const enc = ing.shape.enclosing_radius || ing.shape.radius || 1.0;
@@ -1109,7 +1106,6 @@ async function buildScene(doc, fileName) {
   }
   bboxLines = makeBoxLines(bbMin, bbMax, 0x556677);
   scene.add(bboxLines);
-  buildImpostorMembrane(doc);
 
   framePacking(bbMin, bbMax);
   renderLegend();
