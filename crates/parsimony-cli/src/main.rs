@@ -534,55 +534,103 @@ fn run_viewer(args: ViewerArgs) -> Result<()> {
         None => format!("http://localhost:{}/viewer/index.html", args.port),
     };
 
-    // Static server rooted at the project so root-relative mesh URLs
-    // resolve. Prefer the repo's no-cache server (scripts/serve.py) so
-    // viewer.js edits and freshly regenerated packs show up on a normal
-    // reload; fall back to the stdlib server if it's absent.
-    let python = which_python()?;
+    // Native no-cache static server rooted at the project, so root-relative
+    // mesh URLs resolve and edited viewer.js / regenerated packs show up on a
+    // plain reload. No Python.
     eprintln!("serving {} at {url}", root.display());
     eprintln!("(Ctrl-C to stop)");
-    let serve_py = root.join("scripts/serve.py");
-    let mut cmd = std::process::Command::new(&python);
-    if serve_py.exists() {
-        cmd.arg("scripts/serve.py").arg(args.port.to_string());
-    } else {
-        cmd.args(["-m", "http.server", &args.port.to_string()]);
-    }
-    let mut child = cmd
-        .current_dir(root)
-        .spawn()
-        .with_context(|| format!("starting static server via {python}"))?;
 
     if !args.no_open {
-        // Let the server bind, then best-effort open a browser.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        for opener in ["xdg-open", "open"] {
-            if std::process::Command::new(opener).arg(&url).spawn().is_ok() {
-                break;
+        let open_url = url.clone();
+        std::thread::spawn(move || {
+            // Let the server bind, then best-effort open a browser.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            for opener in ["xdg-open", "open"] {
+                if std::process::Command::new(opener).arg(&open_url).spawn().is_ok() {
+                    break;
+                }
             }
-        }
+        });
     }
 
-    let status = child.wait().context("waiting on http server")?;
-    if !status.success() {
-        anyhow::bail!("http server exited with status {status}");
+    serve_static(root, args.port)
+}
+
+/// Minimal native static file server (no Python): serves files under `root`
+/// with no-cache headers, so edited viewer.js / regenerated packs show up on a
+/// plain reload. HTTP/1.0, GET only, a thread per connection — enough for the
+/// browser's parallel mesh fetches. Blocks until interrupted.
+fn serve_static(root: &Path, port: u16) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+    let root = root.to_path_buf();
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let peek = match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut reader = BufReader::new(peek);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                return;
+            }
+            // Drain the remaining request headers (avoids a reset on close).
+            loop {
+                let mut h = String::new();
+                match reader.read_line(&mut h) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if h == "\r\n" || h == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let raw = line.split_whitespace().nth(1).unwrap_or("/");
+            let path = raw.split(['?', '#']).next().unwrap_or("/");
+            let rel = path.trim_start_matches('/');
+            let rel = if rel.is_empty() { "viewer/index.html" } else { rel };
+            let body = if rel.contains("..") {
+                None // reject path traversal
+            } else {
+                std::fs::read(root.join(rel)).ok()
+            };
+            match body {
+                Some(bytes) => {
+                    let hdr = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+                         Cache-Control: no-store, no-cache, must-revalidate\r\nConnection: close\r\n\r\n",
+                        content_type(rel),
+                        bytes.len(),
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&bytes);
+                }
+                None => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
     }
     Ok(())
 }
 
-/// First working `python3`/`python` on PATH (for the static server).
-fn which_python() -> Result<String> {
-    for cand in ["python3", "python"] {
-        let ok = std::process::Command::new(cand)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            return Ok(cand.to_string());
-        }
+/// Content-Type for a file path, by extension.
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "obj" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
     }
-    anyhow::bail!("no python3/python on PATH (needed for the viewer's static file server)")
 }
 
 // ───── compare ──────────────────────────────────────────────────────

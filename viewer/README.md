@@ -17,8 +17,8 @@ cargo run --release -p parsimony-cli -- viewer --port 9000 --no-open           #
 `parsimony viewer`:
 1. Optionally packs `--recipe` to `viewer/data/latest.pack.json` (or
    opens an existing `--pack`).
-2. Serves the project root over a no-cache static server
-   (`scripts/serve.py`; falls back to Python's stdlib server).
+2. Serves the project root over its own native no-cache static server
+   (built into the CLI — no Python).
 3. Opens your browser to the viewer, deep-linking the pack via `?file=`.
 
 Press Ctrl-C to stop the server.
@@ -51,4 +51,4 @@ This local viewer is:
 
 - `index.html` — UI + importmap referencing three.js from a CDN.
 - `viewer.js` — scene, instanced rendering, UI wiring.
-- `data/` — staging area for `parsimony viewer` / `demos` (gitignore as needed).
+- `data/` — staging area for `parsimony viewer` / `demos`; `*.pack.json` are gitignored (regenerated).
