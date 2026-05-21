@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use parsimony_core::{
-    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer, Pipeline,
-    PlacerConfig, PlacerOutcome, Recipe,
+    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
+    PlacementBackend, Pipeline, PlacerConfig, PlacerOutcome, Recipe,
 };
 
 #[derive(Debug, Parser)]
@@ -34,12 +34,19 @@ enum Command {
     Pack(PackArgs),
     /// Regenerate (or list) the viewer demo packs in viewer/data/.
     Demos(DemosArgs),
-    /// Pack-and-serve the local three.js viewer (supersedes view_pack.sh).
+    /// Pack-and-serve the local three.js viewer in the browser.
     Viewer(ViewerArgs),
     /// Pack a recipe and compare it against cellPACK (validation).
     Compare(CompareArgs),
     /// Generate mesh LODs from PDB/CIF structures (PDB → SDF → OBJ LODs).
     Mesh(MeshArgs),
+    /// Translate the whole-cell Mycoplasma recipe + meshes from the cellPACK
+    /// data repo (clones it on first run) into a parsimony recipe.
+    TranslateMycoplasma(TranslateMycoplasmaArgs),
+    /// Render a Simularium file to a static PNG (the report images).
+    Render(RenderArgs),
+    /// Open this repo's REPORT.md as a live preview, or export it to HTML.
+    Report(ReportArgs),
     /// Run a staged packing pipeline (DAG + content-addressed cache).
     Pipeline(PipelineArgs),
 }
@@ -73,6 +80,31 @@ struct PackArgs {
     /// compartments are always strict regardless of this flag.
     #[arg(long)]
     loose_bounds: bool,
+
+    /// Interior-placement engine. `legacy` (default) is cellPACK-style:
+    /// a dense clearance grid + a valid-cell list rebuilt per directive.
+    /// `octree` shares one content-scaled sparse occupancy tree across all
+    /// directives — ~5× faster on whole-cell recipes, and the engine that
+    /// scales to far larger / sparser domains.
+    #[arg(long, value_enum, default_value_t = Backend::Legacy)]
+    backend: Backend,
+}
+
+/// CLI mirror of [`PlacementBackend`] (keeps `clap` out of parsimony-core).
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum Backend {
+    #[default]
+    Legacy,
+    Octree,
+}
+
+impl From<Backend> for PlacementBackend {
+    fn from(b: Backend) -> Self {
+        match b {
+            Backend::Legacy => PlacementBackend::Legacy,
+            Backend::Octree => PlacementBackend::Octree,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -104,7 +136,42 @@ fn main() -> Result<()> {
         Command::Viewer(args) => run_viewer(args),
         Command::Compare(args) => run_compare(args),
         Command::Mesh(args) => run_mesh(args),
+        Command::TranslateMycoplasma(args) => run_translate_mycoplasma(args),
+        Command::Render(args) => run_render(args),
+        Command::Report(args) => run_report(args),
         Command::Pipeline(args) => run_pipeline(args),
+    }
+}
+
+/// Error unless `uv` is on PATH (drives the bundled scientific-Python
+/// helpers — PDB meshing, the Mycoplasma translator, report rendering).
+fn ensure_uv() -> Result<()> {
+    let ok = std::process::Command::new("uv")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "`uv` not on PATH — needed for the bundled Python helpers \
+             (https://docs.astral.sh/uv/)"
+        )
+    }
+}
+
+/// Error unless `git` is on PATH (used to clone upstream data repos).
+fn ensure_git() -> Result<()> {
+    let ok = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("`git` not on PATH — needed to clone the cellPACK data repo")
     }
 }
 
@@ -123,6 +190,7 @@ fn run_pack(args: PackArgs) -> Result<()> {
 
     let placer_config = PlacerConfig {
         strict_bounds: !args.loose_bounds,
+        backend: args.backend.into(),
         ..PlacerConfig::default()
     };
     let t = Instant::now();
@@ -131,6 +199,13 @@ fn run_pack(args: PackArgs) -> Result<()> {
     let elapsed = t.elapsed();
 
     if !args.quiet {
+        eprintln!(
+            "backend: {}",
+            match args.backend {
+                Backend::Legacy => "legacy (clearance grid + valid-cells)",
+                Backend::Octree => "octree (sparse occupancy, content-scaled)",
+            }
+        );
         eprintln!(
             "packed: {}/{} instances in {:.2?}  ({:.0}%)",
             out.stats.placed,
@@ -258,16 +333,18 @@ enum DemosAction {
     List,
 }
 
-/// Load + pack one recipe. Shared by `pack` and `demos`.
+/// Load + pack one recipe. Shared by `pack`, `demos`, `viewer`, `compare`.
 fn pack_recipe(
     recipe_path: &Path,
     seed: u64,
     loose_bounds: bool,
+    backend: PlacementBackend,
 ) -> Result<(Recipe, PlacerOutcome)> {
     let recipe = Recipe::from_file(recipe_path)
         .with_context(|| format!("loading recipe `{}`", recipe_path.display()))?;
     let config = PlacerConfig {
         strict_bounds: !loose_bounds,
+        backend,
         ..PlacerConfig::default()
     };
     let placer = GreedyRandomPlacer::new(&recipe, config);
@@ -308,7 +385,7 @@ fn run_demos(args: DemosArgs) -> Result<()> {
                 None
             } else {
                 eprint!("  pack   {:<16} … ", d.id);
-                match pack_recipe(&recipe_path, args.seed, d.loose_bounds) {
+                match pack_recipe(&recipe_path, args.seed, d.loose_bounds, PlacementBackend::Legacy) {
                     Ok((recipe, out)) => {
                         let value = write_pack_json(&out.snapshot, &recipe);
                         fs::write(&out_path, serde_json::to_string_pretty(&value)?)
@@ -364,10 +441,10 @@ fn placement_count(path: &Path) -> Result<usize> {
 
 // ───── viewer ───────────────────────────────────────────────────────
 // Pack-and-serve front end for the local three.js viewer. Serves the
-// project root over Python's stdlib http.server (no extra deps) so the
-// viewer can fetch root-relative mesh URLs like /examples/pdb_meshes/…,
-// then opens a browser. Supersedes scripts/view_pack.sh; mesh
-// (re)generation is `parsimony mesh …`, kept out of this path.
+// project root over a static server (no extra deps) so the viewer can
+// fetch root-relative mesh URLs like /examples/pdb_meshes/…, then opens
+// a browser. Mesh (re)generation is `parsimony mesh` /
+// `translate-mycoplasma`, kept out of this path.
 #[derive(Debug, Parser)]
 struct ViewerArgs {
     /// Pack this recipe to viewer/data/latest.pack.json and open it.
@@ -410,7 +487,8 @@ fn run_viewer(args: ViewerArgs) -> Result<()> {
             root.join(recipe)
         };
         eprintln!("packing {} …", recipe_path.display());
-        let (recipe_doc, out) = pack_recipe(&recipe_path, args.seed, args.loose_bounds)?;
+        let (recipe_doc, out) =
+            pack_recipe(&recipe_path, args.seed, args.loose_bounds, PlacementBackend::Legacy)?;
         let data_dir = root.join("viewer/data");
         fs::create_dir_all(&data_dir)?;
         let out_path = data_dir.join("latest.pack.json");
@@ -530,17 +608,30 @@ fn run_compare(args: CompareArgs) -> Result<()> {
     fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("creating {}", args.out_dir.display()))?;
 
-    // Parsimony — packed in-process (no subprocess, no hardcoded binary).
-    eprintln!("packing parsimony…");
-    let t = Instant::now();
-    let (recipe, out) = pack_recipe(&args.recipe, args.seed, !args.strict_bounds)?;
-    let psy_elapsed = t.elapsed();
-    let psy_path = args.out_dir.join("parsimony.simularium");
-    let sim = write_simularium_json(&out.snapshot, &recipe);
-    fs::write(&psy_path, serde_json::to_string(&sim)?)
-        .with_context(|| format!("writing {}", psy_path.display()))?;
-    let psy_doc = SimulariumDoc::from_json(&fs::read_to_string(&psy_path)?, "parsimony")?;
-    eprintln!("  {} placements in {:.2?}", psy_doc.agents.len(), psy_elapsed);
+    // Parsimony — packed in-process with *both* backends, so the table puts
+    // the cellPACK-method engine (legacy) and the content-scaled one
+    // (octree) side by side against cellPACK itself.
+    let pack_backend = |backend: PlacementBackend,
+                        label: &'static str,
+                        file: &str|
+     -> Result<(SimulariumDoc, std::time::Duration)> {
+        eprintln!("packing parsimony ({label})…");
+        let t = Instant::now();
+        let (recipe, out) = pack_recipe(&args.recipe, args.seed, !args.strict_bounds, backend)?;
+        let elapsed = t.elapsed();
+        let path = args.out_dir.join(file);
+        let sim = write_simularium_json(&out.snapshot, &recipe);
+        fs::write(&path, serde_json::to_string(&sim)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        let doc = SimulariumDoc::from_json(&fs::read_to_string(&path)?, label)?;
+        eprintln!("  {} placements in {:.2?}", doc.agents.len(), elapsed);
+        Ok((doc, elapsed))
+    };
+
+    let (legacy_doc, legacy_el) =
+        pack_backend(PlacementBackend::Legacy, "legacy", "parsimony_legacy.simularium")?;
+    let (octree_doc, octree_el) =
+        pack_backend(PlacementBackend::Octree, "octree", "parsimony_octree.simularium")?;
 
     // cellPACK — only if its venv python is present.
     let py = args.cellpack.join(".venv/bin/python");
@@ -575,27 +666,36 @@ fn run_compare(args: CompareArgs) -> Result<()> {
 
     // Report.
     println!("\n=== compare: {} ===\n", args.recipe.display());
-    println!("{:<12} {:>12} {:>12}", "engine", "placements", "wall");
-    println!("{:-<12} {:->12} {:->12}", "", "", "");
-    println!("{:<12} {:>12} {:>12.2?}", "parsimony", psy_doc.agents.len(), psy_elapsed);
+    println!("{:<18} {:>12} {:>12}", "engine", "placements", "wall");
+    println!("{:-<18} {:->12} {:->12}", "", "", "");
+    println!("{:<18} {:>12} {:>12.2?}", "parsimony-legacy", legacy_doc.agents.len(), legacy_el);
+    println!("{:<18} {:>12} {:>12.2?}", "parsimony-octree", octree_doc.agents.len(), octree_el);
     if let Some((cp_doc, cp_el)) = &cp {
-        println!("{:<12} {:>12} {:>12.2?}", "cellpack", cp_doc.agents.len(), cp_el);
-        println!("\nper-radius counts:");
-        println!("{:>10} {:>12} {:>12} {:>9}", "radius", "cellpack", "parsimony", "%diff");
+        println!("{:<18} {:>12} {:>12.2?}", "cellpack", cp_doc.agents.len(), cp_el);
+        let secs = |d: std::time::Duration| d.as_secs_f64().max(1e-9);
+        println!(
+            "\nspeedup vs cellpack:  legacy {:.0}×   octree {:.0}×",
+            secs(*cp_el) / secs(legacy_el),
+            secs(*cp_el) / secs(octree_el),
+        );
+        println!("\nper-radius counts (cellpack vs parsimony-legacy):");
+        println!("{:>10} {:>12} {:>12} {:>9}", "radius", "cellpack", "legacy", "%diff");
         println!("{:->10} {:->12} {:->12} {:->9}", "", "", "", "");
-        for r in compare_counts(cp_doc, &psy_doc) {
+        for r in compare_counts(cp_doc, &legacy_doc) {
             println!(
                 "{:>10.2} {:>12} {:>12} {:>+8.1}%",
                 r.radius, r.a_count, r.b_count, r.pct_diff(),
             );
         }
     }
-    let ps = distribution_stats(&psy_doc.agents);
     println!("\nposition stddev (x, y, z):");
-    println!("  parsimony ({:.1}, {:.1}, {:.1})", ps.stddev[0], ps.stddev[1], ps.stddev[2]);
+    let pl = distribution_stats(&legacy_doc.agents);
+    let po = distribution_stats(&octree_doc.agents);
+    println!("  parsimony-legacy ({:.1}, {:.1}, {:.1})", pl.stddev[0], pl.stddev[1], pl.stddev[2]);
+    println!("  parsimony-octree ({:.1}, {:.1}, {:.1})", po.stddev[0], po.stddev[1], po.stddev[2]);
     if let Some((cp_doc, _)) = &cp {
         let cs = distribution_stats(&cp_doc.agents);
-        println!("  cellpack  ({:.1}, {:.1}, {:.1})", cs.stddev[0], cs.stddev[1], cs.stddev[2]);
+        println!("  cellpack         ({:.1}, {:.1}, {:.1})", cs.stddev[0], cs.stddev[1], cs.stddev[2]);
     }
     Ok(())
 }
@@ -625,11 +725,7 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
     if !script.exists() {
         anyhow::bail!("{} not found — run `parsimony mesh` from the repo root", script.display());
     }
-    if std::process::Command::new("uv").arg("--version").output().is_err() {
-        anyhow::bail!(
-            "`uv` not on PATH — needed for the PDB→mesh script (https://docs.astral.sh/uv/)"
-        );
-    }
+    ensure_uv()?;
     let lods: Vec<f32> = args
         .lods
         .split(',')
@@ -704,6 +800,268 @@ fn run_mesh(args: MeshArgs) -> Result<()> {
     Ok(())
 }
 
+// ───── translate-mycoplasma ──────────────────────────────────────────
+// The whole-cell Mycoplasma recipe comes from the cellPACK data repo
+// (Maritan et al.). This subcommand folds the two manual steps — clone
+// the data repo, then run the translator — into one command, the same
+// way `mesh` wraps pdb_to_mesh.py. The translator itself (recipe walk +
+// batch marching-cubes meshing) stays in scripts/translate_mycoplasma.py
+// because it shares pdb_to_mesh.py's scientific-Python deps via uv. Run
+// from the repo root.
+#[derive(Debug, Parser)]
+struct TranslateMycoplasmaArgs {
+    /// Git URL of the cellPACK Mycoplasma data repo.
+    #[arg(long, default_value = "https://github.com/ccsb-scripps/MycoplasmaGenitalium")]
+    data_repo: String,
+
+    /// Where to clone / find the data repo (its `cellPACK_Data/` is used).
+    #[arg(long, default_value = ".cache/MycoplasmaGenitalium")]
+    cache_dir: PathBuf,
+
+    /// Output parsimony recipe path.
+    #[arg(long, default_value = "examples/recipes/mycoplasma_full.json")]
+    out_recipe: PathBuf,
+
+    /// Output directory for the generated per-protein LOD meshes.
+    #[arg(long, default_value = "examples/pdb_meshes/mycoplasma")]
+    out_meshes: PathBuf,
+
+    /// LOD voxel sizes in Å (coarse→fine), comma-separated.
+    #[arg(long, default_value = "16,8,4,2.5")]
+    lods: String,
+
+    /// Most-abundant interior species to include (0 = all; 30 = the demo).
+    #[arg(long, default_value_t = 0)]
+    top_n: u32,
+}
+
+fn run_translate_mycoplasma(args: TranslateMycoplasmaArgs) -> Result<()> {
+    let script = Path::new("scripts/translate_mycoplasma.py");
+    if !script.exists() {
+        anyhow::bail!(
+            "{} not found — run `parsimony translate-mycoplasma` from the repo root",
+            script.display()
+        );
+    }
+    ensure_uv()?;
+
+    // Clone the data repo if its data dir is missing (idempotent otherwise).
+    let data_dir = args.cache_dir.join("cellPACK_Data");
+    if data_dir.exists() {
+        eprintln!("using cellPACK data at {}", data_dir.display());
+    } else {
+        ensure_git()?;
+        if let Some(parent) = args.cache_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        eprintln!("cloning {} → {}", args.data_repo, args.cache_dir.display());
+        let st = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", &args.data_repo])
+            .arg(&args.cache_dir)
+            .status()
+            .context("running git clone")?;
+        if !st.success() {
+            anyhow::bail!("git clone failed ({st})");
+        }
+    }
+
+    fs::create_dir_all(&args.out_meshes)?;
+    if let Some(parent) = args.out_recipe.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+
+    eprintln!(
+        "translating mycoplasma (top-n {}, lods {}) → {}",
+        args.top_n,
+        args.lods,
+        args.out_recipe.display()
+    );
+    let st = std::process::Command::new("uv")
+        .arg("run")
+        .arg(script)
+        .arg("--cellpack-data")
+        .arg(&data_dir)
+        .arg("--out-recipe")
+        .arg(&args.out_recipe)
+        .arg("--out-meshes")
+        .arg(&args.out_meshes)
+        .arg("--lods")
+        .arg(&args.lods)
+        .arg("--top-n")
+        .arg(args.top_n.to_string())
+        .status()
+        .context("running translate_mycoplasma.py via uv")?;
+    if !st.success() {
+        anyhow::bail!("mycoplasma translation failed ({st})");
+    }
+    eprintln!(
+        "wrote recipe {} and meshes under {}",
+        args.out_recipe.display(),
+        args.out_meshes.display()
+    );
+    Ok(())
+}
+
+// ───── render ────────────────────────────────────────────────────────
+// Static PNG renderer for the report images. Wraps
+// scripts/render_simularium.py (matplotlib via uv) so the report figures
+// regenerate through the CLI rather than a loose `uv run` invocation.
+#[derive(Debug, Parser)]
+struct RenderArgs {
+    /// Input `.simularium` file (pack with `--format simularium` first).
+    input: PathBuf,
+
+    /// Output `.png` path.
+    output: PathBuf,
+
+    /// Figure title.
+    #[arg(long, default_value = "parsimony pack")]
+    title: String,
+
+    /// Cross-section axis (`x`/`y`/`z`); omit for the full volume.
+    #[arg(long)]
+    slice: Option<String>,
+
+    /// Slice thickness in Å (used with `--slice`).
+    #[arg(long, default_value_t = 50.0)]
+    slice_thickness: f32,
+}
+
+fn run_render(args: RenderArgs) -> Result<()> {
+    let script = Path::new("scripts/render_simularium.py");
+    if !script.exists() {
+        anyhow::bail!(
+            "{} not found — run `parsimony render` from the repo root",
+            script.display()
+        );
+    }
+    ensure_uv()?;
+    if let Some(parent) = args.output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut cmd = std::process::Command::new("uv");
+    cmd.arg("run")
+        .arg(script)
+        .arg(&args.input)
+        .arg(&args.output)
+        .arg("--title")
+        .arg(&args.title)
+        .arg("--slice-thickness")
+        .arg(args.slice_thickness.to_string());
+    if let Some(s) = &args.slice {
+        cmd.arg("--slice").arg(s);
+    }
+    let st = cmd.status().context("running render_simularium.py via uv")?;
+    if !st.success() {
+        anyhow::bail!("render failed ({st})");
+    }
+    eprintln!("wrote {}", args.output.display());
+    Ok(())
+}
+
+// ───── report ────────────────────────────────────────────────────────
+// Folds scripts/view_report.sh: a live grip preview by default, or a
+// standalone HTML export with `--html` (pandoc, falling back to grip's
+// exporter). The images live in docs/img/ and are referenced with
+// relative paths, so any renderer that resolves them shows the figures.
+#[derive(Debug, Parser)]
+struct ReportArgs {
+    /// Markdown file to render.
+    #[arg(default_value = "docs/REPORT.md")]
+    file: PathBuf,
+
+    /// Export a standalone HTML file instead of opening a live preview.
+    #[arg(long)]
+    html: bool,
+
+    /// Output path for `--html` (default: the input with a `.html` extension).
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// With `--html`, open the generated file in a browser afterward.
+    #[arg(long)]
+    open: bool,
+}
+
+fn run_report(args: ReportArgs) -> Result<()> {
+    if !args.file.exists() {
+        anyhow::bail!("{} not found", args.file.display());
+    }
+
+    if !args.html {
+        // Live preview via grip (GitHub-style, ephemeral uv venv).
+        ensure_uv()?;
+        eprintln!(
+            "previewing {} via grip — open the printed URL; Ctrl-C to stop",
+            args.file.display()
+        );
+        let st = std::process::Command::new("uv")
+            .args(["tool", "run", "--from", "grip", "grip"])
+            .arg(&args.file)
+            .status()
+            .context("running grip via uv")?;
+        if !st.success() {
+            anyhow::bail!("grip exited with status {st}");
+        }
+        return Ok(());
+    }
+
+    // HTML export. Default output is the markdown path with a .html suffix.
+    let out = args
+        .out
+        .unwrap_or_else(|| args.file.with_extension("html"));
+    let has = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    if has("pandoc") {
+        eprintln!("rendering {} → {} (pandoc)", args.file.display(), out.display());
+        let st = std::process::Command::new("pandoc")
+            .arg(&args.file)
+            .arg("-o")
+            .arg(&out)
+            .arg("--standalone")
+            .arg("--metadata")
+            .arg("title=parsimony — feature status")
+            .arg("--css=https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown-light.min.css")
+            .status()
+            .context("running pandoc")?;
+        if !st.success() {
+            anyhow::bail!("pandoc exited with status {st}");
+        }
+    } else if has("uv") {
+        eprintln!("rendering {} → {} (grip --export)", args.file.display(), out.display());
+        let st = std::process::Command::new("uv")
+            .args(["tool", "run", "--from", "grip", "grip"])
+            .arg(&args.file)
+            .arg("--export")
+            .arg(&out)
+            .status()
+            .context("running grip --export via uv")?;
+        if !st.success() {
+            anyhow::bail!("grip --export exited with status {st}");
+        }
+    } else {
+        anyhow::bail!(
+            "need `pandoc` or `uv` for --html (install pandoc, or uv for grip)"
+        );
+    }
+    eprintln!("wrote {}", out.display());
+
+    if args.open {
+        for opener in ["xdg-open", "open"] {
+            if std::process::Command::new(opener).arg(&out).spawn().is_ok() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ───── pipeline ──────────────────────────────────────────────────────
 // Staged packing as a small build system: a pipeline file lists stages
 // (chromosome / pack-subset) with dependencies; each stage's partial
@@ -745,6 +1103,20 @@ enum PipelineAction {
     Status {
         /// Pipeline JSON file.
         file: PathBuf,
+        /// Stage cache directory. Default: <root>/.parsimony/cache.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Project root (for the default cache location).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Empty the staged cache so the next `run` repacks every stage from
+    /// scratch. (`run --force` recomputes but keeps writing into the cache;
+    /// this deletes it entirely — a true "start over".)
+    Clean {
+        /// Pipeline JSON file. Optional and unused — accepted only so
+        /// `clean` takes the same argument as `run`/`status`.
+        file: Option<PathBuf>,
         /// Stage cache directory. Default: <root>/.parsimony/cache.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
@@ -851,6 +1223,21 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
                     s.kind,
                     s.depends_on.join(",")
                 );
+            }
+            Ok(())
+        }
+        PipelineAction::Clean {
+            file: _,
+            cache_dir,
+            root,
+        } => {
+            let cache_dir = cache_dir.unwrap_or_else(|| root.join(".parsimony/cache"));
+            if cache_dir.exists() {
+                fs::remove_dir_all(&cache_dir)
+                    .with_context(|| format!("removing {}", cache_dir.display()))?;
+                eprintln!("pipeline: cleared cache {}", cache_dir.display());
+            } else {
+                eprintln!("pipeline: cache already empty ({})", cache_dir.display());
             }
             Ok(())
         }

@@ -24,7 +24,9 @@ pub use pipeline::{
     Pipeline, PipelineError, PipelineRun, Stage, StageKind, StagePlan, StageReport,
 };
 pub use placement::{Op, Placement, ReplaceChange, Snapshot, VariantId};
-pub use placer::{GreedyRandomPlacer, PlacerConfig, PlacerOutcome, PlacerStats};
+pub use placer::{
+    GreedyRandomPlacer, PlacementBackend, PlacerConfig, PlacerOutcome, PlacerStats,
+};
 pub use recipe::{
     PackingMode, PlacementDirective, Recipe, RecipeError, RegionKind,
 };

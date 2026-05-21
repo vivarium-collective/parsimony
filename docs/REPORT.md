@@ -1,31 +1,32 @@
 # parsimony — feature status
 
-**Date:** 2026-05-18 · **Tests passing:** 136 · **Workspace crates:** 4
+**Date:** 2026-05-20 · **Tests passing:** 162 · **Workspace crates:** 5
 
 A Rust reimagining of cellPACK. Reads cellPACK v2 JSON recipes, packs
-molecular ingredients into compartments using a uniform clearance grid
-+ per-directive valid-cell lists + slack-bounded jitter, emits
-Simularium JSON for the cellpack.allencell.org viewer.
+molecular ingredients into compartments, and emits its own pack format
+(plus optional Simularium export). Two interchangeable placement
+engines: a **clearance grid + per-directive valid-cell lists +
+slack-bounded jitter** (cellPACK's method, `--backend legacy`, the
+default) and a **content-scaled sparse occupancy octree**
+(`--backend octree`) that shares one tree across all directives —
+~5× faster at whole-cell scale. See *Performance* below.
 
 > **Viewing this report on Ubuntu:** the embedded PNGs in
 > `docs/img/` are referenced with standard markdown image syntax
 > (`![alt](img/foo.png)`), so any markdown renderer that resolves
 > relative paths will show them.
 >
-> Easiest: **`./scripts/view_report.sh`** — if `uv` is on PATH it
-> runs `uv tool run grip` (GitHub-style render in a local web server,
-> ephemeral venv, no global install). Falls back to a system grip /
-> pandoc / VSCode if uv isn't available.
+> Easiest: **`parsimony report`** — a live grip preview (GitHub-style,
+> ephemeral uv venv, no global install). Or export a standalone file
+> with **`parsimony report --html --open`** (pandoc if present, else
+> grip's exporter). Both resolve the relative image paths.
 >
 > Manual options:
 >
-> - **uv + grip** (recommended; one command, no global pollution):
+> - **uv + grip** (one command, no global pollution):
 >   `uvx grip docs/REPORT.md` → opens `http://localhost:6419`.
 > - **VSCode**: `code docs/REPORT.md`, then Ctrl+Shift+V (or Ctrl+K V
 >   for side-by-side).
-> - **pandoc → HTML**:
->   `sudo apt install pandoc && pandoc docs/REPORT.md -o docs/REPORT.html --standalone --metadata title=parsimony`
->   then `xdg-open docs/REPORT.html`.
 > - **gnome-text-editor / typora / obsidian** — open the file from
 >   inside this repo so the relative image paths resolve.
 
@@ -114,11 +115,12 @@ recipe: mycoplasma_genitalium (643 ingredient types, 643 directives, 41,623 inst
 Translated from [ccsb-scripps/MycoplasmaGenitalium](https://github.com/ccsb-scripps/MycoplasmaGenitalium)
 (the cellPACK data backing Maritan, Singla, Autin, Karr, Covert,
 Olson & Goodsell, *J Mol Biol* 2022, "Building Structural Models of
-a Whole Mycoplasma Cell"). The translator `scripts/translate_mycoplasma.py`
-walks their JSON recipe, finds the structure file for every species,
-batch-converts them to Van der Waals meshes via
-`scripts/pdb_to_mesh.py` (marching cubes on an atomic SDF at 2.5 Å
-resolution), and emits a parsimony recipe.
+a Whole Mycoplasma Cell"). `parsimony translate-mycoplasma` clones that
+data repo, walks their JSON recipe, finds the structure file for every
+species, batch-converts them to Van der Waals meshes (marching cubes on
+an atomic SDF), and emits a parsimony recipe — folding what used to be a
+manual `git clone` + `scripts/translate_mycoplasma.py` invocation into
+one command.
 
 - **Interior**: 546 cytoplasmic species placed inside the cell sphere.
 - **Surface**: 96 membrane proteins placed on the cell-sphere boundary
@@ -143,65 +145,120 @@ and warrants its own pipeline.
 
 ## Performance vs cellPACK
 
-Same recipe, same single thread, same machine
-(Linux 6.8, Tuxedo workstation). Each engine packs `spheres_in_a_box`
-(630 instances requested: 60 sphere_100 + 20 sphere_200 + 150
-sphere_50 + 400 sphere_25 into a 1000³ box).
+Two comparisons, both single-threaded on the same machine (Linux 6.8,
+Tuxedo workstation):
 
-| | parsimony (loose-bounds) | cellPACK (Python, jitter mode) | ratio |
+1. **vs the original cellPACK** on recipes small enough for cellPACK to
+   finish — the apples-to-apples validation that we pack the *same*
+   thing, much faster.
+2. **legacy vs octree backend** at whole-cell scale, where cellPACK
+   doesn't realistically run — the comparison that motivates the new
+   engine.
+
+Reproduce #1 with `parsimony compare <recipe>` (packs both backends in
+process, runs cellPACK from `../cellpack/.venv`, prints the table); #2
+with `parsimony pack <recipe> --backend legacy|octree`.
+
+### 1 · vs original cellPACK
+
+`spheres_in_a_box` — cellPACK's classic dense benchmark (630 requested:
+60 sphere_100 + 20 sphere_200 + 150 sphere_50 + 400 sphere_25 in a
+1000³ box). parsimony in loose-bounds mode to match cellPACK's
+centre-in-box containment:
+
+| | parsimony legacy (loose) | cellPACK (Python, jitter) | ratio |
 |---|---|---|---|
-| **Wall time** | **~11 ms** | **31.5 s** | **~2 900× faster** |
+| **Wall time** | **13.3 ms** | **31.5 s** | **~2 400× faster** |
 | Placements | 612/630 (97%) | 613/630 (97%) | matched |
-| Attempts | 614 | many thousands (every cell-rejection retries) | ~10–100× fewer |
-| Sample success rate | 99.7% | ≪10% on dense recipes | grid is authoritative |
-| Per-ingredient (sphere_200) | 13/20 | 18/20 | within rounding |
-| Per-ingredient (sphere_100) | 49/60 | 45/60 | within rounding |
-| Throughput | ~56 000 placements/sec | ~20 placements/sec | ~2 800× |
+| Attempts | 614 | many thousands (each cell-rejection retries) | ~10–100× fewer |
+| Sample success | 99.7% | ≪10% on dense recipes | grid is authoritative |
+| sphere_200 | 13/20 | 18/20 | within rounding |
+| sphere_100 | 49/60 | 45/60 | within rounding |
 
-Three parsimony runs at different seeds (loose-bounds, release build):
-
-```
-seed=1: 608/630 in 12.46ms  attempts 610, success 99.7%
-seed=2: 614/630 in 10.14ms  attempts 616, success 99.7%
-seed=3: 610/630 in 12.08ms  attempts 612, success 99.7%
-```
-
-cellPACK on the same recipe and seed (one run, default config):
+`one_sphere` — the trivial single-placement recipe, run live through
+`parsimony compare` (both backends + cellPACK):
 
 ```
-real    0m31.544s
-user    0m12.162s
-sys     0m21.620s
+parsimony-legacy   1 placement   ~0.3–2 ms
+parsimony-octree   1 placement   ~0.5–2 ms
+cellpack           1 placement   ~4–6 s
 ```
 
-### Where the speed comes from
+On a trivial recipe the gap is even wider (thousands ×) and noisy —
+cellPACK's multi-second Python/NumPy startup alone dwarfs parsimony's
+sub-millisecond pack. The representative figure is the dense
+`spheres_in_a_box` above: matched density, ~2 400× the speed. (cellPACK's
+`spheres_in_a_box` run is flaky to launch headless on this box; its
+31.5 s is the established prior measurement, so the live `compare`
+corroboration uses `one_sphere`.)
 
-The 2 900× isn't an accident. cellPACK is Python with NumPy hot loops;
-parsimony is release-mode Rust. But the algorithmic differences
-matter at least as much:
+#### Where the speed comes from
 
-- **Sample success rate.** cellPACK admits cells where the sphere
-  *might* fit and verifies with a per-attempt grid scan. Most attempts
-  fail and retry — orders of magnitude more iterations than placements.
-  parsimony's strict `clearance ≥ radius` filter + slack-bounded jitter
-  means the grid is authoritative, so every iteration commits.
-- **No per-attempt collision check.** Interior placements skip the
-  QBVH (and cellPACK's grid scan) entirely. The invariant in the
-  jitter bound proves no overlap can happen.
-- **f32 distance grid, not quantised.** cellPACK stores `distToClosestSurf`
-  as floats too, but their per-attempt `collision_jitter` scans O(radius³/cell³)
-  grid points per placement. parsimony does one `min(stored, |c−p|−r)`
-  pass over the affected cells at placement time, then nothing per attempt.
-- **QBVH broad-phase** for the Surface-region collision check
-  (Interior skips it). cellPACK uses a brute / grid-scan combo.
-- **Sphere-tree pairwise check** is exact and tight; no quantization,
+cellPACK is Python with NumPy hot loops; parsimony is release-mode
+Rust. But the algorithmic differences matter at least as much:
+
+- **Sample success.** cellPACK admits cells where the sphere *might*
+  fit and verifies with a per-attempt grid scan; most attempts fail and
+  retry. The legacy backend's strict `clearance ≥ radius` filter +
+  slack-bounded jitter makes the grid authoritative — every iteration
+  commits.
+- **No per-attempt collision check (legacy).** Interior placements skip
+  the QBVH and cellPACK's grid scan entirely; the jitter bound proves
+  no overlap can happen.
+- **f32 distance grid, not quantised.** cellPACK's per-attempt
+  `collision_jitter` scans O(radius³/cell³) grid points per placement;
+  parsimony does one `min(stored, |c−p|−r)` pass over the affected
+  cells at placement time, then nothing per attempt.
+- **Sphere-tree pairwise check** is exact and tight — no quantization,
   no extraneous overlap tolerance.
 
-The throughput leaves comfortable headroom for the bigger recipes
-that will follow (Mycoplasma's ~9 M atoms, etc.).
-The clearance grid currently caps at 500 cells per axis (≈ 500 MB
-worst case f32 storage) — that becomes the next bottleneck before
-the algorithm does.
+### 2 · legacy vs octree at whole-cell scale
+
+Both backends pack the full cell — legacy isn't broken. The octree is an
+*optimisation*, and (correcting an earlier draft of this report) the win
+is **not** the clearance grid's 500-cells/axis memory cap: that cap is
+never reached here. The largest complex's ~374 Å enclosing radius sets a
+~55 Å cell, so the mycoplasma grid is only ~74³ ≈ 405k cells (~1.6 MB) —
+coarse and small, nowhere near the 500³ ceiling.
+
+What costs the legacy engine at this scale is per-directive,
+grid-resolution work the octree avoids:
+
+- It (re)builds a **per-directive** valid-cell list (cellPACK's
+  `allIngrPts`), and because that grid (~405k cells) is below the
+  `MAX_VALID_CELLS` (500k) fast-path threshold, each build is a **full
+  scan of the whole compartment grid** — repeated for all 630 directives
+  and again whenever a directive's list empties.
+- Every placement updates a grid neighbourhood sized by
+  `r + max_required_radius`, i.e. by the **largest** ingredient (~374 Å)
+  even for a tiny protein.
+
+The octree shares **one** tree across all directives and touches only the
+occupied/free frontier of each actual sphere — so it sidesteps both. A
+*bigger/finer* grid would slow legacy down and cost more memory, not
+speed it up; the dense grid's volume-scaled memory only bites at far
+larger or sparser domains (tissue scale), which is where the octree's
+content scaling becomes load-bearing rather than merely faster. Both
+backends, seed 0, `parsimony pack`:
+
+| recipe (requested) | backend | placed | pack time | peak RAM | sample success |
+|---|---|---|---|---|---|
+| top-30 (50,313) | legacy | 50,248 (99.9%) | 74.8 s | 1.05 GB | 99.7% |
+| top-30 (50,313) | **octree** | **50,313 (100%)** | **15.5 s** | 1.50 GB | 62.9% |
+| full (65,154) | legacy | 59,302 (91%) | 155.5 s | 2.39 GB | 98.8% |
+| full (65,154) | **octree** | **60,177 (92%)** | **28.2 s** | 2.51 GB | 18.9% |
+
+**Octree is ~4.8× faster on top-30, ~5.5× on the full cell, and fills
+slightly more** (it saturates the densest species better). The win here
+is **wall time, not memory** — peak RAM is comparable (mesh proxies
+dominate, and the clearance grid is tiny), and the octree is marginally
+higher on these dense recipes.
+
+The trade-off runs the other way on small/sparse recipes: there the
+grid's slack-bound (≈1 attempt per placement, 99.7% success) beats the
+octree's cheaper-but-more-numerous attempts (18.9–62.9% success). So
+the default stays `legacy`; reach for `--backend octree` on whole-cell
+recipes — it's what the `mycoplasma_full` pipeline uses.
 
 ---
 
@@ -276,6 +333,50 @@ directive for a parent never lands inside one of its children.
   `pickIngredient`).
 - `PlacerConfig::strict_bounds` toggles loose (centre-in-box) vs
   strict (sphere-fully-in-box) containment of the root compartment.
+- **Two interchangeable backends** behind `PlacerConfig::backend`
+  (`parsimony pack --backend legacy|octree`). `legacy` (default) is
+  the clearance-grid engine described here — cellPACK's method, with
+  the slack-bound making the grid authoritative. `octree` swaps the
+  grid + valid-cell lists for a sparse occupancy octree (below); the
+  two share the recipe walk, chromosome pass, and Surface/tiled
+  handling.
+
+### Occupancy octree  (`crates/parsimony-core/src/octree.rs`)
+
+The clearance grid answers "where can this land?" by enumerating empty
+*volume* — a dense f32 cell per `cell_size³`, plus a derived free-cell
+list per directive. Its cost is set by the box, not by what's placed,
+and it builds one valid-cell list **per directive** (×630 on the full
+*Mycoplasma* recipe). The occupancy octree answers the same question
+with cost that scales with *content*:
+
+- One sparse tree per compartment, **shared across every directive**.
+  Starts as a single empty root and subdivides **only near placed
+  geometry** — big empty regions stay one coarse leaf; the interior of
+  a placed blob collapses back to one `full` leaf; only the
+  occupied/free frontier refines down to `min_cell` (same
+  `max_radius/8` policy as the grid).
+- Each node caches the **free volume** in its subtree, so
+  `sample_free` descends weighted toward free space and lands in a
+  known-free leaf — preserving near-direct placement at high density
+  (where blind rejection would need thousands of tries) without the
+  grid's volume price.
+- `insert_sphere` / `overlaps` / `sample_free` updated incrementally
+  as placement proceeds; `overlaps` is an exact proxy-vs-proxy test, so
+  the main pass and the proxy-accurate densify collapse into **one
+  loop** (no separate clearance grid, valid-cell list, or densify
+  stage). A freed-block arena recycles collapsed subtrees so the node
+  count tracks peak *live* content.
+- Unit test `node_count_scales_with_content_not_volume` pins the
+  invariant: the same placement in a 64×-bigger box refines to the same
+  order of magnitude of nodes.
+
+Trade-off vs the grid: the octree re-checks every candidate against the
+tree (lower per-attempt success — more, cheaper attempts), where the
+grid's slack-bound lets it skip that check (≈1 attempt per placement).
+At whole-cell scale the octree's content scaling wins on wall time
+anyway (see *Performance* below); on a small sparse box the grid is
+more efficient.
 
 ### Clearance grid  (`crates/parsimony-core/src/clearance_grid.rs`)
 
@@ -306,23 +407,37 @@ directive for a parent never lands inside one of its children.
 
 ### CLI / bench  (`crates/parsimony-cli`, `crates/parsimony-bench`)
 
-- `parsimony pack <recipe> --out <path> [--loose-bounds] [--seed N]`.
-- `compare-with-cellpack <recipe>` — runs both engines, parses both
-  Simularium outputs, reports side-by-side counts.
+- `parsimony pack <recipe> --out <path> [--backend legacy|octree]
+  [--loose-bounds] [--seed N]` — pack one recipe.
+- `parsimony compare <recipe>` — packs **both** parsimony backends in
+  process and (if `../cellpack/.venv` is present) cellPACK too, then
+  prints a side-by-side table of placements, wall time, per-radius
+  counts, and position spread. The validation harness.
+- `parsimony pipeline run <pipeline.json> [--force] [--relax N]` —
+  staged packing as a build system (chromosome → membrane → fibers →
+  densified interior), each stage content-addressed and cached;
+  `pipeline status` shows fresh/stale, `pipeline clean` empties the
+  cache to start over.
+- `parsimony mesh <pdb|dir>` — PDB/CIF → LOD OBJ meshes.
+- `parsimony demos regenerate` / `parsimony viewer` — rebuild the demo
+  packs and serve the local three.js viewer.
 
 ---
 
 ## Test inventory
 
-136 tests passing across the workspace (cargo test --release). Clippy
-clean.
+162 tests passing across the workspace (`cargo test --release`). Clippy
+is clean in the CLI; a handful of pedantic style lints remain in the
+actively-developed core modules.
 
 | Crate / file | Tests | Coverage |
 |---|---|---|
 | `parsimony-spatial` (lib) | 87 | AABB, brute index, QBVH, voxel field, mesh voxeliser, queries |
-| `parsimony-core` (lib) | 34 | recipe loader, compartments, placer unit tests, output schema |
+| `parsimony-core` (lib) | 59 | recipe loader, compartments, both placement backends, octree, fiber, pipeline, relax, output |
+| `parsimony-core` tests/ `ecoli_starter.rs` | 5 | E. coli starter recipe packs + invariants |
 | `parsimony-core` tests/ `shape_zoo.rs` | 3 | every shape type present, ≥90% packed, no overlaps |
 | `parsimony-core` tests/ `spheres_in_a_box.rs` | 7 | loads cellPACK recipe, no overlaps, within bounds, deterministic, simularium + transforms output well-formed |
+| `parsimony-gpu` (lib) | 1 | GPU clearance-grid update matches CPU oracle |
 
 Selected test names (full list runnable via `cargo test --release`):
 
@@ -420,10 +535,6 @@ add when a recipe needs them:
   cells in a narrow clearance band for cytoplasmic-crowding style
   packings.
 - **Gradient packing** (concentration gradients along a vector).
-- **PDB → mesh pipeline.** Offline conversion (ChimeraX-headless or
-  PyMOL produces an OBJ from a PDB structure); a small Python
-  script. Then a real biology demo (GroEL 1AON inside a vesicle, or
-  the hemoglobin/IgG/lysozyme plasma trio).
 - **Mesh-vs-sphere exact collision.** Currently mesh ingredients
   collide via their sphere-tree proxies; the underlying `TriMesh`
   is retained for future exact narrow-phase via parry3d.
@@ -442,27 +553,37 @@ add when a recipe needs them:
 # All tests
 cargo test --release
 
-# Packs (any recipe path)
+# Packs (any recipe path) — pick the engine with --backend
 cargo run --release -p parsimony-cli -- pack \
-    examples/recipes/shape_zoo.json --out /tmp/x.simularium
+    examples/recipes/shape_zoo.json --out /tmp/x.pack.json
+cargo run --release -p parsimony-cli -- pack \
+    examples/recipes/mycoplasma_full.json --backend octree --out /tmp/full.pack.json
 
-# cellPACK comparison (cellpack venv at ../cellpack/.venv)
-cargo run --release -p parsimony-bench --bin compare-with-cellpack -- \
-    /home/pattern/code/cellpack/examples/recipes/v2/spheres_in_a_box.json
+# Compare both backends + cellPACK on one recipe (cellpack venv at ../cellpack/.venv)
+cargo run --release -p parsimony-cli -- compare \
+    ../cellpack/examples/recipes/v2/spheres_in_a_box.json
 
-# Re-render report images. The script's PEP 723 header pulls
-# matplotlib/numpy into an ephemeral uv-managed env on first run; no
-# pip install required. Plain `./scripts/render_simularium.py` works
-# too via the `uv run` shebang.
-uv run scripts/render_simularium.py /tmp/x.simularium docs/img/x.png \
-    --title "demo" [--slice z --slice-thickness 80]
+# Whole-cell octree-vs-legacy numbers in this report (seed 0)
+cargo run --release -p parsimony-cli -- pack examples/recipes/mycoplasma.json \
+    --backend legacy --out /tmp/myco_legacy.pack.json
+cargo run --release -p parsimony-cli -- pack examples/recipes/mycoplasma.json \
+    --backend octree --out /tmp/myco_octree.pack.json
 
-# Open this report in a browser (uv tool run grip, ephemeral venv)
-./scripts/view_report.sh
+# Re-render report images (matplotlib pulled into an ephemeral uv env on
+# first run; needs a .simularium input — pack with --format simularium).
+cargo run --release -p parsimony-cli -- pack \
+    examples/recipes/shape_zoo.json --format simularium --out /tmp/x.simularium
+cargo run --release -p parsimony-cli -- render /tmp/x.simularium docs/img/x.png \
+    --title "demo" --slice z --slice-thickness 80
 
-# Pack and view a recipe in the local three.js viewer
-./scripts/view_pack.sh                           # shape_zoo demo
-./scripts/view_pack.sh path/to/recipe.json       # any recipe
+# View this report — live preview, or export standalone HTML
+cargo run --release -p parsimony-cli -- report
+cargo run --release -p parsimony-cli -- report --html --open
+
+# Regenerate the whole-cell recipe + meshes from cellPACK data (clones on
+# first run), then pack and view it in the local three.js viewer
+cargo run --release -p parsimony-cli -- translate-mycoplasma
+cargo run --release -p parsimony-cli -- viewer --recipe examples/recipes/shape_zoo.json
 ```
 
 ---
@@ -474,12 +595,18 @@ crates/parsimony-spatial/    # AABB, BVH (brute + QBVH SIMD), VoxelField, mesh v
 crates/parsimony-core/       # recipe loader, ingredients, compartments, placer, output
   src/ingredient.rs            # IngredientShape + shape_helpers + obj loader
   src/compartment.rs           # CompartmentKind + signed_distance + surface sampling
-  src/clearance_grid.rs        # f32 distance field
-  src/placer.rs                # the main algorithm
+  src/clearance_grid.rs        # f32 distance field (legacy backend)
+  src/octree.rs                # sparse occupancy octree (octree backend)
+  src/placer.rs                # both placement backends + chromosome/fiber/surface
+  src/pipeline.rs              # staged packing (DAG + content-addressed cache)
+  src/relax.rs                 # post-merge clash relaxation
   src/recipe.rs                # JSON loader + composition walker
-  src/output.rs                # Simularium + transforms emitters
-crates/parsimony-cli/        # parsimony pack
-crates/parsimony-bench/      # compare-with-cellpack
+  src/output.rs                # pack.v1 + Simularium + transforms emitters
+crates/parsimony-cli/        # the `parsimony` binary — every command below
+                             #   pack / compare / pipeline / mesh / demos / viewer
+                             #   translate-mycoplasma / render / report
+crates/parsimony-gpu/        # wgpu clearance-grid update (Phase 4)
+crates/parsimony-bench/      # cellPACK comparison harness (parse + runner + compare)
 examples/recipes/            # shape_zoo.json, blood_plasma.json, mycoplasma.json, pdb_proteins.json
 examples/meshes/             # sphere.obj (toy mesh-ingredient demo)
 examples/pdb_meshes/         # generated Van der Waals meshes (1AKI, 1AON, 1HHO, 1IGY, 1AO6, 1A8E)
@@ -487,9 +614,9 @@ examples/pdb_meshes/mycoplasma/ # batch-generated meshes for the mycoplasma reci
 examples/pdb_cache/          # downloaded raw PDBs (gitignore as desired)
 docs/                        # this report, parsimony-design.md, img/*.png
 viewer/                      # local three.js sphere-packing viewer (HTML + JS)
-scripts/render_simularium.py # static PNG renderer used to produce report images
-scripts/pdb_to_mesh.py       # PDB/CIF → Van der Waals OBJ mesh (uv-managed)
-scripts/translate_mycoplasma.py # cellPACK Maritan recipe → parsimony recipe
-scripts/view_report.sh       # opens this report in the best available viewer
-scripts/view_pack.sh         # packs a recipe and opens it in the viewer
+scripts/                     # uv-managed Python helpers, each fronted by a CLI command:
+  pdb_to_mesh.py             #   PDB/CIF → Van der Waals OBJ mesh        (parsimony mesh)
+  translate_mycoplasma.py    #   cellPACK Maritan recipe → parsimony     (translate-mycoplasma)
+  render_simularium.py       #   Simularium → static PNG                 (parsimony render)
+  serve.py                   #   no-cache static server                  (parsimony viewer)
 ```

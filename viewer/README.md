@@ -1,32 +1,31 @@
 # parsimony viewer
 
-A minimal three.js viewer for parsimony packings. Reads the
-Simularium JSON we emit (`parsimony pack ... --out foo.simularium`),
-renders each ingredient type as a single instanced sphere mesh, with
-orbit controls, per-type visibility, and a cross-section slider.
+A minimal three.js viewer for parsimony packings. Reads parsimony's
+native pack format (`parsimony pack ... --out foo.pack.json`), renders
+each ingredient type with instanced meshes, with orbit controls,
+per-type visibility, and a cross-section slider.
 
 ## Run it
 
 ```bash
-./scripts/view_pack.sh                              # packs shape_zoo, opens browser
-./scripts/view_pack.sh path/to/recipe.json          # other recipe
-./scripts/view_pack.sh recipe.json --loose-bounds   # pass flags through to parsimony
-PORT=9000 ./scripts/view_pack.sh                    # change port (default 8123)
+cargo run --release -p parsimony-cli -- viewer                                 # landing page
+cargo run --release -p parsimony-cli -- viewer --recipe examples/recipes/shape_zoo.json   # pack + open
+cargo run --release -p parsimony-cli -- viewer --pack mycoplasma_full_staged.pack.json    # existing pack
+cargo run --release -p parsimony-cli -- viewer --port 9000 --no-open           # options
 ```
 
-The script:
-1. Runs `cargo run --release -p parsimony-cli -- pack <recipe>` and
-   writes `viewer/data/latest.simularium`.
-2. Starts a local HTTP server (Python stdlib, no deps; uses uv if
-   present, otherwise system `python3`).
-3. Opens your browser to
-   `http://localhost:8123/index.html?file=data/latest.simularium`.
+`parsimony viewer`:
+1. Optionally packs `--recipe` to `viewer/data/latest.pack.json` (or
+   opens an existing `--pack`).
+2. Serves the project root over a no-cache static server
+   (`scripts/serve.py`; falls back to Python's stdlib server).
+3. Opens your browser to the viewer, deep-linking the pack via `?file=`.
 
 Press Ctrl-C to stop the server.
 
 ## Use the UI
 
-- **Drag-and-drop** any `.simularium` file onto the window to view it.
+- **Drag-and-drop** any `.pack.json` file onto the window to view it.
 - **Left-click drag**: orbit the camera. **Right-click drag**: pan.
   **Scroll**: zoom.
 - **Legend** (right side): click a row to toggle that ingredient
@@ -52,4 +51,4 @@ This local viewer is:
 
 - `index.html` — UI + importmap referencing three.js from a CDN.
 - `viewer.js` — scene, instanced rendering, UI wiring.
-- `data/` — staging area for `view_pack.sh` (gitignore as needed).
+- `data/` — staging area for `parsimony viewer` / `demos` (gitignore as needed).
