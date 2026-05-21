@@ -1617,7 +1617,8 @@
     }
   },
   "chromosome": {
-    "beads": 1500,
+    "genome": "../genome/mycoplasma_g37_genes.csv",
+    "beads": 8000,
     "spacing": 22,
     "bead_radius": 10,
     "color": [
@@ -1627,7 +1628,8 @@
     ],
     "supercoil": {
       "radius": 80,
-      "pitch": 120
+      "pitch": 120,
+      "domains": 50
     },
     "proteins": [
       {

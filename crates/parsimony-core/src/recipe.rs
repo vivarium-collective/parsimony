@@ -55,6 +55,11 @@ struct RawChromosome {
     /// DNA-binding proteins to pack along the fiber (RNAP, replisome, …).
     #[serde(default)]
     proteins: Vec<RawFiberProtein>,
+    /// Optional gene-annotation CSV (resolved relative to the recipe). When
+    /// set, DNA-binding proteins are seated at real transcription sites
+    /// (genes, abundance-weighted) instead of uniformly along the fiber.
+    #[serde(default)]
+    genome: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -64,6 +69,10 @@ struct RawSupercoil {
     radius: f32,
     /// Axial rise per turn (how stretched the coil is).
     pitch: f32,
+    /// Number of plectoneme loop domains (rosette nucleoid). `None`/1 = one
+    /// global plectoneme; higher = Maritan-style supercoiled domains.
+    #[serde(default)]
+    domains: Option<usize>,
 }
 
 /// A protein species bound along the chromosome. `object` names an entry in
@@ -250,6 +259,8 @@ pub struct ChromosomeSpec {
     pub supercoil: Option<SupercoilSpec>,
     /// DNA-binding proteins to pack along the fiber: `(ingredient name, count)`.
     pub proteins: Vec<(String, u32)>,
+    /// Resolved path to the gene-annotation CSV, if the recipe set `genome`.
+    pub genome: Option<std::path::PathBuf>,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -257,6 +268,8 @@ pub struct ChromosomeSpec {
 pub struct SupercoilSpec {
     pub radius: f32,
     pub pitch: f32,
+    /// Plectoneme loop domains (rosette nucleoid); 1 = single global plectoneme.
+    pub domains: usize,
 }
 
 impl Recipe {
@@ -569,8 +582,16 @@ fn resolve(raw: RawRecipe, recipe_dir: Option<&std::path::Path>) -> Result<Recip
             compartment: c.compartment,
             supercoil: c
                 .supercoil
-                .map(|s| SupercoilSpec { radius: s.radius, pitch: s.pitch }),
+                .map(|s| SupercoilSpec {
+                    radius: s.radius,
+                    pitch: s.pitch,
+                    domains: s.domains.unwrap_or(1),
+                }),
             proteins: c.proteins.iter().map(|p| (p.object.clone(), p.count)).collect(),
+            genome: c.genome.as_ref().map(|g| match recipe_dir {
+                Some(dir) => dir.join(g),
+                None => std::path::PathBuf::from(g),
+            }),
         }),
     })
 }

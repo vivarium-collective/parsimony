@@ -146,6 +146,112 @@ pub fn pack_on_fiber<R: Rng>(
     out
 }
 
+/// Like [`pack_on_fiber`], but each instance targets a specific arc *fraction*
+/// of the strand (its gene's genomic position) rather than a random spot.
+/// `placements` is one entry per instance: `(ingredient_id, ingredient,
+/// fraction in [0,1))`. Each is seated at `fraction × contour`, searching
+/// azimuths and a small (growing) arc jitter for a clear spot so it stays near
+/// its locus. Used to put RNAP/DNAP at real transcription / replication sites.
+pub fn pack_on_fiber_at<R: Rng>(
+    fiber: &[Point3<f32>],
+    placements: &[(IngredientId, &Ingredient, f32)],
+    obstacles: &[(Point3<f32>, f32)],
+    fiber_radius: f32,
+    rng: &mut R,
+) -> Vec<FiberBinding> {
+    if fiber.len() < 2 {
+        return Vec::new();
+    }
+    let mut cum = vec![0.0_f32; fiber.len()];
+    for i in 1..fiber.len() {
+        cum[i] = cum[i - 1] + (fiber[i] - fiber[i - 1]).norm();
+    }
+    let total = cum[fiber.len() - 1];
+    if total <= 1e-3 {
+        return Vec::new();
+    }
+    let sample = |s: f32| -> (Point3<f32>, Vector3<f32>) {
+        let s = s.clamp(0.0, total);
+        let mut k = 0;
+        while k + 1 < fiber.len() && cum[k + 1] <= s {
+            k += 1;
+        }
+        let k1 = (k + 1).min(fiber.len() - 1);
+        let seg = (cum[k1] - cum[k]).max(1e-6);
+        let t = ((s - cum[k]) / seg).clamp(0.0, 1.0);
+        let pos = fiber[k] + (fiber[k1] - fiber[k]) * t;
+        let tang = (fiber[k1] - fiber[k])
+            .try_normalize(1e-6)
+            .unwrap_or_else(|| Vector3::z());
+        (pos, tang)
+    };
+
+    let mut spheres: Vec<(Point3<f32>, f32)> = obstacles.to_vec();
+    spheres.extend(fiber.iter().map(|p| (*p, fiber_radius)));
+    let mut index = QbvhIndex::new();
+    let mut max_r = 0.0_f32;
+    for (i, (c, r)) in spheres.iter().enumerate() {
+        index.insert(i as u64, Aabb::from_sphere(*c, *r)).expect("uid");
+        max_r = max_r.max(*r);
+    }
+
+    // Largest first, as in pack_on_fiber, so big proteins claim surface before
+    // small abundant ones crowd the strand.
+    let mut order: Vec<usize> = (0..placements.len()).collect();
+    order.sort_by(|&a, &b| {
+        placements[b]
+            .1
+            .shape
+            .enclosing_radius()
+            .partial_cmp(&placements[a].1.shape.enclosing_radius())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut out = Vec::new();
+    for &pi in &order {
+        let (id, ing, frac) = placements[pi];
+        let er = ing.shape.enclosing_radius();
+        let off = fiber_radius + er + BIND_GAP;
+        let base_s = frac.rem_euclid(1.0) * total;
+        for attempt in 0..ATTEMPTS_PER_INSTANCE {
+            // Attempt 0 hits the gene exactly; later attempts wander a little
+            // (up to ~4% of the contour) to find an open azimuth/spot nearby.
+            let jitter = if attempt == 0 {
+                0.0
+            } else {
+                rng.gen_range(-1.0_f32..1.0)
+                    * (attempt as f32 / ATTEMPTS_PER_INSTANCE as f32)
+                    * 0.04
+                    * total
+            };
+            let (p, tang) = sample(base_s + jitter);
+            let n1 = perp(tang);
+            let n2 = tang.cross(&n1);
+            let phi = rng.gen_range(0.0..std::f32::consts::TAU);
+            let radial = n1 * phi.cos() + n2 * phi.sin();
+            let center = p + radial * off;
+            let rot = align_to_normal(ing.principal_vector, tang);
+            let cand: Vec<(Point3<f32>, f32)> = ing.shape.world_spheres(center, rot).collect();
+            if collides(&index, &spheres, max_r, &cand) {
+                continue;
+            }
+            for s in &cand {
+                let uid = spheres.len() as u64;
+                index.insert(uid, Aabb::from_sphere(s.0, s.1)).expect("uid");
+                spheres.push(*s);
+                max_r = max_r.max(s.1);
+            }
+            out.push(FiberBinding {
+                ingredient_id: id,
+                position: center,
+                rotation: rot,
+            });
+            break;
+        }
+    }
+    out
+}
+
 /// True if any candidate sphere overlaps a stored sphere.
 fn collides(
     index: &QbvhIndex,

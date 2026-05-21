@@ -202,6 +202,147 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     pts
 }
 
+/// Wind an interwound (plectonemic) double strand of up to `n_beads` along a
+/// local `axis` polyline: out along the axis as one superhelix, back as the
+/// complementary one (offset by π) so the two strands interwind. Extracted from
+/// [`generate_supercoiled_fiber`] so [`generate_nucleoid`] can wind one
+/// plectoneme per domain. Returns the bead path (out then back).
+fn wind_plectoneme(
+    axis: &[Point3<f32>],
+    n_beads: usize,
+    step: f32,
+    sc_radius: f32,
+    sc_pitch: f32,
+) -> Vec<Point3<f32>> {
+    if axis.len() < 2 || n_beads < 2 {
+        return axis.to_vec();
+    }
+    let tau = std::f32::consts::TAU;
+    let cpt = ((tau * sc_radius).powi(2) + sc_pitch * sc_pitch).sqrt();
+    let da = step * sc_pitch / cpt;
+    let dphi = step * tau / cpt;
+    let frames = frames_along(axis);
+    let mut cum = vec![0.0_f32; axis.len()];
+    for i in 1..axis.len() {
+        cum[i] = cum[i - 1] + (axis[i] - axis[i - 1]).norm();
+    }
+    let total = cum[axis.len() - 1];
+    if total <= 1e-3 {
+        return Vec::new();
+    }
+    let sample = |a: f32| -> (Point3<f32>, Vector3<f32>, Vector3<f32>) {
+        let a = a.clamp(0.0, total);
+        let mut k = 0;
+        while k + 1 < axis.len() && cum[k + 1] <= a {
+            k += 1;
+        }
+        let k1 = (k + 1).min(axis.len() - 1);
+        let seg = (cum[k1] - cum[k]).max(1e-6);
+        let t = ((a - cum[k]) / seg).clamp(0.0, 1.0);
+        let pos = axis[k] + (axis[k1] - axis[k]) * t;
+        let tang = (frames[k].0 * (1.0 - t) + frames[k1].0 * t)
+            .try_normalize(1e-6)
+            .unwrap_or(frames[k].0);
+        let mut n1 = frames[k].1 * (1.0 - t) + frames[k1].1 * t;
+        n1 = (n1 - tang * tang.dot(&n1))
+            .try_normalize(1e-6)
+            .unwrap_or_else(|| perp(tang));
+        let n2 = tang.cross(&n1);
+        (pos, n1, n2)
+    };
+    let half = (n_beads / 2).max(1);
+    let fit_half = ((total / da).floor() as usize).clamp(1, half);
+    let mut pts = Vec::with_capacity(2 * fit_half);
+    for i in 0..fit_half {
+        let (c, n1, n2) = sample(i as f32 * da);
+        let phi = i as f32 * dphi;
+        pts.push(c + n1 * (phi.cos() * sc_radius) + n2 * (phi.sin() * sc_radius));
+    }
+    let phi_apex = (fit_half - 1) as f32 * dphi;
+    for j in 0..fit_half {
+        let (c, n1, n2) = sample((fit_half - 1 - j) as f32 * da);
+        let phi = phi_apex + std::f32::consts::PI + j as f32 * dphi;
+        pts.push(c + n1 * (phi.cos() * sc_radius) + n2 * (phi.sin() * sc_radius));
+    }
+    pts
+}
+
+/// Generate a *rosette* nucleoid: the circular genome as a series of
+/// plectonemic loop **domains** branching off a central backbone scaffold —
+/// Maritan's "unsupercoiled segments punctuated with supercoiled plectonemes".
+/// Each of `domains` domains is a local interwound loop (≈ a topological
+/// domain) anchored on the scaffold and bulging outward; consecutive loops
+/// connect along the scaffold so the whole thing reads as one circular genome.
+/// More faithful than one global plectoneme, and the loops compact the genome
+/// so more contour fits the cell. `domains <= 1` falls back to a single
+/// plectoneme.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_nucleoid<R: Rng>(
+    cell_radius: f32,
+    bead_count: usize,
+    step: f32,
+    bead_radius: f32,
+    sc_radius: f32,
+    sc_pitch: f32,
+    domains: usize,
+    rng: &mut R,
+) -> Vec<Point3<f32>> {
+    if domains <= 1 {
+        return generate_supercoiled_fiber(
+            cell_radius, bead_count, step, bead_radius, sc_radius, sc_pitch, rng,
+        );
+    }
+    let core_r = (cell_radius - sc_radius - bead_radius).max(step);
+    // Scaffold anchor points (one per domain) — a short confined walk in the
+    // cell core; loops bulge outward from these.
+    let backbone_step = (2.2 * sc_radius).max(core_r * 1.2 / domains as f32);
+    let anchors = generate_fiber(core_r * 0.65, domains, backbone_step, bead_radius, rng);
+    if anchors.len() < 2 {
+        return generate_supercoiled_fiber(
+            cell_radius, bead_count, step, bead_radius, sc_radius, sc_pitch, rng,
+        );
+    }
+    let na = anchors.len();
+    let per = (bead_count / na).max(2);
+    let max_apex = core_r; // keep wound beads (offset sc_radius) inside the cell
+    let loop_height = (sc_radius * 3.0).min(core_r * 0.45);
+
+    let mut out: Vec<Point3<f32>> = Vec::with_capacity(bead_count);
+    for d in 0..na {
+        let a = anchors[d];
+        let b = anchors[(d + 1) % na];
+        let mid = Point3::from((a.coords + b.coords) * 0.5);
+        // Bulge away from the cell centre (fall back to a perpendicular if the
+        // midpoint sits at the origin).
+        let outward = mid
+            .coords
+            .try_normalize(1e-3)
+            .unwrap_or_else(|| perp((b - a).try_normalize(1e-6).unwrap_or(Vector3::z())));
+        let mut apex = mid + outward * loop_height;
+        if apex.coords.norm() > max_apex {
+            apex = Point3::from(apex.coords.normalize() * max_apex);
+        }
+        // Local axis a → apex → b, subdivided + smoothed for clean frames.
+        let sub = 6;
+        let mut axis = Vec::with_capacity(2 * sub);
+        for s in 0..=sub {
+            let t = s as f32 / sub as f32;
+            axis.push(Point3::from(a.coords * (1.0 - t) + apex.coords * t));
+        }
+        for s in 1..=sub {
+            let t = s as f32 / sub as f32;
+            axis.push(Point3::from(apex.coords * (1.0 - t) + b.coords * t));
+        }
+        smooth_polyline(&mut axis, 8);
+        out.extend(wind_plectoneme(&axis, per, step, sc_radius, sc_pitch));
+        if out.len() >= bead_count {
+            break;
+        }
+    }
+    out.truncate(bead_count);
+    out
+}
+
 /// Per-vertex rotation-minimizing frames `(T, N1, N2)` along a polyline.
 /// Each normal is carried forward by the rotation that maps the previous
 /// tangent onto the current one, then re-orthogonalised — avoiding the
@@ -367,6 +508,43 @@ mod tests {
         assert_eq!(
             generate_supercoiled_fiber(150.0, 300, 8.0, 3.0, 0.0, 50.0, &mut c),
             generate_fiber(150.0, 300, 8.0, 3.0, &mut d),
+        );
+    }
+
+    #[test]
+    fn nucleoid_rosette_is_confined_multi_domain_and_deterministic() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        let (cell, step, bead) = (2000.0_f32, 22.0_f32, 10.0_f32);
+        let (scr, pitch) = (80.0_f32, 120.0_f32);
+        let pts = generate_nucleoid(cell, 8000, step, bead, scr, pitch, 40, &mut rng);
+        assert!(pts.len() > 4000, "placed only {} beads", pts.len());
+        for p in &pts {
+            assert!(
+                p.coords.norm() <= cell - bead + 1.0,
+                "bead outside cell: {}",
+                p.coords.norm()
+            );
+        }
+        // Multiple domains ⇒ several apical hairpins (big consecutive jumps),
+        // unlike a single plectoneme (one hairpin).
+        let jumps = pts
+            .windows(2)
+            .filter(|w| (w[1] - w[0]).norm() > 1.5 * scr)
+            .count();
+        assert!(jumps >= 5, "expected several domain hairpins, got {jumps}");
+
+        // Deterministic; domains<=1 falls back to a single plectoneme.
+        let mut a = Xoshiro256PlusPlus::seed_from_u64(9);
+        let mut b = Xoshiro256PlusPlus::seed_from_u64(9);
+        assert_eq!(
+            generate_nucleoid(cell, 2000, step, bead, scr, pitch, 30, &mut a),
+            generate_nucleoid(cell, 2000, step, bead, scr, pitch, 30, &mut b),
+        );
+        let mut c = Xoshiro256PlusPlus::seed_from_u64(9);
+        let mut e = Xoshiro256PlusPlus::seed_from_u64(9);
+        assert_eq!(
+            generate_nucleoid(cell, 1500, step, bead, scr, pitch, 1, &mut c),
+            generate_supercoiled_fiber(cell, 1500, step, bead, scr, pitch, &mut e),
         );
     }
 }

@@ -7,6 +7,7 @@ pub mod compartment;
 pub(crate) mod clearance_grid;
 pub mod fiber;
 pub mod fiber_pack;
+pub mod genome;
 pub mod ingredient;
 pub(crate) mod octree;
 pub mod output;
@@ -17,7 +18,8 @@ pub mod recipe;
 pub mod relax;
 
 pub use compartment::{Compartment, CompartmentId, CompartmentKind};
-pub use fiber_pack::{pack_on_fiber, FiberBinding};
+pub use fiber_pack::{pack_on_fiber, pack_on_fiber_at, FiberBinding};
+pub use genome::{Gene, Genome};
 pub use ingredient::{Ingredient, IngredientId, IngredientShape, ProxySphere};
 pub use output::{write_pack_json, write_simularium_json, write_transforms_json};
 pub use pipeline::{

@@ -528,8 +528,40 @@ fn run_fiber_pack(
         .collect();
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(stage.effective_seed(pipeline_seed));
-    for b in crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chrom.radius, &mut rng)
+    // If the recipe references a genome annotation, seat the DNA-binding
+    // proteins at real transcription / replication sites (RNAP abundance-
+    // weighted over genes, DNAP near oriC); otherwise spread them randomly.
+    let binds = match chr_spec
+        .genome
+        .as_ref()
+        .and_then(|p| crate::genome::Genome::from_csv(p).ok())
     {
+        Some(genome) => {
+            let abundances: Vec<(String, u32)> = recipe
+                .directives
+                .iter()
+                .map(|d| (d.ingredient.clone(), d.count))
+                .collect();
+            let sites = genome.binding_sites(&chr_spec.proteins, &abundances, &mut rng);
+            let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
+            for ((name, _), fracs) in chr_spec.proteins.iter().zip(&sites) {
+                if let Some((idx, _, ing)) = recipe.ingredients.get_full(name) {
+                    for &f in fracs {
+                        at.push((idx as u32, ing, f));
+                    }
+                }
+            }
+            crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chrom.radius, &mut rng)
+        }
+        None => crate::fiber_pack::pack_on_fiber(
+            &fiber_world,
+            &proteins,
+            &obstacles,
+            chrom.radius,
+            &mut rng,
+        ),
+    };
+    for b in binds {
         snap.placements.push(Placement {
             instance_uid: snap.placements.len() as u64,
             ingredient_id: b.ingredient_id,

@@ -589,13 +589,16 @@ impl<'a> GreedyRandomPlacer<'a> {
             return;
         };
         let pts = match &chr.supercoil {
-            Some(sc) => crate::fiber::generate_supercoiled_fiber(
+            // `generate_nucleoid` is a rosette of `domains` plectoneme loops;
+            // `domains <= 1` falls back to a single global plectoneme.
+            Some(sc) => crate::fiber::generate_nucleoid(
                 cell_r,
                 chr.beads,
                 chr.spacing,
                 chr.bead_radius,
                 sc.radius,
                 sc.pitch,
+                sc.domains,
                 rng,
             ),
             None => {
@@ -618,10 +621,37 @@ impl<'a> GreedyRandomPlacer<'a> {
                     ing.shape.world_spheres(pl.position, pl.rotation)
                 })
                 .collect();
-            let proteins = self.resolve_fiber_proteins(chr);
-            for b in
-                crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+            // With a genome annotation, seat DNA-binding proteins at real
+            // transcription / replication sites; otherwise spread them randomly.
+            let binds = match chr
+                .genome
+                .as_ref()
+                .and_then(|p| crate::genome::Genome::from_csv(p).ok())
             {
+                Some(genome) => {
+                    let abundances: Vec<(String, u32)> = self
+                        .recipe
+                        .directives
+                        .iter()
+                        .map(|d| (d.ingredient.clone(), d.count))
+                        .collect();
+                    let sites = genome.binding_sites(&chr.proteins, &abundances, rng);
+                    let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
+                    for ((name, _), fracs) in chr.proteins.iter().zip(&sites) {
+                        if let Some((idx, _, ing)) = self.recipe.ingredients.get_full(name) {
+                            for &f in fracs {
+                                at.push((idx as u32, ing, f));
+                            }
+                        }
+                    }
+                    crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, rng)
+                }
+                None => {
+                    let proteins = self.resolve_fiber_proteins(chr);
+                    crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+                }
+            };
+            for b in binds {
                 snapshot.placements.push(Placement {
                     instance_uid: *next_uid,
                     ingredient_id: b.ingredient_id,
