@@ -877,70 +877,12 @@ async function loadLevel(best) {
   }
 }
 
-// ───── compartment surfaces ("membrane") ───────────────────────────
-// Compartments arrive as sphere / box / mesh boundaries. We render
-// sphere compartments (the cell envelope) as a translucent, fresnel-
-// rimmed shell with a faint cellular grain — evoking the lipid bilayer
-// that the surface lipids tile, so the membrane reads as a surface
-// rather than a loose cloud of head-group beads. The outer "space" box
-// is already drawn as the bbox wireframe, so box compartments are
-// skipped; mesh compartments aren't rendered yet.
-function makeMembraneMaterial() {
-  return new THREE.ShaderMaterial({
-    uniforms: {
-      uColor: { value: new THREE.Color(0x5fc6d4) },
-      uOpacity: { value: 0.13 },
-      uRim: { value: 0.55 },
-      uGrainScale: { value: 0.14 },
-    },
-    vertexShader: `
-      varying vec3 vN; varying vec3 vWorld; varying vec3 vLocal;
-      void main() {
-        vLocal = position;
-        vec4 wp = modelMatrix * vec4(position, 1.0);
-        vWorld = wp.xyz;
-        vN = normalize(mat3(modelMatrix) * normal);
-        gl_Position = projectionMatrix * viewMatrix * wp;
-      }
-    `,
-    fragmentShader: `
-      uniform vec3 uColor; uniform float uOpacity; uniform float uRim; uniform float uGrainScale;
-      varying vec3 vN; varying vec3 vWorld; varying vec3 vLocal;
-      vec3 hash3(vec3 p) {
-        p = vec3(dot(p, vec3(127.1, 311.7, 74.7)),
-                 dot(p, vec3(269.5, 183.3, 246.1)),
-                 dot(p, vec3(113.5, 271.9, 124.6)));
-        return fract(sin(p) * 43758.5453);
-      }
-      // Worley/cellular distance — a pebbled "lipid head" grain.
-      float worley(vec3 p) {
-        vec3 ip = floor(p); vec3 fp = fract(p); float d = 1.0;
-        for (int x = -1; x <= 1; x++)
-        for (int y = -1; y <= 1; y++)
-        for (int z = -1; z <= 1; z++) {
-          vec3 g = vec3(float(x), float(y), float(z));
-          vec3 o = hash3(ip + g); vec3 r = g + o - fp;
-          d = min(d, dot(r, r));
-        }
-        return sqrt(d);
-      }
-      void main() {
-        vec3 N = normalize(vN);
-        vec3 V = normalize(cameraPosition - vWorld);
-        float fres = pow(1.0 - abs(dot(N, V)), 3.0);
-        float w = worley(vLocal * uGrainScale);
-        float pebble = smoothstep(0.12, 0.7, w);
-        float grain = mix(0.82, 1.18, 1.0 - pebble);
-        vec3 col = uColor * grain;
-        float a = clamp(uOpacity * grain + fres * uRim, 0.0, 0.92);
-        gl_FragColor = vec4(col, a);
-      }
-    `,
-    transparent: true,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-  });
-}
+// ───── membrane cleanup ─────────────────────────────────────────────
+// The cell envelope used to be drawn here as a translucent, fresnel-rimmed
+// shell; that was dropped in favour of the dense impostor lipid bilayer
+// below (buildImpostorMembrane), which reads as the membrane on its own.
+// `disposeCompartments` is kept — it now tears down that impostor mesh,
+// which is still tracked in `compartmentMeshes` and toggled as "membrane".
 
 function disposeCompartments() {
   for (const m of compartmentMeshes) {
@@ -949,23 +891,6 @@ function disposeCompartments() {
     m.material.dispose();
   }
   compartmentMeshes = [];
-}
-
-function buildCompartments(doc) {
-  const comps = doc.compartments || [];
-  for (const c of comps) {
-    if (c.kind !== "sphere" || !Array.isArray(c.center) || typeof c.radius !== "number") {
-      continue; // box → bbox wireframe already; mesh → not yet rendered
-    }
-    const geom = new THREE.SphereGeometry(c.radius, 64, 48);
-    geom.translate(c.center[0], c.center[1], c.center[2]);
-    const mesh = new THREE.Mesh(geom, makeMembraneMaterial());
-    mesh.frustumCulled = false;
-    mesh.renderOrder = 2; // draw after opaque contents so it blends over them
-    mesh.visible = !toggleMembrane || toggleMembrane.checked;
-    scene.add(mesh);
-    compartmentMeshes.push(mesh);
-  }
 }
 
 // ───── impostor lipid bilayer ───────────────────────────────────────
@@ -1102,15 +1027,91 @@ function buildImpostorMembrane(doc) {
 // centres. We render it as one smooth tube through the beads
 // (Catmull-Rom), per placement — cheap (a single mesh) and reads as a
 // continuous chromosome threading the cell.
+// Plectonemic supercoil, grounded in Maritan 2022 / Goodsell's LatticeNucleoids:
+// the bacterial chromosome is a coarse supercoiled loop — two interwound
+// plectoneme arms — so the tube's PATH already is the supercoil (our
+// generator lays the genome out as one superhelix, back as the complementary
+// one). We render that honestly: the two arms in two related blues (Maritan
+// renders DNA blue; orange is reserved for RNA). Then, only when the camera
+// is close, a duplex hint fades in on each arm (dark base-stack core +
+// asymmetric major/minor grooves + faint base-pair rungs) — coil-within-a-
+// coil: duplex up close, plectoneme at cell scale. The duplex pitch is
+// illustrative (each bead is hundreds of bp, so a literal duplex would be
+// sub-pixel) — same "suggestion at the protein-mesh realism level" idea.
+const HELIX_PITCH_PER_RADIUS = 4.0;  // duplex-hint pitch = tube radius × this (close zoom)
+const HELIX_RADIAL_SEG = 14;         // tube cross-section facets
+const HELIX_STRAND_EDGE = 0.5;       // duplex backbone width (lower = wider)
+const HELIX_MINOR_OFFSET = 0.42;     // strand-B offset (<0.5 → asymmetric major/minor grooves)
+const HELIX_RUNGS_PER_TURN = 1.0;    // base-pair rung hint frequency
+const HELIX_FADE_NEAR = 250.0;       // Å camera distance: duplex fully shown
+const HELIX_FADE_FAR = 1400.0;       // Å camera distance: duplex gone (flat arms)
+const HELIX_ARM_A = [0.20, 0.42, 0.72]; // deep blue (outgoing plectoneme arm)
+const HELIX_ARM_B = [0.41, 0.63, 0.87]; // light blue (return arm)
+
+// MeshStandardMaterial (still scene-lit) with the helix logic injected. Driven
+// by a per-vertex `aHelix` baked at build time: x = turns-along (continuous),
+// y = around 0..1, z = 0..1 along the whole tube (splits the two arms at the
+// apex). `vViewDist` (view-space distance) drives the close-zoom LOD fade.
+function makeFiberMaterial() {
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(0.3, 0.5, 0.8),
+    roughness: 0.5,
+    metalness: 0.05,
+  });
+  const v3 = (c) => `vec3(${c[0].toFixed(4)}, ${c[1].toFixed(4)}, ${c[2].toFixed(4)})`;
+  const f = (x) => x.toFixed(4);
+  mat.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nattribute vec3 aHelix;\nvarying vec3 vHelix;\nvarying float vViewDist;",
+      )
+      .replace(
+        "#include <begin_vertex>",
+        "#include <begin_vertex>\n  vHelix = aHelix;\n  vViewDist = length((modelViewMatrix * vec4(position, 1.0)).xyz);",
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying vec3 vHelix;\nvarying float vViewDist;",
+      )
+      .replace(
+        "#include <color_fragment>",
+        `#include <color_fragment>
+        {
+          // Two interwound plectoneme arms (outgoing vs return half of the tube).
+          float arm = smoothstep(0.48, 0.52, vHelix.z);
+          vec3 base = mix(${v3(HELIX_ARM_A)}, ${v3(HELIX_ARM_B)}, arm);
+          // Duplex hint per arm, faded in only up close so it never aliases far out.
+          float detail = 1.0 - smoothstep(${f(HELIX_FADE_NEAR)}, ${f(HELIX_FADE_FAR)}, vViewDist);
+          if (detail > 0.001) {
+            float phase = vHelix.y - vHelix.x;
+            float dA = cos(6.2831853 * phase);                       // backbone A
+            float dB = cos(6.2831853 * (phase - ${f(HELIX_MINOR_OFFSET)})); // backbone B
+            float rA = smoothstep(${f(HELIX_STRAND_EDGE)}, 1.0, dA);
+            float rB = smoothstep(${f(HELIX_STRAND_EDGE)}, 1.0, dB);
+            vec3 dup = base * 0.35;                                  // dark base-stack core / grooves
+            dup = mix(dup, base * 1.25, max(rA, rB));                // lit backbones (same arm hue)
+            float groove = 1.0 - max(rA, rB);
+            float rung = smoothstep(0.85, 1.0, cos(6.2831853 * vHelix.x * ${f(HELIX_RUNGS_PER_TURN)}));
+            dup = mix(dup, base * 1.5, 0.25 * rung * groove);        // faint base-pair rungs
+            base = mix(base, dup, detail);
+          }
+          diffuseColor.rgb = base;
+        }`,
+      );
+  };
+  return mat;
+}
+
 function buildFiber(ing, placements) {
   const sh = ing.shape;
   if (!Array.isArray(sh.points) || sh.points.length < 2) return;
-  const c = ing.color || [0.86, 0.3, 0.42];
-  const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(c[0], c[1], c[2]),
-    roughness: 0.6,
-    metalness: 0.05,
-  });
+  const mat = makeFiberMaterial();
+  const radius = sh.radius || 8;
+  const pitch = radius * HELIX_PITCH_PER_RADIUS;
+  const radialSeg = HELIX_RADIAL_SEG;
+  const vertsPerRing = radialSeg + 1;
   for (const p of placements) {
     const [ox, oy, oz] = p.position;
     const cps = sh.points.map(
@@ -1118,7 +1119,24 @@ function buildFiber(ing, placements) {
     );
     const curve = new THREE.CatmullRomCurve3(cps, false, "catmullrom", 0.5);
     const tubular = Math.min(8000, sh.points.length * 3);
-    const geom = new THREE.TubeGeometry(curve, tubular, sh.radius || 8, 8, false);
+    const geom = new THREE.TubeGeometry(curve, tubular, radius, radialSeg, false);
+
+    // Per-vertex helix coords. TubeGeometry is ring-major: (tubular+1) rings ×
+    // (radialSeg+1) verts. x = arcLen/pitch (continuous turns-along), y =
+    // around 0..1 (cos() makes the v=0/v=1 seam free), z = ring/tubular (0..1
+    // along the whole tube → arm split at ~0.5, the plectoneme apex).
+    const lengths = curve.getLengths(tubular);
+    const n = geom.attributes.position.count;
+    const aHelix = new Float32Array(n * 3);
+    for (let k = 0; k < n; k++) {
+      const ring = Math.floor(k / vertsPerRing);
+      const j = k % vertsPerRing;
+      aHelix[k * 3] = (lengths[Math.min(ring, lengths.length - 1)] || 0) / pitch;
+      aHelix[k * 3 + 1] = j / radialSeg;
+      aHelix[k * 3 + 2] = ring / tubular;
+    }
+    geom.setAttribute("aHelix", new THREE.BufferAttribute(aHelix, 3));
+
     const mesh = new THREE.Mesh(geom, mat);
     mesh.frustumCulled = false;
     mesh.visible = !toggleFiber || toggleFiber.checked;
@@ -1461,10 +1479,10 @@ let lodSphereBudgetPx = 12.0;
 
 // Fraction of each ingredient's instances actually drawn — a viz-only
 // subsample (the pack order is random, so a prefix is a uniform random
-// subset). The packed cell is numerically sparse (~4% volume) but the
-// oversized ellipsoid proxies read as crowded; halving the drawn instances
-// declutters and cuts render load without re-packing. Driven by "Show %".
-let interiorFraction = 0.5;
+// subset). Defaults to 100% (the full pack); the "Show %" slider can dial
+// it down to declutter / cut render load without re-packing (the packed
+// cell is numerically sparse but the oversized proxies read as crowded).
+let interiorFraction = 1.0;
 
 let reassessQueued = false;
 function scheduleReassess() {
