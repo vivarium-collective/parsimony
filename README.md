@@ -35,24 +35,23 @@ sidesteps the grid's volume-scaled, per-directive setup).
 Single-threaded, one workstation (Linux 6.8). Full numbers and method
 discussion in [`docs/REPORT.md`](docs/REPORT.md).
 
-**vs original cellPACK** (same recipe, matched density, ~2 400× faster):
+**vs original cellPACK** — `spheres_in_a_box` (630 spheres, no meshes), the
+pure-placement comparison:
 
-| `spheres_in_a_box` (630 spheres) | parsimony `legacy` | cellPACK |
+| | parsimony `legacy` | cellPACK |
 |---|---|---|
-| wall time | **13 ms** | 31.5 s |
+| wall time | **~19 ms** | ~31.5 s |
 | placed | 612/630 | 613/630 |
 
-(`one_sphere`, live via `parsimony compare`: cellPACK's multi-second
-Python startup vs parsimony's sub-millisecond pack — thousands ×.)
+(~1,600×. cellPACK figure from a prior run; its multi-second Python/NumPy
+startup alone dwarfs parsimony's whole pack.)
 
-**legacy vs octree at whole-cell scale** (*Mycoplasma genitalium*, seed 0):
-
-| recipe | backend | placed | pack time | peak RAM |
-|---|---|---|---|---|
-| top-30 species | legacy | 50,248 | 74.8 s | 1.05 GB |
-| top-30 species | **octree** | **50,313** | **15.5 s** | 1.50 GB |
-| full (632 species) | legacy | 59,302 | 155.5 s | 2.39 GB |
-| full (632 species) | **octree** | **60,177** | **28.2 s** | 2.51 GB |
+**Whole cell.** The full *Mycoplasma genitalium* model is now far richer than a
+sphere pack — 682 real-structure species VdW-meshed at 1.5 Å, plus 48,719
+instanced dsDNA segments, 16,000 lipid bilayer patches, and 3,870 tiled RNA
+segments (~89k placements). It builds via the **staged `octree` pipeline**
+(`--proxy-lod 2`, with per-stage caching) in **~2 min at ~7 GB peak**. The
+`legacy` backend is impractical at this scale; `octree` is the whole-cell engine.
 
 ## Quickstart
 

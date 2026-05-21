@@ -123,15 +123,15 @@ structure for every species, batch-converts them to Van der Waals meshes
 (atomic SDF + surface nets), and emits a parsimony recipe — all in native
 Rust, no Python.
 
-- **Interior**: 546 cytoplasmic species placed inside the cell sphere.
-- **Surface**: 96 membrane proteins placed on the cell-sphere boundary
+- **Interior**: 552 cytoplasmic species placed inside the cell sphere.
+- **Surface**: 130 membrane-protein species placed on the cell-sphere boundary
   via parsimony's Surface region (with `principal_vector` alignment
   to surface normals).
 - **Membrane**: a real phospholipid bilayer. Each surface placement is one
   mesh *patch* — a hex-packed disc of ~250 real LHG (phosphatidylglycerol)
   lipids, mirrored tail-to-tail with the phosphate heads oriented outward —
-  tiled with a random in-plane roll over the cell sphere. A few thousand
-  patches give millions of effective lipids at a tiny instance count.
+  tiled with a random in-plane roll over the cell sphere. ~16,000 patches
+  stand in for ~4 million lipids at a tiny instance count.
 - **Chromosome + RNA**: the full genome as a genome-driven supercoiled fiber,
   rendered as tens of thousands of instances of a real B-DNA dodecamer (1BNA)
   tiled + twisted along the path; mRNA the same way (a real A-RNA segment,
@@ -170,7 +170,7 @@ centre-in-box containment:
 
 | | parsimony legacy (loose) | cellPACK (Python, jitter) | ratio |
 |---|---|---|---|
-| **Wall time** | **13.3 ms** | **31.5 s** | **~2 400× faster** |
+| **Wall time** | **~19 ms** | **31.5 s** | **~1 600× faster** |
 | Placements | 612/630 (97%) | 613/630 (97%) | matched |
 | Attempts | 614 | many thousands (each cell-rejection retries) | ~10–100× fewer |
 | Sample success | 99.7% | ≪10% on dense recipes | grid is authoritative |
@@ -189,7 +189,7 @@ cellpack           1 placement   ~4–6 s
 On a trivial recipe the gap is even wider (thousands ×) and noisy —
 cellPACK's multi-second Python/NumPy startup alone dwarfs parsimony's
 sub-millisecond pack. The representative figure is the dense
-`spheres_in_a_box` above: matched density, ~2 400× the speed. (cellPACK's
+`spheres_in_a_box` above: matched density, ~1 600× the speed. (cellPACK's
 `spheres_in_a_box` run is flaky to launch headless on this box; its
 31.5 s is the established prior measurement, so the live `compare`
 corroboration uses `one_sphere`.)
@@ -229,7 +229,7 @@ grid-resolution work the octree avoids:
 - It (re)builds a **per-directive** valid-cell list (cellPACK's
   `allIngrPts`), and because that grid (~405k cells) is below the
   `MAX_VALID_CELLS` (500k) fast-path threshold, each build is a **full
-  scan of the whole compartment grid** — repeated for all 630 directives
+  scan of the whole compartment grid** — repeated for all ~680 directives
   and again whenever a directive's list empties.
 - Every placement updates a grid neighbourhood sized by
   `r + max_required_radius`, i.e. by the **largest** ingredient (~374 Å)
@@ -240,27 +240,34 @@ occupied/free frontier of each actual sphere — so it sidesteps both. A
 *bigger/finer* grid would slow legacy down and cost more memory, not
 speed it up; the dense grid's volume-scaled memory only bites at far
 larger or sparser domains (tissue scale), which is where the octree's
-content scaling becomes load-bearing rather than merely faster. Both
-backends, seed 0, `parsimony pack`:
+content scaling becomes load-bearing rather than merely faster.
 
-| recipe (requested) | backend | placed | pack time | peak RAM | sample success |
-|---|---|---|---|---|---|
-| top-30 (50,313) | legacy | 50,248 (99.9%) | 74.8 s | 1.05 GB | 99.7% |
-| top-30 (50,313) | **octree** | **50,313 (100%)** | **15.5 s** | 1.50 GB | 62.9% |
-| full (65,154) | legacy | 59,302 (91%) | 155.5 s | 2.39 GB | 98.8% |
-| full (65,154) | **octree** | **60,177 (92%)** | **28.2 s** | 2.51 GB | 18.9% |
+Since that comparison the cell has grown far heavier — 682 species VdW-meshed at
+1.5 Å (not 2.5 Å), plus an instanced chromosome, lipid bilayer patches, and
+tiled mRNA — so absolute times are no longer comparable to the older 632-species
+/ 2.5 Å run. The qualitative result only sharpens: as placed content grows, the
+octree's content scaling pulls away from the grid's volume-scaled, per-directive
+work until `legacy` stops being practical. Full cell, seed 0, `--proxy-lod 2`:
 
-**Octree is ~4.8× faster on top-30, ~5.5× on the full cell, and fills
-slightly more** (it saturates the densest species better). The win here
-is **wall time, not memory** — peak RAM is comparable (mesh proxies
-dominate, and the clearance grid is tiny), and the octree is marginally
-higher on these dense recipes.
+| full cell · octree · `--proxy-lod 2` | placed | wall | peak RAM |
+|---|---|---|---|
+| single-shot `pack` | 36,980 / 43,486 (85%) | 5:49 | 13.5 GB |
+| staged `pipeline` (recommended) | comparable | ~2:00 | ~7 GB |
 
-The trade-off runs the other way on small/sparse recipes: there the
-grid's slack-bound (≈1 attempt per placement, 99.7% success) beats the
-octree's cheaper-but-more-numerous attempts (18.9–62.9% success). So
-the default stays `legacy`; reach for `--backend octree` on whole-cell
-recipes — it's what the `mycoplasma_full` pipeline uses.
+`pack` builds every collision proxy up front; the pipeline stages the build
+(chromosome → membrane → fiber proteins → densified interior) and content-caches
+each stage, landing the same cell in ~3× less wall time at roughly half the peak
+RAM. The `legacy` backend did **not** finish the full cell in a practical time
+at this scale and was abandoned — its per-directive valid-cell rebuilds and
+largest-ingredient grid neighbourhoods (above) don't amortise once content
+dominates the box. (The 85% placed is the densest-species saturation gap, not a
+backend limit.)
+
+On small/sparse recipes the trade-off still runs the other way: there the grid's
+slack-bound (≈1 attempt per placement, ~99.7% success) beats the octree's
+cheaper-but-more-numerous attempts. So the default stays `legacy`; reach for
+`--backend octree` and the staged pipeline on whole-cell recipes — it's what
+`mycoplasma_full` uses.
 
 ---
 
