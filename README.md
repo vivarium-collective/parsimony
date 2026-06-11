@@ -125,11 +125,11 @@ full feature inventory, and how to render report images / open the viewer.
   and `VoxelField` (sparse hierarchical voxel grid) + mesh voxeliser.
 - **`crates/parsimony-core`** — recipe loader, ingredients, compartments,
   both placement backends (`clearance_grid` + `octree`), staged
-  `pipeline`, `relax`, and output emitters.
+  `pipeline`, `relax`, `metrics`, and output emitters.
 - **`crates/parsimony-cli`** — the `parsimony` binary: `pack` / `compare` /
-  `pipeline` / `mesh` / `translate-mycoplasma` / `demos` / `viewer`. `mesh` and
-  `translate-mycoplasma` are native Rust (PDB/mmCIF parse + VdW surface-nets
-  mesher, RCSB fetch) — no Python.
+  `metrics` / `pipeline` / `mesh` / `translate-mycoplasma` / `demos` /
+  `viewer`. `mesh` and `translate-mycoplasma` are native Rust (PDB/mmCIF
+  parse + VdW surface-nets mesher, RCSB fetch) — no Python.
 - **`crates/parsimony-gpu`** — wgpu clearance-grid update (Phase 4).
 - **`crates/parsimony-bench`** — cellPACK comparison harness.
 
@@ -137,3 +137,9 @@ full feature inventory, and how to render report images / open the viewer.
 
 See [`docs/parsimony-design.md`](docs/parsimony-design.md) for the
 architectural blueprint, roadmap, and open questions.
+
+## Roadmap / task list
+
+[`docs/ROADMAP.md`](docs/ROADMAP.md) is the living backlog for forward
+work (gradients, partner packing, realtime animation, …) — what's
+shipped, what's partial, and what's next.

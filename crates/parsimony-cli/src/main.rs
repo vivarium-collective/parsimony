@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod mesh_gen;
 
 use parsimony_core::{
-    write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
-    PlacementBackend, Pipeline, PlacerConfig, PlacerOutcome, Recipe,
+    metrics, write_pack_json, write_simularium_json, write_transforms_json, GreedyRandomPlacer,
+    MetricsConfig, PlacementBackend, Pipeline, PlacerConfig, PlacerOutcome, Recipe,
 };
 
 #[derive(Debug, Parser)]
@@ -51,6 +51,9 @@ enum Command {
     Report(ReportArgs),
     /// Run a staged packing pipeline (DAG + content-addressed cache).
     Pipeline(PipelineArgs),
+    /// Pack a recipe and report quantitative metrics — overlaps, fill,
+    /// pair-correlation g(r), nearest-neighbour distances, free space.
+    Metrics(MetricsArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
         Command::Render(args) => run_render(args),
         Command::Report(args) => run_report(args),
         Command::Pipeline(args) => run_pipeline(args),
+        Command::Metrics(args) => run_metrics(args),
     }
 }
 
@@ -272,6 +276,152 @@ fn run_pack(args: PackArgs) -> Result<()> {
                 Format::Transforms => "transform-list",
             }
         );
+    }
+    Ok(())
+}
+
+// ───── metrics ──────────────────────────────────────────────────────
+
+#[derive(Debug, Parser)]
+struct MetricsArgs {
+    /// Recipe JSON path.
+    recipe: PathBuf,
+
+    /// RNG seed — drives both the pack and the Monte-Carlo free-space
+    /// sampling, so the whole report is reproducible.
+    #[arg(short, long, default_value_t = 0)]
+    seed: u64,
+
+    /// Interior-placement engine (see `pack --backend`).
+    #[arg(long, value_enum, default_value_t = Backend::Legacy)]
+    backend: Backend,
+
+    /// cellPACK-style loose root containment (centre-in-box).
+    #[arg(long)]
+    loose_bounds: bool,
+
+    /// Build mesh collision proxies from this LOD index (0 = coarsest).
+    #[arg(long)]
+    proxy_lod: Option<usize>,
+
+    /// Override the legacy clearance-grid cell size, in Å.
+    #[arg(long)]
+    cell_size: Option<f32>,
+
+    /// Override the recipe's chromosome bead count.
+    #[arg(long)]
+    chromosome_beads: Option<usize>,
+
+    /// Emit the full metrics as JSON on stdout instead of a summary.
+    #[arg(long)]
+    json: bool,
+
+    /// Number of pair-correlation g(r) bins (0 disables the RDF).
+    #[arg(long, default_value_t = 64)]
+    rdf_bins: usize,
+
+    /// Monte-Carlo samples for the free-space estimate (0 disables it).
+    #[arg(long, default_value_t = 8192)]
+    samples: usize,
+}
+
+fn run_metrics(args: MetricsArgs) -> Result<()> {
+    let recipe = Recipe::from_file_with_proxy_lod(&args.recipe, args.proxy_lod)
+        .with_context(|| format!("loading recipe `{}`", args.recipe.display()))?;
+
+    let placer_config = PlacerConfig {
+        strict_bounds: !args.loose_bounds,
+        backend: args.backend.into(),
+        clearance_cell_size: args.cell_size,
+        chromosome_beads: args.chromosome_beads,
+        ..PlacerConfig::default()
+    };
+    let t = Instant::now();
+    let placer = GreedyRandomPlacer::new(&recipe, placer_config);
+    let out = placer.pack(args.seed);
+    let pack_elapsed = t.elapsed();
+
+    let cfg = MetricsConfig {
+        rdf_bins: args.rdf_bins,
+        free_space_samples: args.samples,
+        seed: args.seed,
+        ..MetricsConfig::default()
+    };
+    let t2 = Instant::now();
+    let m = metrics::compute(&out.snapshot, &recipe, &cfg);
+    let metrics_elapsed = t2.elapsed();
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&m)?);
+        return Ok(());
+    }
+
+    let backend = match args.backend {
+        Backend::Legacy => "legacy",
+        Backend::Octree => "octree",
+    };
+    println!("recipe: {}  (seed {}, backend {})", m.recipe_name, m.seed, backend);
+    println!(
+        "packed {} / {} requested ({:.0}%) in {:.2?}; metrics in {:.2?}",
+        m.n_placed,
+        m.n_requested,
+        100.0 * m.fraction_placed,
+        pack_elapsed,
+        metrics_elapsed,
+    );
+    println!("domain volume: {:.3e} Å³", m.domain_volume);
+
+    let o = &m.geometry.overlaps;
+    if o.pair_count == 0 {
+        println!("overlaps: none");
+    } else {
+        println!(
+            "overlaps: {} pairs across {} instances (max depth {:.3} Å, mean {:.3} Å)",
+            o.pair_count, o.instance_count, o.max_depth, o.mean_depth,
+        );
+    }
+
+    let nn = &m.geometry.nearest_neighbor;
+    if nn.center.n > 0 {
+        println!(
+            "nearest neighbour (centre):  min {:.2}  median {:.2}  max {:.2}  (mean {:.2} ± {:.2}) Å",
+            nn.center.min, nn.center.median, nn.center.max, nn.center.mean, nn.center.stddev,
+        );
+        println!(
+            "nearest neighbour (surface): min {:.2}  median {:.2} Å  (negative ⇒ contact/overlap)",
+            nn.surface_gap.min, nn.surface_gap.median,
+        );
+    }
+
+    if let Some(rdf) = &m.geometry.rdf {
+        let (pk_i, pk_g) = rdf
+            .g
+            .iter()
+            .enumerate()
+            .fold((0usize, 0.0f32), |(bi, bg), (i, &g)| if g > bg { (i, g) } else { (bi, bg) });
+        println!(
+            "g(r): peak g={:.2} at r={:.1} Å  (r_max {:.1} Å, {} bins, ρ={:.3e}/Å³)",
+            pk_g,
+            rdf.r.get(pk_i).copied().unwrap_or(0.0),
+            rdf.r_max,
+            rdf.g.len(),
+            rdf.number_density,
+        );
+    }
+
+    if let Some(fs) = &m.geometry.free_space {
+        println!(
+            "free space: {:.1}% occupied; void radius median {:.2}  max {:.2} Å  ({} samples)",
+            100.0 * fs.occupied_fraction,
+            fs.clearance.median,
+            fs.clearance.max,
+            fs.samples,
+        );
+    }
+
+    println!("per-ingredient (placed / requested):");
+    for f in &m.per_ingredient {
+        println!("  {:<28} {:>6} / {:<6}", f.name, f.placed, f.requested);
     }
     Ok(())
 }

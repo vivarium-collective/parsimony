@@ -422,6 +422,13 @@ more efficient.
   process and (if `../cellpack/.venv` is present) cellPACK too, then
   prints a side-by-side table of placements, wall time, per-radius
   counts, and position spread. The validation harness.
+- `parsimony metrics <recipe> [--backend ...] [--json]` — packs a recipe
+  and reports quantitative pack metrics: exact-proxy **overlaps** +
+  penetration depth, **fill** (placed/requested, per ingredient),
+  **nearest-neighbour** distance (centre + surface gap),
+  **pair-correlation g(r)**, and a Monte-Carlo **free-space / void-size**
+  estimate. QBVH-accelerated, so it scales to whole-cell packs. (Core:
+  `parsimony-core/src/metrics.rs`.)
 - `parsimony pipeline run <pipeline.json> [--force] [--relax N]` —
   staged packing as a build system (chromosome → membrane → fibers →
   densified interior), each stage content-addressed and cached;
@@ -610,10 +617,11 @@ crates/parsimony-core/       # recipe loader, ingredients, compartments, placer,
   src/pipeline.rs              # staged packing (DAG + content-addressed cache)
   src/relax.rs                 # post-merge clash relaxation
   src/recipe.rs                # JSON loader + composition walker
+  src/metrics.rs               # quantitative pack metrics (overlaps, g(r), NN, free space)
   src/output.rs                # pack.v1 + Simularium + transforms emitters
 crates/parsimony-cli/        # the `parsimony` binary — every command below
-                             #   pack / compare / pipeline / mesh / demos / viewer
-                             #   translate-mycoplasma / render / report
+                             #   pack / compare / metrics / pipeline / mesh / demos
+                             #   viewer / translate-mycoplasma / render / report
 crates/parsimony-gpu/        # wgpu clearance-grid update (Phase 4)
 crates/parsimony-bench/      # cellPACK comparison harness (parse + runner + compare)
 examples/recipes/            # shape_zoo.json, blood_plasma.json, mycoplasma.json, pdb_proteins.json

@@ -653,6 +653,11 @@ comparison.
 
 ## 14. Roadmap
 
+> Phases 0–3 below are delivered (the whole *M. genitalium* cell packs
+> end to end). Forward feature work — gradients, partner packing,
+> realtime animation, container/ingredient unification — now lives in
+> the living backlog at [`ROADMAP.md`](ROADMAP.md).
+
 ### Phase 0 — design (done 2026-05-18)
 
 This document. Workspace skeleton.

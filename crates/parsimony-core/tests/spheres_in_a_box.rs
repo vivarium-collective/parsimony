@@ -99,6 +99,44 @@ fn no_overlaps_in_packing() {
 }
 
 #[test]
+fn metrics_report_is_sane() {
+    // Exercise the A1 metrics harness end-to-end on a real pack: a clean
+    // pack must report zero overlaps, the Monte-Carlo occupied fraction
+    // must be a sane (0,1), g(r) must be present, and every instance must
+    // get a nearest-neighbour distance.
+    let Some(path) = spheres_recipe_path() else {
+        return;
+    };
+    let recipe = Recipe::from_file(path).expect("load recipe");
+    let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+    let out = placer.pack(0xC0DE);
+
+    let cfg = parsimony_core::MetricsConfig {
+        free_space_samples: 4096,
+        ..Default::default()
+    };
+    let m = parsimony_core::metrics::compute(&out.snapshot, &recipe, &cfg);
+
+    assert_eq!(
+        m.geometry.overlaps.pair_count, 0,
+        "a clean pack must have no overlapping pairs"
+    );
+    assert_eq!(m.n_placed, out.snapshot.placements.len());
+    assert_eq!(
+        m.geometry.nearest_neighbor.center.n,
+        out.snapshot.placements.len(),
+        "every instance should get a nearest-neighbour distance"
+    );
+    assert!(m.geometry.rdf.is_some(), "g(r) should be computed");
+    let fs = m.geometry.free_space.expect("free-space estimate");
+    assert!(
+        fs.occupied_fraction > 0.0 && fs.occupied_fraction < 1.0,
+        "occupied fraction {} out of range",
+        fs.occupied_fraction
+    );
+}
+
+#[test]
 fn all_inside_bounding_box() {
     // Default PlacerConfig has `strict_bounds: true` — sphere fully
     // inside the box. Loose-bounds mode (which would allow protrusions

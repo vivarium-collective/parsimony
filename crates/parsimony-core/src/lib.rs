@@ -9,6 +9,7 @@ pub mod fiber;
 pub mod fiber_pack;
 pub mod genome;
 pub mod ingredient;
+pub mod metrics;
 pub(crate) mod octree;
 pub mod output;
 pub mod pipeline;
@@ -21,6 +22,7 @@ pub use compartment::{Compartment, CompartmentId, CompartmentKind};
 pub use fiber_pack::{pack_on_fiber, pack_on_fiber_at, FiberBinding};
 pub use genome::{Gene, Genome};
 pub use ingredient::{Ingredient, IngredientId, IngredientShape, ProxySphere};
+pub use metrics::{GeometryMetrics, MetricsConfig, PackMetrics};
 pub use output::{write_pack_json, write_simularium_json, write_transforms_json};
 pub use pipeline::{
     Pipeline, PipelineError, PipelineRun, Stage, StageKind, StagePlan, StageReport,
