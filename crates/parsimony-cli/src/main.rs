@@ -471,6 +471,8 @@ const DEMOS: &[Demo] = &[
            recipe: "examples/recipes/mycoplasma.json", out: "mycoplasma_top30.pack.json", loose_bounds: false },
     Demo { id: "mycoplasma_full", label: "mycoplasma (full) — 642 species + lipid bilayer",
            recipe: "examples/recipes/mycoplasma_full.json", out: "mycoplasma_full.pack.json", loose_bounds: false },
+    Demo { id: "ecoli_nucleoid", label: "E. coli — capsule + 4.6 Mbp rod nucleoid",
+           recipe: "examples/recipes/ecoli_nucleoid.json", out: "ecoli_nucleoid.pack.json", loose_bounds: false },
 ];
 
 #[derive(Debug, Parser)]
