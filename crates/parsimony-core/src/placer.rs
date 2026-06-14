@@ -608,7 +608,7 @@ impl<'a> GreedyRandomPlacer<'a> {
         let Some(chr) = &self.recipe.chromosome else {
             return;
         };
-        let Some((center, cell_r)) = self.chromosome_cell(chr) else {
+        let Some((center, shape)) = self.chromosome_cell(chr) else {
             return;
         };
         // Genome resolution: recipe value unless overridden (e.g. `pack
@@ -628,7 +628,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                     .map(|g| g.domain_bead_allocation(beads, sc.domains))
                     .unwrap_or_else(|| vec![(beads / sc.domains.max(1)).max(2); sc.domains.max(1)]);
                 crate::fiber::generate_nucleoid(
-                    cell_r,
+                    shape,
                     &alloc,
                     chr.spacing,
                     chr.bead_radius,
@@ -637,7 +637,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                     rng,
                 )
             }
-            None => crate::fiber::generate_fiber(cell_r, beads, chr.spacing, chr.bead_radius, rng),
+            None => crate::fiber::generate_fiber(shape, beads, chr.spacing, chr.bead_radius, rng),
         };
         if !chr.proteins.is_empty() && pts.len() >= 2 {
             let fiber_world: Vec<Point3<f32>> =
@@ -894,16 +894,36 @@ impl<'a> GreedyRandomPlacer<'a> {
     fn chromosome_cell(
         &self,
         chr: &crate::recipe::ChromosomeSpec,
-    ) -> Option<(Point3<f32>, f32)> {
+    ) -> Option<(Point3<f32>, crate::fiber::CellShape)> {
+        use crate::compartment::CompartmentKind;
+        use crate::fiber::CellShape;
         for (name, comp) in &self.recipe.compartments {
             if let Some(want) = &chr.compartment {
                 if name != want {
                     continue;
                 }
             }
-            if let crate::compartment::CompartmentKind::Sphere { center, radius } = &comp.kind {
-                return Some((*center, *radius));
-            }
+            let (center, shape) = match &comp.kind {
+                CompartmentKind::Sphere { center, radius } => {
+                    (*center, CellShape::Sphere { radius: *radius })
+                }
+                CompartmentKind::Capsule { a, b, radius } => {
+                    let axis_v = b - a;
+                    let half_len = axis_v.norm() * 0.5;
+                    let axis = axis_v
+                        .try_normalize(1e-6)
+                        .unwrap_or_else(nalgebra::Vector3::x);
+                    let center = Point3::from((a.coords + b.coords) * 0.5);
+                    (center, CellShape::Capsule { half_len, radius: *radius, axis })
+                }
+                CompartmentKind::Box(aabb) => {
+                    (aabb.center(), CellShape::Sphere { radius: aabb.half_extents().min() })
+                }
+                CompartmentKind::Mesh(m) => {
+                    (m.aabb.center(), CellShape::Sphere { radius: m.aabb.half_extents().min() })
+                }
+            };
+            return Some((center, shape));
         }
         None
     }
