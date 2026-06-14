@@ -127,7 +127,7 @@ impl Genome {
     fn loci_in_name(&self, name: &str) -> Vec<String> {
         let parts: Vec<&str> = name.split('_').collect();
         let mut out: Vec<String> = Vec::new();
-        let mut push = |c: String, out: &mut Vec<String>| {
+        let push = |c: String, out: &mut Vec<String>| {
             if self.by_locus.contains_key(&c) && !out.contains(&c) {
                 out.push(c);
             }
