@@ -1,0 +1,70 @@
+{
+    "name": "ecoli_nucleoid",
+    "version": "0.1.0",
+    "format_version": "2.1-parsimony",
+    "description": "E. coli engine demo: capsule cell ~2 µm × 0.8 µm with a 4.6 Mbp supercoiled rod nucleoid seated at real K-12 loci, RNAP bound along the fiber, a few abundant proteins, and an inner-membrane lipid shell. Curated structures; the full v2ecoli-driven proteome is Plan 2.",
+    "bounding_box": [[-11000, -4500, -4500], [11000, 4500, 4500]],
+    "objects": {
+        "dna_segment": {
+            "type": "mesh",
+            "color": [0.85, 0.75, 0.45],
+            "mesh_lods": [
+                {"path": "../pdb_meshes/1BNA.lod0.obj", "voxel_size": 16.0},
+                {"path": "../pdb_meshes/1BNA.lod1.obj", "voxel_size": 8.0},
+                {"path": "../pdb_meshes/1BNA.lod2.obj", "voxel_size": 4.0},
+                {"path": "../pdb_meshes/1BNA.lod3.obj", "voxel_size": 1.5}
+            ]
+        },
+        "rnap": {
+            "type": "mesh",
+            "color": [0.35, 0.6, 0.9],
+            "mesh_lods": [
+                {"path": "../pdb_meshes/1hqm.lod0.obj", "voxel_size": 16.0},
+                {"path": "../pdb_meshes/1hqm.lod1.obj", "voxel_size": 8.0},
+                {"path": "../pdb_meshes/1hqm.lod2.obj", "voxel_size": 4.0}
+            ],
+            "proxy_voxel_size": 12.0
+        },
+        "groel": {
+            "type": "mesh",
+            "color": [0.9, 0.9, 0.35],
+            "mesh_lods": [
+                {"path": "../pdb_meshes/1aon.lod0.obj", "voxel_size": 16.0},
+                {"path": "../pdb_meshes/1aon.lod1.obj", "voxel_size": 8.0},
+                {"path": "../pdb_meshes/1aon.lod2.obj", "voxel_size": 4.0}
+            ],
+            "proxy_voxel_size": 12.0
+        },
+        "lipid": {
+            "type": "single_sphere",
+            "color": [0.95, 0.85, 0.6],
+            "radius": 12,
+            "principal_vector": [0, 0, 1]
+        }
+    },
+    "composition": {
+        "space": { "regions": { "interior": ["cell"] } },
+        "cell": {
+            "compartment": { "kind": "capsule", "a": [-7000, 0, 0], "b": [7000, 0, 0], "radius": 4000 },
+            "regions": {
+                "interior": [
+                    { "object": "groel", "count": 300 }
+                ],
+                "surface": [
+                    { "object": "lipid", "count": 40000 }
+                ]
+            }
+        }
+    },
+    "chromosome": {
+        "beads": 34000,
+        "spacing": 135.0,
+        "bead_radius": 12.0,
+        "color": [0.85, 0.75, 0.45],
+        "compartment": "cell",
+        "segment": "dna_segment",
+        "genome": "../genome/ecoli_k12_genes.csv",
+        "supercoil": { "radius": 90.0, "pitch": 130.0, "domains": 200 },
+        "proteins": [ { "object": "rnap", "count": 1500 } ]
+    }
+}

@@ -1,0 +1,13 @@
+{
+    "name": "ecoli_nucleoid_staged",
+    "recipe": "../recipes/ecoli_nucleoid.json",
+    "seed": 0,
+    "strict_bounds": true,
+    "backend": "octree",
+    "stages": [
+        { "id": "chromosome", "kind": "chromosome" },
+        { "id": "membrane", "kind": "pack", "include": ["lipid"] },
+        { "id": "fiber_proteins", "kind": "fiber_pack", "depends_on": ["chromosome"] },
+        { "id": "interior", "kind": "pack", "exclude": ["lipid"], "densify": true, "depends_on": ["chromosome", "fiber_proteins"], "clearance_cell_size": 40 }
+    ]
+}
