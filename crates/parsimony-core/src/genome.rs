@@ -111,10 +111,44 @@ impl Genome {
     /// `MG_022_MONOMER` → one site, `MG_098_099_100_TRIMER` → three. Empty
     /// when the name carries no recognizable `MG_<digits>` locus (rnap, tRNA…).
     pub fn ingredient_sites(&self, ingredient_name: &str) -> Vec<u32> {
-        loci_in_name(ingredient_name)
+        self.loci_in_name(ingredient_name)
             .into_iter()
             .filter_map(|locus| self.gene(&locus).map(Gene::midpoint))
             .collect()
+    }
+
+    /// Locus tags referenced by an ingredient name, validated against the
+    /// genome's real locus set (organism-agnostic — no hardcoded prefix).
+    /// Two candidate forms are checked: (a) each `_`-separated token verbatim
+    /// (`EG10001`, `b0014`); (b) a letter-prefixed token joined with each
+    /// following run of digit tokens (`MG`,`022` → `MG_022`,
+    /// `MG_098_099_100` → `MG_098`, `MG_099`, `MG_100`). Only candidates present
+    /// in `by_locus` are returned, preserving order and de-duplicating.
+    fn loci_in_name(&self, name: &str) -> Vec<String> {
+        let parts: Vec<&str> = name.split('_').collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |c: String, out: &mut Vec<String>| {
+            if self.by_locus.contains_key(&c) && !out.contains(&c) {
+                out.push(c);
+            }
+        };
+        for (i, &p) in parts.iter().enumerate() {
+            // (a) token verbatim
+            push(p.to_string(), &mut out);
+            // (b) <letters>_<digits>… reconstruction (Mycoplasma style)
+            let is_alpha = !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphabetic());
+            if is_alpha {
+                let mut j = i + 1;
+                while j < parts.len()
+                    && !parts[j].is_empty()
+                    && parts[j].bytes().all(|b| b.is_ascii_digit())
+                {
+                    push(format!("{}_{}", p, parts[j]), &mut out);
+                    j += 1;
+                }
+            }
+        }
+        out
     }
 
     /// Position around the circular genome as a fraction in `[0, 1)`.
@@ -233,31 +267,6 @@ impl Genome {
     }
 }
 
-/// Extract old locus tags from an ingredient name: each `MG` token followed by
-/// one or more all-digit `_`-separated parts becomes `MG_<digits>`.
-/// `MG_098_099_100_TRIMER` → `[MG_098, MG_099, MG_100]`.
-fn loci_in_name(name: &str) -> Vec<String> {
-    let parts: Vec<&str> = name.split('_').collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i] == "MG" {
-            let mut j = i + 1;
-            while j < parts.len()
-                && !parts[j].is_empty()
-                && parts[j].bytes().all(|b| b.is_ascii_digit())
-            {
-                out.push(format!("MG_{}", parts[j]));
-                j += 1;
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,14 +302,32 @@ mod tests {
 
     #[test]
     fn loci_tokenizer_handles_complexes() {
-        assert_eq!(loci_in_name("MG_022_MONOMER"), vec!["MG_022"]);
+        let g = Genome::from_csv(&table()).unwrap();
+        assert_eq!(g.loci_in_name("MG_022_MONOMER"), vec!["MG_022"]);
         assert_eq!(
-            loci_in_name("MG_098_099_100_TRIMER"),
+            g.loci_in_name("MG_098_099_100_TRIMER"),
             vec!["MG_098", "MG_099", "MG_100"]
         );
-        assert_eq!(loci_in_name("MG_213_214_298_6MER_ADP"),
-            vec!["MG_213", "MG_214", "MG_298"]);
-        assert!(loci_in_name("rnap").is_empty());
+        assert!(g.loci_in_name("rnap").is_empty());
+    }
+
+    #[test]
+    fn loci_lookup_is_organism_agnostic() {
+        // A tiny in-memory E. coli-style genome (b-numbers + an EcoCyc id).
+        let csv = "# genome_length_bp=4641652\n\
+                   old_locus_tag,locus_tag,start,end,strand,biotype\n\
+                   b0014,dnaK,12163,14079,+,protein_coding\n\
+                   EG10001,thrA,337,2799,+,protein_coding\n";
+        let tmp = std::env::temp_dir().join("ecoli_loci_test.csv");
+        std::fs::write(&tmp, csv).unwrap();
+        let g = Genome::from_csv(&tmp).unwrap();
+        // b-number embedded in an ingredient name resolves to its gene midpoint.
+        assert_eq!(g.ingredient_sites("b0014_dnaK_MONOMER"), vec![(12163 + 14079) / 2]);
+        // EcoCyc single-token id resolves too.
+        assert_eq!(g.ingredient_sites("EG10001"), vec![(337 + 2799) / 2]);
+        // Unknown tokens map to nothing.
+        assert!(g.ingredient_sites("ribosome_30S").is_empty());
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
