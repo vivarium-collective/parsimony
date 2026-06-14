@@ -110,13 +110,13 @@ fn random_unit<R: Rng>(rng: &mut R) -> Vector3<f32> {
 /// centre). Returns however many beads it placed — if the walk traps
 /// itself in the confined volume it stops early rather than spinning.
 pub fn generate_fiber<R: Rng>(
-    cell_radius: f32,
+    shape: CellShape,
     bead_count: usize,
     step: f32,
     bead_radius: f32,
     rng: &mut R,
 ) -> Vec<Point3<f32>> {
-    let max_r = (cell_radius - bead_radius).max(step);
+    let inset = shape.inset(bead_radius);
     let min_sep = 1.5 * bead_radius;
     let min_sep2 = min_sep * min_sep;
 
@@ -133,7 +133,7 @@ pub fn generate_fiber<R: Rng>(
             // Worm-like chain: blend persistence (stiffness) with noise.
             let cd = (dir * 0.65 + rnd * 0.35).normalize();
             let next = last + cd * step;
-            if next.coords.norm() > max_r {
+            if !inset.contains(&next) {
                 continue; // would leave the cell
             }
             // Self-avoidance (the immediate predecessor is allowed to touch).
@@ -155,12 +155,10 @@ pub fn generate_fiber<R: Rng>(
         if placed {
             stuck_runs = 0;
         } else {
-            // Trapped: kink in a fresh direction biased toward the centre
-            // to escape a crowded boundary. Give up if it keeps failing
+            // Trapped: kink in a fresh direction biased toward the medial
+            // axis to escape a crowded boundary. Give up if it keeps failing
             // (the cell is saturated at this spacing).
-            let toward_center = (Point3::origin() - last)
-                .try_normalize(1e-6)
-                .unwrap_or_else(|| random_unit(rng));
+            let toward_center = inset.inward(&last);
             dir = (random_unit(rng) * 0.5 + toward_center * 0.5).normalize();
             stuck_runs += 1;
             if stuck_runs > bead_count {
@@ -567,44 +565,51 @@ mod tests {
     #[test]
     fn fiber_is_confined_spaced_and_self_avoiding() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
-        let (cell_radius, step, bead_radius) = (200.0_f32, 10.0_f32, 4.0_f32);
-        let pts = generate_fiber(cell_radius, 1500, step, bead_radius, &mut rng);
-
-        // Should fill a good fraction of the cell before (if) trapping.
+        let (radius, step, bead_radius) = (200.0_f32, 10.0_f32, 4.0_f32);
+        let shape = CellShape::Sphere { radius };
+        let pts = generate_fiber(shape, 1500, step, bead_radius, &mut rng);
         assert!(pts.len() > 800, "placed only {} beads", pts.len());
-
-        // Every bead inside the cell.
         for p in &pts {
-            assert!(
-                p.coords.norm() <= cell_radius - bead_radius + 1e-2,
-                "bead outside cell: {}",
-                p.coords.norm()
-            );
+            assert!(p.coords.norm() <= radius - bead_radius + 1e-2, "outside: {}", p.coords.norm());
         }
-        // Consecutive beads spaced ~step.
         for w in pts.windows(2) {
             let d = (w[1] - w[0]).norm();
             assert!((d - step).abs() < 1e-2, "step {d} != {step}");
         }
-        // Non-adjacent beads don't overlap.
         let min_sep = 1.5 * bead_radius;
         for i in 0..pts.len() {
             for j in (i + 2)..pts.len() {
-                assert!(
-                    (pts[i] - pts[j]).norm() >= min_sep - 1e-2,
-                    "beads {i} and {j} overlap"
-                );
+                assert!((pts[i] - pts[j]).norm() >= min_sep - 1e-2, "beads {i},{j} overlap");
             }
         }
+    }
+
+    #[test]
+    fn fiber_confined_to_capsule() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+        let (half_len, radius, step, bead) = (700.0_f32, 400.0_f32, 22.0_f32, 10.0_f32);
+        let shape = CellShape::Capsule { half_len, radius, axis: Vector3::x() };
+        let pts = generate_fiber(shape, 2000, step, bead, &mut rng);
+        assert!(pts.len() > 1000, "placed only {} beads", pts.len());
+        let inset = shape.inset(bead);
+        for p in &pts {
+            assert!(inset.contains(p), "bead outside capsule: {p}");
+        }
+        // The rod should be longer than it is wide: x-extent > radius.
+        let xext = pts.iter().map(|p| p.x).fold(f32::MIN, f32::max)
+            - pts.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(xext > radius, "fiber should extend along the rod, x-extent {xext}");
     }
 
     #[test]
     fn deterministic_for_seed() {
         let mut a = Xoshiro256PlusPlus::seed_from_u64(42);
         let mut b = Xoshiro256PlusPlus::seed_from_u64(42);
-        let pa = generate_fiber(150.0, 300, 8.0, 3.0, &mut a);
-        let pb = generate_fiber(150.0, 300, 8.0, 3.0, &mut b);
-        assert_eq!(pa, pb);
+        let s = CellShape::Sphere { radius: 150.0 };
+        assert_eq!(
+            generate_fiber(s, 300, 8.0, 3.0, &mut a),
+            generate_fiber(s, 300, 8.0, 3.0, &mut b)
+        );
     }
 
     #[test]
