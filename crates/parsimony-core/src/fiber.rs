@@ -14,6 +14,78 @@
 use nalgebra::{Matrix3, Point3, Rotation3, Unit, UnitQuaternion, Vector3};
 use rand::Rng;
 
+/// The envelope the chromosome is confined to, in the origin-relative frame
+/// the fiber generators use (the caller offsets the result by the compartment
+/// centre). A sphere is centred at the origin; a capsule's medial segment runs
+/// from `-half_len*axis` to `+half_len*axis` with cap radius `radius`.
+#[derive(Debug, Clone, Copy)]
+pub enum CellShape {
+    Sphere { radius: f32 },
+    Capsule { half_len: f32, radius: f32, axis: Vector3<f32> },
+}
+
+impl CellShape {
+    /// Farthest interior extent from the origin (used for fallback sizing).
+    pub fn reach(&self) -> f32 {
+        match *self {
+            CellShape::Sphere { radius } => radius,
+            CellShape::Capsule { half_len, radius, .. } => half_len + radius,
+        }
+    }
+
+    /// Shrink the envelope inward by `margin` on every side.
+    pub fn inset(&self, margin: f32) -> CellShape {
+        match *self {
+            CellShape::Sphere { radius } => CellShape::Sphere { radius: (radius - margin).max(0.0) },
+            CellShape::Capsule { half_len, radius, axis } => CellShape::Capsule {
+                half_len: (half_len - margin).max(0.0),
+                radius: (radius - margin).max(0.0),
+                axis,
+            },
+        }
+    }
+
+    /// Nearest point on the medial axis (sphere: the origin).
+    fn medial(&self, p: &Point3<f32>) -> Point3<f32> {
+        match *self {
+            CellShape::Sphere { .. } => Point3::origin(),
+            CellShape::Capsule { half_len, axis, .. } => {
+                let t = p.coords.dot(&axis).clamp(-half_len, half_len);
+                Point3::from(axis * t)
+            }
+        }
+    }
+
+    /// Is `p` (origin-relative) inside the envelope?
+    pub fn contains(&self, p: &Point3<f32>) -> bool {
+        (p - self.medial(p)).norm() <= self.cap_radius()
+    }
+
+    pub(crate) fn cap_radius(&self) -> f32 {
+        match *self {
+            CellShape::Sphere { radius } => radius,
+            CellShape::Capsule { radius, .. } => radius,
+        }
+    }
+
+    /// Outward unit direction (radial from the medial axis) at `p`.
+    pub fn outward(&self, p: &Point3<f32>) -> Vector3<f32> {
+        (p - self.medial(p)).try_normalize(1e-6).unwrap_or_else(|| perp(self.long_axis()))
+    }
+
+    /// Direction toward the medial axis/centre at `p` (escape direction).
+    pub fn inward(&self, p: &Point3<f32>) -> Vector3<f32> {
+        (self.medial(p) - p).try_normalize(1e-6).unwrap_or_else(|| perp(self.long_axis()))
+    }
+
+    fn long_axis(&self) -> Vector3<f32> {
+        match *self {
+            CellShape::Sphere { .. } => Vector3::z(),
+            CellShape::Capsule { axis, .. } => axis,
+        }
+    }
+}
+
 /// Uniformly random unit vector (rejection-sampled in the unit ball).
 fn random_unit<R: Rng>(rng: &mut R) -> Vector3<f32> {
     loop {
@@ -471,6 +543,26 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;
+
+    #[test]
+    fn cellshape_sphere_and_capsule_contain_and_inset() {
+        let s = CellShape::Sphere { radius: 100.0 };
+        assert!(s.contains(&Point3::new(0.0, 0.0, 99.0)));
+        assert!(!s.contains(&Point3::new(0.0, 0.0, 101.0)));
+        assert_eq!(s.inset(10.0).reach(), 90.0);
+
+        // Capsule along x: half_len 700, radius 400 (the ecoli_starter cell).
+        let c = CellShape::Capsule { half_len: 700.0, radius: 400.0, axis: Vector3::x() };
+        // On-axis beyond the cylinder but within a cap:
+        assert!(c.contains(&Point3::new(700.0, 0.0, 399.0)));
+        assert!(!c.contains(&Point3::new(700.0, 0.0, 401.0)));
+        // Far past the cap tip is outside:
+        assert!(!c.contains(&Point3::new(1101.0, 0.0, 0.0)));
+        assert!(c.contains(&Point3::new(1099.0, 0.0, 0.0)));
+        // Outward direction is radial from the medial axis (perpendicular to x):
+        let o = c.outward(&Point3::new(0.0, 0.0, 50.0));
+        assert!((o - Vector3::z()).norm() < 1e-5);
+    }
 
     #[test]
     fn fiber_is_confined_spaced_and_self_avoiding() {
