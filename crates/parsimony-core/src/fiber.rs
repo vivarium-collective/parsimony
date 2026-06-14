@@ -180,7 +180,7 @@ pub fn generate_fiber<R: Rng>(
 /// coil can't fit the cell. Points are origin-relative; deterministic for
 /// a given RNG.
 pub fn generate_supercoiled_fiber<R: Rng>(
-    cell_radius: f32,
+    shape: CellShape,
     bead_count: usize,
     step: f32,
     bead_radius: f32,
@@ -189,8 +189,8 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     rng: &mut R,
 ) -> Vec<Point3<f32>> {
     // No coil (or it can't fit): just lay a plain self-avoiding walk.
-    if sc_radius <= 1e-3 || cell_radius < sc_radius + 2.0 * bead_radius + step {
-        return generate_fiber(cell_radius, bead_count, step, bead_radius, rng);
+    if sc_radius <= 1e-3 || shape.reach() < sc_radius + 2.0 * bead_radius + step {
+        return generate_fiber(shape, bead_count, step, bead_radius, rng);
     }
     let tau = std::f32::consts::TAU;
     let cpt = ((tau * sc_radius).powi(2) + sc_pitch * sc_pitch).sqrt(); // contour / turn
@@ -210,9 +210,9 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     let axis_len_target = n_half as f32 * da * 1.8;
     let axis_step = (sc_pitch / 6.0).max(2.0 * bead_radius);
     let axis_n = ((axis_len_target / axis_step).ceil() as usize + 2).max(2);
-    let mut axis = generate_fiber(cell_radius - sc_radius, axis_n, axis_step, bead_radius, rng);
+    let mut axis = generate_fiber(shape.inset(sc_radius), axis_n, axis_step, bead_radius, rng);
     if axis.len() < 2 {
-        return generate_fiber(cell_radius, bead_count, step, bead_radius, rng);
+        return generate_fiber(shape, bead_count, step, bead_radius, rng);
     }
     // A fat coil amplifies backbone kinks: at a backbone vertex the coil's
     // offset plane tilts by the kink angle, jerking the wound strand by
@@ -350,7 +350,7 @@ fn wind_plectoneme(
 /// `domain_beads.len() <= 1` falls back to a single global plectoneme.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_nucleoid<R: Rng>(
-    cell_radius: f32,
+    shape: CellShape,
     domain_beads: &[usize],
     step: f32,
     bead_radius: f32,
@@ -361,38 +361,31 @@ pub fn generate_nucleoid<R: Rng>(
     let domains = domain_beads.len();
     let total: usize = domain_beads.iter().sum();
     if domains <= 1 {
-        return generate_supercoiled_fiber(
-            cell_radius, total, step, bead_radius, sc_radius, sc_pitch, rng,
-        );
+        return generate_supercoiled_fiber(shape, total, step, bead_radius, sc_radius, sc_pitch, rng);
     }
-    let core_r = (cell_radius - sc_radius - bead_radius).max(step);
-    // Scaffold anchor points (one per domain) — a short confined walk in the
-    // cell core; loops bulge outward from these.
-    let backbone_step = (2.2 * sc_radius).max(core_r * 1.2 / domains as f32);
-    let anchors = generate_fiber(core_r * 0.65, domains, backbone_step, bead_radius, rng);
+    // Core envelope that keeps wound beads (offset by sc_radius) inside the cell.
+    let core = shape.inset(sc_radius + bead_radius);
+    let backbone_step = (2.2 * sc_radius).max(core.reach() * 1.2 / domains as f32);
+    // Anchors in a slightly tighter inset so loops have room to bulge.
+    let anchor_shape = core.inset(core.cap_radius() * 0.35);
+    let anchors = generate_fiber(anchor_shape, domains, backbone_step, bead_radius, rng);
     if anchors.len() < 2 {
-        return generate_supercoiled_fiber(
-            cell_radius, total, step, bead_radius, sc_radius, sc_pitch, rng,
-        );
+        return generate_supercoiled_fiber(shape, total, step, bead_radius, sc_radius, sc_pitch, rng);
     }
     let na = anchors.len();
-    let max_apex = core_r; // keep wound beads (offset sc_radius) inside the cell
-    let loop_height = (sc_radius * 3.0).min(core_r * 0.45);
+    let loop_height = (sc_radius * 3.0).min(core.cap_radius() * 0.45);
 
     let mut out: Vec<Point3<f32>> = Vec::with_capacity(total);
     for d in 0..na {
         let a = anchors[d];
         let b = anchors[(d + 1) % na];
         let mid = Point3::from((a.coords + b.coords) * 0.5);
-        // Bulge away from the cell centre (fall back to a perpendicular if the
-        // midpoint sits at the origin).
-        let outward = mid
-            .coords
-            .try_normalize(1e-3)
-            .unwrap_or_else(|| perp((b - a).try_normalize(1e-6).unwrap_or(Vector3::z())));
+        let outward = core.outward(&mid);
         let mut apex = mid + outward * loop_height;
-        if apex.coords.norm() > max_apex {
-            apex = Point3::from(apex.coords.normalize() * max_apex);
+        // Clamp the apex back inside the core envelope if the bulge overshoots.
+        if !core.contains(&apex) {
+            let m = core.medial(&apex);
+            apex = m + core.outward(&apex) * core.cap_radius();
         }
         // Local axis a → apex → b, subdivided + smoothed for clean frames.
         let sub = 6;
@@ -615,91 +608,86 @@ mod tests {
     #[test]
     fn supercoiled_fiber_is_confined_and_interwound() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
-        let (cell, step, bead) = (2000.0_f32, 22.0_f32, 10.0_f32);
+        let (radius, step, bead) = (2000.0_f32, 22.0_f32, 10.0_f32);
         let (scr, pitch) = (80.0_f32, 100.0_f32);
-        let pts = generate_supercoiled_fiber(cell, 1500, step, bead, scr, pitch, &mut rng);
+        let shape = CellShape::Sphere { radius };
+        let pts = generate_supercoiled_fiber(shape, 1500, step, bead, scr, pitch, &mut rng);
         assert!(pts.len() > 1000, "placed only {} beads", pts.len());
-
-        // Every bead inside the cell.
         for p in &pts {
-            assert!(
-                p.coords.norm() <= cell - bead + 1e-1,
-                "bead outside cell: {}",
-                p.coords.norm()
-            );
+            assert!(p.coords.norm() <= radius - bead + 1e-1, "outside: {}", p.coords.norm());
         }
-
-        // The strand doubles back at the midpoint: the apical hairpin spans
-        // the coil (~2·sc_radius), proving the interwound structure.
         let mid = pts.len() / 2;
         let apex = (pts[mid] - pts[mid - 1]).norm();
         assert!(apex > 1.5 * scr, "apex hairpin should span the coil, got {apex}");
-
-        // Everywhere else, consecutive beads are spaced ~step along the helix.
         for i in 0..pts.len() - 1 {
-            if i + 1 == mid {
-                continue;
-            }
+            if i + 1 == mid { continue; }
             let d = (pts[i + 1] - pts[i]).norm();
-            assert!(
-                d > step * 0.5 && d < step * 1.3,
-                "helix spacing {d} off step {step} at bead {i}"
-            );
+            assert!(d > step * 0.5 && d < step * 1.3, "helix spacing {d} off step at {i}");
         }
     }
 
     #[test]
     fn supercoil_is_deterministic_and_falls_back() {
+        let s = CellShape::Sphere { radius: 2000.0 };
         let mut a = Xoshiro256PlusPlus::seed_from_u64(5);
         let mut b = Xoshiro256PlusPlus::seed_from_u64(5);
         assert_eq!(
-            generate_supercoiled_fiber(2000.0, 800, 22.0, 10.0, 80.0, 100.0, &mut a),
-            generate_supercoiled_fiber(2000.0, 800, 22.0, 10.0, 80.0, 100.0, &mut b),
+            generate_supercoiled_fiber(s, 800, 22.0, 10.0, 80.0, 100.0, &mut a),
+            generate_supercoiled_fiber(s, 800, 22.0, 10.0, 80.0, 100.0, &mut b),
         );
         // sc_radius 0 ⇒ identical to the plain self-avoiding walk.
+        let s2 = CellShape::Sphere { radius: 150.0 };
         let mut c = Xoshiro256PlusPlus::seed_from_u64(5);
         let mut d = Xoshiro256PlusPlus::seed_from_u64(5);
         assert_eq!(
-            generate_supercoiled_fiber(150.0, 300, 8.0, 3.0, 0.0, 50.0, &mut c),
-            generate_fiber(150.0, 300, 8.0, 3.0, &mut d),
+            generate_supercoiled_fiber(s2, 300, 8.0, 3.0, 0.0, 50.0, &mut c),
+            generate_fiber(s2, 300, 8.0, 3.0, &mut d),
         );
     }
 
     #[test]
     fn nucleoid_rosette_is_confined_multi_domain_and_deterministic() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
-        let (cell, step, bead) = (2000.0_f32, 22.0_f32, 10.0_f32);
+        let (radius, step, bead) = (2000.0_f32, 22.0_f32, 10.0_f32);
         let (scr, pitch) = (80.0_f32, 120.0_f32);
-        let pts = generate_nucleoid(cell, &vec![200; 40], step, bead, scr, pitch, &mut rng);
+        let s = CellShape::Sphere { radius };
+        let pts = generate_nucleoid(s, &vec![200; 40], step, bead, scr, pitch, &mut rng);
         assert!(pts.len() > 4000, "placed only {} beads", pts.len());
         for p in &pts {
-            assert!(
-                p.coords.norm() <= cell - bead + 1.0,
-                "bead outside cell: {}",
-                p.coords.norm()
-            );
+            assert!(p.coords.norm() <= radius - bead + 1.0, "outside: {}", p.coords.norm());
         }
-        // Multiple domains ⇒ several apical hairpins (big consecutive jumps),
-        // unlike a single plectoneme (one hairpin).
-        let jumps = pts
-            .windows(2)
-            .filter(|w| (w[1] - w[0]).norm() > 1.5 * scr)
-            .count();
+        let jumps = pts.windows(2).filter(|w| (w[1] - w[0]).norm() > 1.5 * scr).count();
         assert!(jumps >= 5, "expected several domain hairpins, got {jumps}");
 
-        // Deterministic; domains<=1 falls back to a single plectoneme.
         let mut a = Xoshiro256PlusPlus::seed_from_u64(9);
         let mut b = Xoshiro256PlusPlus::seed_from_u64(9);
         assert_eq!(
-            generate_nucleoid(cell, &vec![66; 30], step, bead, scr, pitch, &mut a),
-            generate_nucleoid(cell, &vec![66; 30], step, bead, scr, pitch, &mut b),
+            generate_nucleoid(s, &vec![66; 30], step, bead, scr, pitch, &mut a),
+            generate_nucleoid(s, &vec![66; 30], step, bead, scr, pitch, &mut b),
         );
         let mut c = Xoshiro256PlusPlus::seed_from_u64(9);
         let mut e = Xoshiro256PlusPlus::seed_from_u64(9);
         assert_eq!(
-            generate_nucleoid(cell, &[1500], step, bead, scr, pitch, &mut c),
-            generate_supercoiled_fiber(cell, 1500, step, bead, scr, pitch, &mut e),
+            generate_nucleoid(s, &[1500], step, bead, scr, pitch, &mut c),
+            generate_supercoiled_fiber(s, 1500, step, bead, scr, pitch, &mut e),
         );
+    }
+
+    #[test]
+    fn nucleoid_confined_to_capsule() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
+        // E. coli-ish rod: 2 µm × 0.8 µm in Å.
+        let shape = CellShape::Capsule { half_len: 7000.0, radius: 4000.0, axis: Vector3::x() };
+        let (step, bead, scr, pitch) = (22.0_f32, 10.0_f32, 80.0_f32, 120.0_f32);
+        let pts = generate_nucleoid(shape, &vec![300; 60], step, bead, scr, pitch, &mut rng);
+        assert!(pts.len() > 6000, "placed only {} beads", pts.len());
+        let inset = shape.inset(bead);
+        let outside = pts.iter().filter(|p| !inset.contains(p)).count();
+        assert!(outside == 0, "{outside} nucleoid beads left the capsule");
+        // The nucleoid fills the rod: x-extent exceeds the cap radius.
+        let xext = pts.iter().map(|p| p.x).fold(f32::MIN, f32::max)
+            - pts.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(xext > shape.cap_radius(), "nucleoid should fill the rod, x-extent {xext}");
     }
 
     #[test]
