@@ -1612,6 +1612,15 @@ function framePacking(bbMin, bbMax) {
   camera.near = Math.max(0.01, extent * 0.01);
   camera.far = extent * 5;
   camera.updateProjectionMatrix();
+  // Scale the depth-cue fog to the scene. The fog is constructed with fixed
+  // distances (1500–6000) tuned for small cells; without rescaling, a large
+  // cell (e.g. E. coli, extent ~22000) sits entirely beyond the fog-far and
+  // every fragment is painted 100% fog color — a fully black/empty viewport.
+  // Tie the fog to `extent` so the packing stays visible at any scale.
+  if (scene.fog) {
+    scene.fog.near = extent * 1.2;
+    scene.fog.far = extent * 5;
+  }
   controls.update();
   // The Goodsell post-pass linearizes the depth buffer using
   // cameraNear / cameraFar uniforms. Those are picked up at resize
