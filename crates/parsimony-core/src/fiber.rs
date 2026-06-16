@@ -272,6 +272,75 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     pts
 }
 
+/// A replicating chromosome laid out as a theta (θ) structure.
+pub struct ThetaChromosome {
+    /// `[main]` when unreplicated; `[main, sister]` when replicating — the
+    /// sister strand covers the replicated region (the bubble around oriC).
+    pub strands: Vec<Vec<Point3<f32>>>,
+    /// The two replication-fork positions (origin-relative), or empty.
+    pub forks: Vec<Point3<f32>>,
+}
+
+/// Generate a chromosome as a theta structure. The main genome is a single
+/// supercoiled strand; when `fork_fraction > 0` the replicated region around
+/// oriC is duplicated into a *sister* strand that bulges away from the main
+/// one and pinches back to it at two forks (the classic replicating-loop
+/// bubble). `fork_fraction` is how far each fork has travelled along its
+/// replichore, 0..1 (0.45 → forks ~45% of the way oriC→terC). Origin-relative;
+/// deterministic for a given RNG.
+pub fn generate_theta_chromosome<R: Rng>(
+    shape: CellShape,
+    genome_beads: usize,
+    fork_fraction: f32,
+    step: f32,
+    bead_radius: f32,
+    sc_radius: f32,
+    sc_pitch: f32,
+    rng: &mut R,
+) -> ThetaChromosome {
+    let main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
+    let n = main.len();
+    let f = fork_fraction.clamp(0.0, 0.95);
+    // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
+    let r = ((f * n as f32 / 2.0).round() as usize).min(n / 2);
+    if r < 2 || n < 8 {
+        return ThetaChromosome { strands: vec![main], forks: Vec::new() };
+    }
+    // Put oriC at the strand midpoint so the bubble is contiguous (no wrap on an
+    // open strand); terC then sits near the strand ends, approximating the loop.
+    let oric = n / 2;
+    let lo = oric - r; // forward fork
+    let hi = oric + r; // reverse fork
+    let inset = shape.inset(bead_radius);
+    // One stable bulge direction for the whole bubble (perpendicular to the
+    // fork-to-fork chord, biased outward from the medial axis) → a clean lens.
+    let chord = main[hi] - main[lo];
+    let chord_dir = chord.try_normalize(1e-6).unwrap_or_else(Vector3::x);
+    let mut off = perp(chord_dir);
+    let out = shape.outward(&main[oric]);
+    if off.dot(&out) < 0.0 {
+        off = -off;
+    }
+    let bulge_max = (shape.cap_radius() * 0.35).max(3.0 * bead_radius);
+    let span = (hi - lo) as f32;
+    let mut sister = Vec::with_capacity(hi - lo + 1);
+    for i in lo..=hi {
+        let u = (i - lo) as f32 / span; // 0..1 across the bubble
+        let mut bulge = bulge_max * (std::f32::consts::PI * u).sin();
+        // Keep the sister inside the cell: shrink the offset until it fits.
+        let mut cand = main[i] + off * bulge;
+        let mut tries = 0;
+        while !inset.contains(&cand) && bulge > bead_radius && tries < 8 {
+            bulge *= 0.6;
+            cand = main[i] + off * bulge;
+            tries += 1;
+        }
+        sister.push(cand);
+    }
+    let forks = vec![main[lo], main[hi]];
+    ThetaChromosome { strands: vec![main, sister], forks }
+}
+
 /// Wind an interwound (plectonemic) double strand of up to `n_beads` along a
 /// local `axis` polyline: out along the axis as one superhelix, back as the
 /// complementary one (offset by π) so the two strands interwind. Extracted from
@@ -624,6 +693,37 @@ mod tests {
             let d = (pts[i + 1] - pts[i]).norm();
             assert!(d > step * 0.5 && d < step * 1.3, "helix spacing {d} off step at {i}");
         }
+    }
+
+    #[test]
+    fn theta_chromosome_has_sister_bubble_and_two_forks() {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+        let shape = CellShape::Capsule {
+            half_len: 4000.0,
+            radius: 2500.0,
+            axis: Vector3::x(),
+        };
+        // Replicating: forks 40% of the way along each replichore.
+        let theta = generate_theta_chromosome(shape, 1200, 0.40, 22.0, 10.0, 80.0, 100.0, &mut rng);
+        assert_eq!(theta.strands.len(), 2, "replicating cell → main + sister strand");
+        assert_eq!(theta.forks.len(), 2, "a theta bubble has exactly two forks");
+        // The sister bubble covers ~2·0.40·(beads/2) = ~0.40·beads beads.
+        let main_len = theta.strands[0].len();
+        let sister_len = theta.strands[1].len();
+        assert!(
+            sister_len > main_len / 6 && sister_len < main_len,
+            "sister bubble size {sister_len} vs main {main_len}"
+        );
+        // Each fork sits where the sister rejoins the main strand.
+        for fk in &theta.forks {
+            let near_main = theta.strands[0].iter().any(|p| (p - fk).norm() < 1.0);
+            assert!(near_main, "fork should lie on the main strand");
+        }
+        // Unreplicated → a single strand, no forks.
+        let mut r2 = Xoshiro256PlusPlus::seed_from_u64(7);
+        let flat = generate_theta_chromosome(shape, 1200, 0.0, 22.0, 10.0, 80.0, 100.0, &mut r2);
+        assert_eq!(flat.strands.len(), 1);
+        assert!(flat.forks.is_empty());
     }
 
     #[test]

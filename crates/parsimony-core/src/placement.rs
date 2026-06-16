@@ -35,7 +35,19 @@ pub struct Chromosome {
     pub center: Point3<f32>,
     pub radius: f32,
     pub color: [f32; 3],
+    /// Primary strand (back-compat / smooth-tube fallback). When `strands`
+    /// is non-empty it holds the same path as `strands[0]`.
     pub points: Vec<Point3<f32>>,
+    /// All DNA strands across all chromosome instances, `center`-relative.
+    /// A non-replicating cell has one strand per chromosome; a replicating
+    /// one adds a sister strand over the replicated (theta) bubble. The
+    /// writer tiles dsDNA segments along each strand independently.
+    #[serde(default)]
+    pub strands: Vec<Vec<Point3<f32>>>,
+    /// Replication-fork positions (`center`-relative) — the Y-junctions where
+    /// a sister strand rejoins the main genome. Two per replicating chromosome.
+    #[serde(default)]
+    pub forks: Vec<Point3<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

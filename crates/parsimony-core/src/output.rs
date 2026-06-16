@@ -228,17 +228,26 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
             .and_then(|c| c.segment.as_ref())
             .and_then(|name| recipe.ingredients.get_index_of(name));
         if let Some(seg_id) = seg {
-            let world: Vec<_> = chr.points.iter().map(|p| chr.center + p.coords).collect();
             let seg_step = 12.0 * 3.4; // ~12 bp per 1BNA segment, 3.4 Å/bp
             let twist = std::f32::consts::TAU / (10.5 * 3.4); // B-DNA: 10.5 bp/turn
-            for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, twist) {
-                placements.push(json!({
-                    "uid": placements.len() as u64,
-                    "ingredient": seg_id as u64,
-                    "compartment": 0,
-                    "position": [pos.x, pos.y, pos.z],
-                    "rotation": [rot.w, rot.i, rot.j, rot.k],
-                }));
+            // Tile each strand independently: the main genome plus, for a
+            // replicating chromosome, the sister strand over the theta bubble.
+            let strand_list: Vec<&Vec<_>> = if chr.strands.is_empty() {
+                vec![&chr.points]
+            } else {
+                chr.strands.iter().collect()
+            };
+            for strand in strand_list {
+                let world: Vec<_> = strand.iter().map(|p| chr.center + p.coords).collect();
+                for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, twist) {
+                    placements.push(json!({
+                        "uid": placements.len() as u64,
+                        "ingredient": seg_id as u64,
+                        "compartment": 0,
+                        "position": [pos.x, pos.y, pos.z],
+                        "rotation": [rot.w, rot.i, rot.j, rot.k],
+                    }));
+                }
             }
         } else {
             let id = ingredients.len() as u64;

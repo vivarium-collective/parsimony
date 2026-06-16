@@ -65,6 +65,20 @@ struct RawChromosome {
     /// tiled along the genome path, instead of a single smooth tube.
     #[serde(default)]
     segment: Option<String>,
+    /// Number of chromosome copies to lay out, each in its own sub-region of
+    /// the cell (1 = a single nucleoid; 2 = a pre-division cell). `beads` is
+    /// the bead count *per chromosome*.
+    #[serde(default)]
+    n_chromosomes: Option<usize>,
+    /// Replication extent: how far each fork has travelled along its replichore
+    /// (0..1). 0 = unreplicated; >0 draws a theta bubble + two forks per
+    /// chromosome.
+    #[serde(default)]
+    fork_fraction: Option<f32>,
+    /// Ingredient name placed at each replication fork (e.g. the replisome /
+    /// DNA polymerase). Optional.
+    #[serde(default)]
+    fork_marker: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -273,6 +287,12 @@ pub struct ChromosomeSpec {
     pub genome: Option<std::path::PathBuf>,
     /// Ingredient name of the per-bead dsDNA mesh (instanced LOD rendering).
     pub segment: Option<String>,
+    /// Number of chromosome copies (each in its own cell sub-region). >= 1.
+    pub n_chromosomes: usize,
+    /// Replication extent (0..1); 0 = unreplicated.
+    pub fork_fraction: f32,
+    /// Ingredient name placed at each replication fork, if any.
+    pub fork_marker: Option<String>,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -627,6 +647,9 @@ fn resolve(
                 None => std::path::PathBuf::from(g),
             }),
             segment: c.segment,
+            n_chromosomes: c.n_chromosomes.unwrap_or(1).max(1),
+            fork_fraction: c.fork_fraction.unwrap_or(0.0),
+            fork_marker: c.fork_marker,
         }),
     })
 }

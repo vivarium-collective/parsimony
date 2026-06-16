@@ -64,6 +64,34 @@ fn random_rotation<R: Rng>(rng: &mut R) -> UnitQuaternion<f32> {
     UnitQuaternion::new_normalize(q)
 }
 
+/// Partition a cell into `n` sub-regions for laying out multiple chromosomes.
+/// A capsule is split into `n` shorter capsules along its long axis; a sphere
+/// offsets copies along z so they don't fully overlap. Returns the origin-
+/// centred sub-shape and its offset from the cell centre.
+fn subdivide(
+    shape: crate::fiber::CellShape,
+    n: usize,
+    k: usize,
+) -> (crate::fiber::CellShape, nalgebra::Vector3<f32>) {
+    use crate::fiber::CellShape;
+    if n <= 1 {
+        return (shape, nalgebra::Vector3::zeros());
+    }
+    match shape {
+        CellShape::Capsule { half_len, radius, axis } => {
+            let bin = 2.0 * half_len / n as f32; // bin width along the axis
+            let center_t = -half_len + (k as f32 + 0.5) * bin;
+            let sub_half = (bin * 0.5 - radius * 0.15).max(radius * 0.5);
+            (CellShape::Capsule { half_len: sub_half, radius, axis }, axis * center_t)
+        }
+        CellShape::Sphere { radius } => {
+            let spread = radius * 0.5;
+            let z = -spread + (k as f32) * (2.0 * spread / (n - 1) as f32);
+            (CellShape::Sphere { radius: radius * 0.7 }, nalgebra::Vector3::new(0.0, 0.0, z))
+        }
+    }
+}
+
 /// Cap on consecutive surface-placement rejections before a Surface
 /// directive is declared stuck. Surface placements use uniform random
 /// sampling on the compartment boundary (no per-cell filtering), so the
@@ -613,35 +641,65 @@ impl<'a> GreedyRandomPlacer<'a> {
         };
         // Genome resolution: recipe value unless overridden (e.g. `pack
         // --chromosome-beads`). More beads → more DNA contour/volume.
+        // `beads` is the bead count *per chromosome*.
         let beads = self.config.chromosome_beads.unwrap_or(chr.beads);
-        let pts = match &chr.supercoil {
-            Some(sc) => {
-                // Per-domain bead allocation: transcription-coupled (each
-                // plectoneme domain sized to its gene-cluster bp span) when a
-                // genome is set, else evenly split. `domains <= 1` → single
-                // global plectoneme.
-                let alloc: Vec<usize> = chr
-                    .genome
-                    .as_ref()
-                    .filter(|_| sc.domains > 1)
-                    .and_then(|p| crate::genome::Genome::from_csv(p).ok())
-                    .map(|g| g.domain_bead_allocation(beads, sc.domains))
-                    .unwrap_or_else(|| vec![(beads / sc.domains.max(1)).max(2); sc.domains.max(1)]);
-                crate::fiber::generate_nucleoid(
-                    shape,
-                    &alloc,
-                    chr.spacing,
-                    chr.bead_radius,
-                    sc.radius,
-                    sc.pitch,
-                    rng,
-                )
+        let n_chrom = chr.n_chromosomes.max(1);
+        // All DNA strands + fork positions, collected cell-centre-relative.
+        let mut strands: Vec<Vec<Point3<f32>>> = Vec::new();
+        let mut forks: Vec<Point3<f32>> = Vec::new();
+        if n_chrom == 1 && chr.fork_fraction <= 0.0 {
+            // Unreplicated single chromosome: keep the supercoiled multi-domain
+            // (rosette) nucleoid layout.
+            let pts = match &chr.supercoil {
+                Some(sc) => {
+                    // Per-domain bead allocation: transcription-coupled (each
+                    // plectoneme domain sized to its gene-cluster bp span) when a
+                    // genome is set, else evenly split. `domains <= 1` → single
+                    // global plectoneme.
+                    let alloc: Vec<usize> = chr
+                        .genome
+                        .as_ref()
+                        .filter(|_| sc.domains > 1)
+                        .and_then(|p| crate::genome::Genome::from_csv(p).ok())
+                        .map(|g| g.domain_bead_allocation(beads, sc.domains))
+                        .unwrap_or_else(|| vec![(beads / sc.domains.max(1)).max(2); sc.domains.max(1)]);
+                    crate::fiber::generate_nucleoid(
+                        shape, &alloc, chr.spacing, chr.bead_radius, sc.radius, sc.pitch, rng,
+                    )
+                }
+                None => crate::fiber::generate_fiber(shape, beads, chr.spacing, chr.bead_radius, rng),
+            };
+            strands.push(pts);
+        } else {
+            // One or more replicating chromosomes: lay each as a theta (θ)
+            // structure in its own sub-region of the cell.
+            let (sc_radius, sc_pitch) = chr
+                .supercoil
+                .as_ref()
+                .map(|s| (s.radius, s.pitch))
+                .unwrap_or((0.0, 0.0));
+            for k in 0..n_chrom {
+                let (sub_shape, sub_off) = subdivide(shape, n_chrom, k);
+                let theta = crate::fiber::generate_theta_chromosome(
+                    sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
+                    sc_radius, sc_pitch, rng,
+                );
+                for mut s in theta.strands {
+                    for p in &mut s {
+                        *p += sub_off;
+                    }
+                    strands.push(s);
+                }
+                for mut fk in theta.forks {
+                    fk += sub_off;
+                    forks.push(fk);
+                }
             }
-            None => crate::fiber::generate_fiber(shape, beads, chr.spacing, chr.bead_radius, rng),
-        };
+        }
+        let pts = strands.first().cloned().unwrap_or_default();
         if !chr.proteins.is_empty() && pts.len() >= 2 {
             let fiber_world: Vec<Point3<f32>> =
-                pts.iter().map(|p| center + p.coords).collect();
+                strands.iter().flatten().map(|p| center + p.coords).collect();
             let obstacles: Vec<(Point3<f32>, f32)> = snapshot
                 .placements
                 .iter()
@@ -697,11 +755,30 @@ impl<'a> GreedyRandomPlacer<'a> {
                 *next_uid += 1;
             }
         }
+        // Seat a fork marker (replisome / DNA polymerase) at each replication
+        // fork, so the Y-junctions read as real machinery on the DNA.
+        if let Some(marker) = &chr.fork_marker {
+            if let Some((idx, _, _)) = self.recipe.ingredients.get_full(marker) {
+                for fk in &forks {
+                    snapshot.placements.push(Placement {
+                        instance_uid: *next_uid,
+                        ingredient_id: idx as u32,
+                        variant_id: 0,
+                        compartment_id: 0,
+                        position: center + fk.coords,
+                        rotation: UnitQuaternion::identity(),
+                    });
+                    *next_uid += 1;
+                }
+            }
+        }
         snapshot.chromosome = Some(crate::placement::Chromosome {
             center,
             radius: chr.bead_radius,
             color: chr.color,
             points: pts,
+            strands,
+            forks,
         });
     }
 
