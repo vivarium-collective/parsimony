@@ -79,15 +79,22 @@ fn subdivide(
     }
     match shape {
         CellShape::Capsule { half_len, radius, axis } => {
-            let bin = 2.0 * half_len / n as f32; // bin width along the axis
-            let center_t = -half_len + (k as f32 + 0.5) * bin;
-            let sub_half = (bin * 0.5 - radius * 0.15).max(radius * 0.5);
-            (CellShape::Capsule { half_len: sub_half, radius, axis }, axis * center_t)
+            // Segregate the chromosomes toward the poles: centres spaced evenly
+            // out to ±spread·half_len, each confined to a COMPACT sub-capsule
+            // (short medial + reduced radius) so the nucleoids read as separated
+            // with a clear midcell gap — not one overlapping blob. The previous
+            // version kept the full cell radius, so each chromosome's reach
+            // (half_len+radius) far exceeded the centre offset and they merged.
+            let spread = 0.65;
+            let t = -spread * half_len + 2.0 * spread * half_len * (k as f32) / ((n - 1) as f32);
+            let sub_half = (spread * half_len / n as f32).max(radius * 0.3);
+            let sub_radius = radius * 0.68;
+            (CellShape::Capsule { half_len: sub_half, radius: sub_radius, axis }, axis * t)
         }
         CellShape::Sphere { radius } => {
-            let spread = radius * 0.5;
-            let z = -spread + (k as f32) * (2.0 * spread / (n - 1) as f32);
-            (CellShape::Sphere { radius: radius * 0.7 }, nalgebra::Vector3::new(0.0, 0.0, z))
+            let spread = radius * 0.55;
+            let z = -spread + 2.0 * spread * (k as f32) / ((n - 1) as f32);
+            (CellShape::Sphere { radius: radius * 0.5 }, nalgebra::Vector3::new(0.0, 0.0, z))
         }
     }
 }
@@ -1024,7 +1031,26 @@ impl<'a> GreedyRandomPlacer<'a> {
                     (aabb.center(), CellShape::Sphere { radius: aabb.half_extents().min() })
                 }
                 CompartmentKind::Mesh(m) => {
-                    (m.aabb.center(), CellShape::Sphere { radius: m.aabb.half_extents().min() })
+                    // Treat an elongated mesh (e.g. a constricted-capsule cell)
+                    // as a capsule along its longest axis, so chromosomes still
+                    // segregate pole-to-pole instead of collapsing to a sphere.
+                    let he = m.aabb.half_extents();
+                    let ext = [he.x, he.y, he.z];
+                    let long_i = (0..3)
+                        .max_by(|&i, &j| ext[i].partial_cmp(&ext[j]).unwrap())
+                        .unwrap();
+                    let radius = (0..3)
+                        .filter(|&i| i != long_i)
+                        .map(|i| ext[i])
+                        .fold(f32::MAX, f32::min)
+                        .max(1.0);
+                    let half_len = (ext[long_i] - radius).max(0.0);
+                    let axis = match long_i {
+                        0 => nalgebra::Vector3::x(),
+                        1 => nalgebra::Vector3::y(),
+                        _ => nalgebra::Vector3::z(),
+                    };
+                    (m.aabb.center(), CellShape::Capsule { half_len, radius, axis })
                 }
             };
             return Some((center, shape));
