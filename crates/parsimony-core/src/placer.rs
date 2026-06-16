@@ -684,6 +684,8 @@ impl<'a> GreedyRandomPlacer<'a> {
         let mut forks: Vec<Point3<f32>> = Vec::new();
         let mut orics: Vec<Point3<f32>> = Vec::new();
         let mut ters: Vec<Point3<f32>> = Vec::new();
+        // Per-chromosome strand groups (each group = one chromosome's strands).
+        let mut chrom_groups: Vec<Vec<Vec<Point3<f32>>>> = Vec::new();
         if n_chrom == 1 && chr.fork_fraction <= 0.0 {
             // Unreplicated single chromosome: keep the supercoiled multi-domain
             // (rosette) nucleoid layout.
@@ -706,7 +708,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
                 None => crate::fiber::generate_fiber(shape, beads, chr.spacing, chr.bead_radius, rng),
             };
-            strands.push(pts);
+            chrom_groups.push(vec![pts]);
         } else {
             // One or more replicating chromosomes: lay each as a theta (θ)
             // structure in its own sub-region of the cell.
@@ -721,11 +723,12 @@ impl<'a> GreedyRandomPlacer<'a> {
                     sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
                     sc_radius, sc_pitch, rng,
                 );
+                let mut group: Vec<Vec<Point3<f32>>> = Vec::new();
                 for mut s in theta.strands {
                     for p in &mut s {
                         *p += sub_off;
                     }
-                    strands.push(s);
+                    group.push(s);
                 }
                 for mut fk in theta.forks {
                     fk += sub_off;
@@ -739,12 +742,21 @@ impl<'a> GreedyRandomPlacer<'a> {
                     t += sub_off;
                     ters.push(t);
                 }
+                chrom_groups.push(group);
+            }
+        }
+        // Flat list of every strand, for the rendered chromosome.
+        for g in &chrom_groups {
+            for s in g {
+                strands.push(s.clone());
             }
         }
         let pts = strands.first().cloned().unwrap_or_default();
-        if !chr.proteins.is_empty() && pts.len() >= 2 {
-            let fiber_world: Vec<Point3<f32>> =
-                strands.iter().flatten().map(|p| center + p.coords).collect();
+        // Pack DNA-binding proteins (RNAP, etc.) PER CHROMOSOME — each chromosome
+        // is a full genome, so each gets its share. Packing them on the single
+        // concatenated fiber instead piled them all onto whichever chromosome had
+        // the longest contour (the others got none).
+        if !chr.proteins.is_empty() && !chrom_groups.is_empty() {
             let obstacles: Vec<(Point3<f32>, f32)> = snapshot
                 .placements
                 .iter()
@@ -758,46 +770,64 @@ impl<'a> GreedyRandomPlacer<'a> {
                     ing.shape.world_spheres(pl.position, pl.rotation)
                 })
                 .collect();
-            // With a genome annotation, seat DNA-binding proteins at real
-            // transcription / replication sites; otherwise spread them randomly.
-            let binds = match chr
+            let genome = chr
                 .genome
                 .as_ref()
-                .and_then(|p| crate::genome::Genome::from_csv(p).ok())
-            {
-                Some(genome) => {
-                    let abundances: Vec<(String, u32)> = self
-                        .recipe
-                        .directives
-                        .iter()
-                        .map(|d| (d.ingredient.clone(), d.count))
-                        .collect();
-                    let sites = genome.binding_sites(&chr.proteins, &abundances, rng);
-                    let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
-                    for ((name, _), fracs) in chr.proteins.iter().zip(&sites) {
-                        if let Some((idx, _, ing)) = self.recipe.ingredients.get_full(name) {
-                            for &f in fracs {
-                                at.push((idx as u32, ing, f));
+                .and_then(|p| crate::genome::Genome::from_csv(p).ok());
+            let n_groups = chrom_groups.len() as u32;
+            // Split each protein's total count across the chromosomes.
+            let per_chrom: Vec<(String, u32)> = chr
+                .proteins
+                .iter()
+                .map(|(name, c)| (name.clone(), (c / n_groups).max(1)))
+                .collect();
+            for group in &chrom_groups {
+                let fiber_world: Vec<Point3<f32>> =
+                    group.iter().flatten().map(|p| center + p.coords).collect();
+                if fiber_world.len() < 2 {
+                    continue;
+                }
+                // With a genome annotation, seat proteins at real transcription /
+                // replication sites; otherwise spread them randomly.
+                let binds = match &genome {
+                    Some(genome) => {
+                        let abundances: Vec<(String, u32)> = self
+                            .recipe
+                            .directives
+                            .iter()
+                            .map(|d| (d.ingredient.clone(), d.count))
+                            .collect();
+                        let sites = genome.binding_sites(&per_chrom, &abundances, rng);
+                        let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
+                        for ((name, _), fracs) in per_chrom.iter().zip(&sites) {
+                            if let Some((idx, _, ing)) = self.recipe.ingredients.get_full(name) {
+                                for &f in fracs {
+                                    at.push((idx as u32, ing, f));
+                                }
                             }
                         }
+                        crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, rng)
                     }
-                    crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, rng)
+                    None => {
+                        let proteins: Vec<(u32, &Ingredient, u32)> = self
+                            .resolve_fiber_proteins(chr)
+                            .into_iter()
+                            .map(|(id, ing, c)| (id, ing, (c / n_groups).max(1)))
+                            .collect();
+                        crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+                    }
+                };
+                for b in binds {
+                    snapshot.placements.push(Placement {
+                        instance_uid: *next_uid,
+                        ingredient_id: b.ingredient_id,
+                        variant_id: 0,
+                        compartment_id: 0,
+                        position: b.position,
+                        rotation: b.rotation,
+                    });
+                    *next_uid += 1;
                 }
-                None => {
-                    let proteins = self.resolve_fiber_proteins(chr);
-                    crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
-                }
-            };
-            for b in binds {
-                snapshot.placements.push(Placement {
-                    instance_uid: *next_uid,
-                    ingredient_id: b.ingredient_id,
-                    variant_id: 0,
-                    compartment_id: 0,
-                    position: b.position,
-                    rotation: b.rotation,
-                });
-                *next_uid += 1;
             }
         }
         // Seat the chromosome landmark molecules: the replisome at each fork,

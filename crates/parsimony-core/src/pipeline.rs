@@ -505,8 +505,20 @@ fn run_fiber_pack(
         return snap;
     };
 
-    let fiber_world: Vec<nalgebra::Point3<f32>> =
-        chrom.points.iter().map(|p| chrom.center + p.coords).collect();
+    // Pack proteins across ALL strands (every chromosome + its sister bubble),
+    // not just the first — otherwise all RNAP piles onto one chromosome. Each
+    // strand gets a share of every protein proportional to its contour length.
+    let strands: Vec<Vec<nalgebra::Point3<f32>>> = if chrom.strands.is_empty() {
+        vec![chrom.points.clone()]
+    } else {
+        chrom.strands.clone()
+    };
+    let contour = |s: &[nalgebra::Point3<f32>]| -> f32 {
+        s.windows(2).map(|w| (w[1] - w[0]).norm()).sum()
+    };
+    let lengths: Vec<f32> = strands.iter().map(|s| contour(s)).collect();
+    let total_len: f32 = lengths.iter().sum::<f32>().max(1e-6);
+
     let obstacles: Vec<(nalgebra::Point3<f32>, f32)> = stage
         .depends_on
         .iter()
@@ -522,60 +534,69 @@ fn run_fiber_pack(
             })
         })
         .collect();
-    let proteins: Vec<(u32, &Ingredient, u32)> = chr_spec
-        .proteins
-        .iter()
-        .filter_map(|(name, count)| {
-            recipe
-                .ingredients
-                .get_full(name)
-                .map(|(idx, _, ing)| (idx as u32, ing, *count))
-        })
-        .collect();
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(stage.effective_seed(pipeline_seed));
-    // If the recipe references a genome annotation, seat the DNA-binding
-    // proteins at real transcription / replication sites (RNAP abundance-
-    // weighted over genes, DNAP near oriC); otherwise spread them randomly.
-    let binds = match chr_spec
+    let genome = chr_spec
         .genome
         .as_ref()
-        .and_then(|p| crate::genome::Genome::from_csv(p).ok())
-    {
-        Some(genome) => {
-            let abundances: Vec<(String, u32)> = recipe
-                .directives
-                .iter()
-                .map(|d| (d.ingredient.clone(), d.count))
-                .collect();
-            let sites = genome.binding_sites(&chr_spec.proteins, &abundances, &mut rng);
-            let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
-            for ((name, _), fracs) in chr_spec.proteins.iter().zip(&sites) {
-                if let Some((idx, _, ing)) = recipe.ingredients.get_full(name) {
-                    for &f in fracs {
-                        at.push((idx as u32, ing, f));
+        .and_then(|p| crate::genome::Genome::from_csv(p).ok());
+
+    for (si, strand) in strands.iter().enumerate() {
+        if strand.len() < 2 {
+            continue;
+        }
+        let share = lengths[si] / total_len;
+        // This strand's share of each protein's total count.
+        let strand_proteins: Vec<(String, u32)> = chr_spec
+            .proteins
+            .iter()
+            .map(|(name, c)| (name.clone(), (*c as f32 * share).round() as u32))
+            .collect();
+        let fiber_world: Vec<nalgebra::Point3<f32>> =
+            strand.iter().map(|p| chrom.center + p.coords).collect();
+        // With a genome annotation, seat proteins at real transcription /
+        // replication sites; otherwise spread them randomly along the strand.
+        let binds = match &genome {
+            Some(genome) => {
+                let abundances: Vec<(String, u32)> = recipe
+                    .directives
+                    .iter()
+                    .map(|d| (d.ingredient.clone(), d.count))
+                    .collect();
+                let sites = genome.binding_sites(&strand_proteins, &abundances, &mut rng);
+                let mut at: Vec<(u32, &Ingredient, f32)> = Vec::new();
+                for ((name, _), fracs) in strand_proteins.iter().zip(&sites) {
+                    if let Some((idx, _, ing)) = recipe.ingredients.get_full(name) {
+                        for &f in fracs {
+                            at.push((idx as u32, ing, f));
+                        }
                     }
                 }
+                crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chrom.radius, &mut rng)
             }
-            crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chrom.radius, &mut rng)
+            None => {
+                let proteins: Vec<(u32, &Ingredient, u32)> = strand_proteins
+                    .iter()
+                    .filter_map(|(name, c)| {
+                        recipe
+                            .ingredients
+                            .get_full(name)
+                            .map(|(idx, _, ing)| (idx as u32, ing, *c))
+                    })
+                    .collect();
+                crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chrom.radius, &mut rng)
+            }
+        };
+        for b in binds {
+            snap.placements.push(Placement {
+                instance_uid: snap.placements.len() as u64,
+                ingredient_id: b.ingredient_id,
+                variant_id: 0,
+                compartment_id: 0,
+                position: b.position,
+                rotation: b.rotation,
+            });
         }
-        None => crate::fiber_pack::pack_on_fiber(
-            &fiber_world,
-            &proteins,
-            &obstacles,
-            chrom.radius,
-            &mut rng,
-        ),
-    };
-    for b in binds {
-        snap.placements.push(Placement {
-            instance_uid: snap.placements.len() as u64,
-            ingredient_id: b.ingredient_id,
-            variant_id: 0,
-            compartment_id: 0,
-            position: b.position,
-            rotation: b.rotation,
-        });
     }
     snap
 }
