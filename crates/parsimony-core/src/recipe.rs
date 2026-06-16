@@ -79,6 +79,12 @@ struct RawChromosome {
     /// DNA polymerase). Optional.
     #[serde(default)]
     fork_marker: Option<String>,
+    /// Ingredient name placed at each origin of replication (oriC). Optional.
+    #[serde(default)]
+    oric_marker: Option<String>,
+    /// Ingredient name placed at the replication terminus (terC). Optional.
+    #[serde(default)]
+    ter_marker: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -293,6 +299,10 @@ pub struct ChromosomeSpec {
     pub fork_fraction: f32,
     /// Ingredient name placed at each replication fork, if any.
     pub fork_marker: Option<String>,
+    /// Ingredient name placed at each origin (oriC), if any.
+    pub oric_marker: Option<String>,
+    /// Ingredient name placed at the terminus (terC), if any.
+    pub ter_marker: Option<String>,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -650,6 +660,8 @@ fn resolve(
             n_chromosomes: c.n_chromosomes.unwrap_or(1).max(1),
             fork_fraction: c.fork_fraction.unwrap_or(0.0),
             fork_marker: c.fork_marker,
+            oric_marker: c.oric_marker,
+            ter_marker: c.ter_marker,
         }),
     })
 }

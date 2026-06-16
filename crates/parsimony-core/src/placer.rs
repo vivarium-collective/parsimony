@@ -623,6 +623,34 @@ impl<'a> GreedyRandomPlacer<'a> {
         PlacerOutcome { snapshot, stats }
     }
 
+    /// Seat `positions.len()` copies of the `marker` ingredient (if named and
+    /// present in the recipe) at the given `center`-relative positions — used
+    /// for the chromosome landmark molecules (replisome, oriC, terC).
+    fn seat_markers(
+        &self,
+        snapshot: &mut Snapshot,
+        next_uid: &mut u64,
+        marker: &Option<String>,
+        positions: &[Point3<f32>],
+        center: Point3<f32>,
+    ) {
+        let Some(name) = marker else { return };
+        let Some((idx, _, _)) = self.recipe.ingredients.get_full(name) else {
+            return;
+        };
+        for p in positions {
+            snapshot.placements.push(Placement {
+                instance_uid: *next_uid,
+                ingredient_id: idx as u32,
+                variant_id: 0,
+                compartment_id: 0,
+                position: center + p.coords,
+                rotation: UnitQuaternion::identity(),
+            });
+            *next_uid += 1;
+        }
+    }
+
     /// Generate the recipe's chromosome fiber (plain or supercoiled) inside its
     /// cell compartment, bind its DNA-binding proteins along it (avoiding the
     /// interior already placed this run), and attach it to the snapshot. No-op
@@ -644,9 +672,11 @@ impl<'a> GreedyRandomPlacer<'a> {
         // `beads` is the bead count *per chromosome*.
         let beads = self.config.chromosome_beads.unwrap_or(chr.beads);
         let n_chrom = chr.n_chromosomes.max(1);
-        // All DNA strands + fork positions, collected cell-centre-relative.
+        // All DNA strands + fork/oriC/terC positions, cell-centre-relative.
         let mut strands: Vec<Vec<Point3<f32>>> = Vec::new();
         let mut forks: Vec<Point3<f32>> = Vec::new();
+        let mut orics: Vec<Point3<f32>> = Vec::new();
+        let mut ters: Vec<Point3<f32>> = Vec::new();
         if n_chrom == 1 && chr.fork_fraction <= 0.0 {
             // Unreplicated single chromosome: keep the supercoiled multi-domain
             // (rosette) nucleoid layout.
@@ -693,6 +723,14 @@ impl<'a> GreedyRandomPlacer<'a> {
                 for mut fk in theta.forks {
                     fk += sub_off;
                     forks.push(fk);
+                }
+                for mut o in theta.oric {
+                    o += sub_off;
+                    orics.push(o);
+                }
+                for mut t in theta.ter {
+                    t += sub_off;
+                    ters.push(t);
                 }
             }
         }
@@ -755,23 +793,12 @@ impl<'a> GreedyRandomPlacer<'a> {
                 *next_uid += 1;
             }
         }
-        // Seat a fork marker (replisome / DNA polymerase) at each replication
-        // fork, so the Y-junctions read as real machinery on the DNA.
-        if let Some(marker) = &chr.fork_marker {
-            if let Some((idx, _, _)) = self.recipe.ingredients.get_full(marker) {
-                for fk in &forks {
-                    snapshot.placements.push(Placement {
-                        instance_uid: *next_uid,
-                        ingredient_id: idx as u32,
-                        variant_id: 0,
-                        compartment_id: 0,
-                        position: center + fk.coords,
-                        rotation: UnitQuaternion::identity(),
-                    });
-                    *next_uid += 1;
-                }
-            }
-        }
+        // Seat the chromosome landmark molecules: the replisome at each fork,
+        // oriC at each origin, terC at the terminus — so they read as real
+        // machinery/loci on the DNA and are individually selectable.
+        self.seat_markers(snapshot, next_uid, &chr.fork_marker, &forks, center);
+        self.seat_markers(snapshot, next_uid, &chr.oric_marker, &orics, center);
+        self.seat_markers(snapshot, next_uid, &chr.ter_marker, &ters, center);
         snapshot.chromosome = Some(crate::placement::Chromosome {
             center,
             radius: chr.bead_radius,

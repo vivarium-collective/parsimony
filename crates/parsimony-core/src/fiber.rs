@@ -279,6 +279,11 @@ pub struct ThetaChromosome {
     pub strands: Vec<Vec<Point3<f32>>>,
     /// The two replication-fork positions (origin-relative), or empty.
     pub forks: Vec<Point3<f32>>,
+    /// Origin-of-replication (oriC) positions: one per genome copy — the main
+    /// strand's oriC, plus the sister copy's oriC once replication has begun.
+    pub oric: Vec<Point3<f32>>,
+    /// Replication-terminus (terC) position: the genome locus opposite oriC.
+    pub ter: Vec<Point3<f32>>,
 }
 
 /// Generate a chromosome as a theta structure. The main genome is a single
@@ -304,7 +309,15 @@ pub fn generate_theta_chromosome<R: Rng>(
     // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
     let r = ((f * n as f32 / 2.0).round() as usize).min(n / 2);
     if r < 2 || n < 8 {
-        return ThetaChromosome { strands: vec![main], forks: Vec::new() };
+        // Unreplicated: one oriC at the strand midpoint, terC at the far end.
+        let mid = main[n / 2];
+        let end = main[0];
+        return ThetaChromosome {
+            strands: vec![main],
+            forks: Vec::new(),
+            oric: vec![mid],
+            ter: vec![end],
+        };
     }
     // Put oriC at the strand midpoint so the bubble is contiguous (no wrap on an
     // open strand); terC then sits near the strand ends, approximating the loop.
@@ -338,7 +351,12 @@ pub fn generate_theta_chromosome<R: Rng>(
         sister.push(cand);
     }
     let forks = vec![main[lo], main[hi]];
-    ThetaChromosome { strands: vec![main, sister], forks }
+    // Two oriCs (the bubble has duplicated the origin): one on the main strand,
+    // one on the sister, both at the bubble's centre. terC is opposite oriC, at
+    // the strand end (the genome was cut there for this open-strand layout).
+    let oric = vec![main[oric], sister[sister.len() / 2]];
+    let ter = vec![main[0]];
+    ThetaChromosome { strands: vec![main, sister], forks, oric, ter }
 }
 
 /// Wind an interwound (plectonemic) double strand of up to `n_beads` along a
