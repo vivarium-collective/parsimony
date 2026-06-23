@@ -75,20 +75,27 @@ fn subdivide(
 ) -> (crate::fiber::CellShape, nalgebra::Vector3<f32>) {
     use crate::fiber::CellShape;
     if n <= 1 {
+        // Single chromosome: fill the whole cell (a spread-out nucleoid). The
+        // raw self-avoiding walk drifts off-centre toward one pole; the caller
+        // re-centres each chromosome's centre-of-mass onto this offset (here 0,
+        // the cell centre), so the DNA stays spread but is centred — not lopsided.
         return (shape, nalgebra::Vector3::zeros());
     }
     match shape {
         CellShape::Capsule { half_len, radius, axis } => {
-            // Segregate the chromosomes toward the poles: centres spaced evenly
-            // out to ±spread·half_len, each confined to a COMPACT sub-capsule
-            // (short medial + reduced radius) so the nucleoids read as separated
-            // with a clear midcell gap — not one overlapping blob. The previous
-            // version kept the full cell radius, so each chromosome's reach
-            // (half_len+radius) far exceeded the centre offset and they merged.
-            let spread = 0.65;
-            let t = -spread * half_len + 2.0 * spread * half_len * (k as f32) / ((n - 1) as f32);
-            let sub_half = (spread * half_len / n as f32).max(radius * 0.3);
-            let sub_radius = radius * 0.68;
+            // n daughters: centre each chromosome's COM at its soon-to-be
+            // daughter's centre — the midpoint of that half of the cell,
+            // ≈ ±reach/2 along the long axis (reach = half_len + radius =
+            // pole-to-centre distance). Each chromosome is generated spread across
+            // a daughter-sized sub-capsule, then the caller pins its COM to this
+            // offset, so each nucleoid reads as centred within its own daughter
+            // with a clear midcell gap. (The previous version centred at
+            // ±0.65·half_len, biased toward midcell rather than the daughter
+            // centres.)
+            let reach = half_len + radius;
+            let t = -0.5 * reach + reach * (k as f32) / ((n - 1) as f32);
+            let sub_half = (0.5 * reach / n as f32).max(radius * 0.3);
+            let sub_radius = radius * 0.7;
             (CellShape::Capsule { half_len: sub_half, radius: sub_radius, axis }, axis * t)
         }
         CellShape::Sphere { radius } => {
@@ -723,24 +730,46 @@ impl<'a> GreedyRandomPlacer<'a> {
                     sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
                     sc_radius, sc_pitch, rng,
                 );
+                // Pin this chromosome's centre-of-mass onto its target offset
+                // (`sub_off`): the cell centre for a single chromosome, each
+                // daughter's centre when replicated. The raw supercoiled walk
+                // drifts off-centre (it can pile up toward one pole), so shift the
+                // whole chromosome by (target − DNA centroid) rather than just
+                // adding `sub_off` — keeping its spread but centring its mass.
+                let mut sum = nalgebra::Vector3::<f32>::zeros();
+                let mut cnt = 0usize;
+                for s in &theta.strands {
+                    for p in s {
+                        sum += p.coords;
+                        cnt += 1;
+                    }
+                }
+                let shift = if cnt > 0 {
+                    sub_off - sum / cnt as f32
+                } else {
+                    sub_off
+                };
+                // The recentring shift can push the spread-out walk's leading end
+                // past a narrowing cap; clamp every bead back inside the cell
+                // envelope (inset by the bead radius) so the nucleoid stays
+                // centred AND fully contained.
+                let inset = shape.inset(chr.bead_radius);
+                let place = |p: Point3<f32>| inset.clamp_inside(p + shift);
                 let mut group: Vec<Vec<Point3<f32>>> = Vec::new();
                 for mut s in theta.strands {
                     for p in &mut s {
-                        *p += sub_off;
+                        *p = place(*p);
                     }
                     group.push(s);
                 }
-                for mut fk in theta.forks {
-                    fk += sub_off;
-                    forks.push(fk);
+                for fk in theta.forks {
+                    forks.push(place(fk));
                 }
-                for mut o in theta.oric {
-                    o += sub_off;
-                    orics.push(o);
+                for o in theta.oric {
+                    orics.push(place(o));
                 }
-                for mut t in theta.ter {
-                    t += sub_off;
-                    ters.push(t);
+                for t in theta.ter {
+                    ters.push(place(t));
                 }
                 chrom_groups.push(group);
             }
