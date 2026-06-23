@@ -68,6 +68,22 @@ impl CellShape {
         }
     }
 
+    /// Project `p` to the nearest point inside this envelope (no-op if already
+    /// inside): pull it radially onto the surface around the nearest medial-axis
+    /// point. Used to keep chromosome beads within the cell after a recentring
+    /// shift nudges the spread-out nucleoid's leading end past a (narrowing) cap.
+    pub(crate) fn clamp_inside(&self, p: Point3<f32>) -> Point3<f32> {
+        let m = self.medial(&p);
+        let v = p - m;
+        let dist = v.norm();
+        let maxr = self.cap_radius();
+        if dist > maxr && dist > 1e-6 {
+            m + v * (maxr / dist)
+        } else {
+            p
+        }
+    }
+
     /// Outward unit direction (radial from the medial axis) at `p`.
     pub fn outward(&self, p: &Point3<f32>) -> Vector3<f32> {
         (p - self.medial(p)).try_normalize(1e-6).unwrap_or_else(|| perp(self.long_axis()))
