@@ -122,7 +122,12 @@ pub fn pack_on_fiber<R: Rng>(
                 let n2 = tang.cross(&n1);
                 let phi = rng.gen_range(0.0..std::f32::consts::TAU);
                 let radial = n1 * phi.cos() + n2 * phi.sin();
-                let center = confine_center(p + radial * off, n1, n2, phi, off, p, &inset);
+                // Confine inside the envelope; a candidate that can't be
+                // confined is a failed attempt (like an overlap rejection).
+                let Some(center) = confine_center(p + radial * off, n1, n2, phi, off, p, &inset)
+                else {
+                    continue;
+                };
                 let rot = align_to_normal(ing.principal_vector, tang);
                 let cand: Vec<(Point3<f32>, f32)> =
                     ing.shape.world_spheres(center, rot).collect();
@@ -234,7 +239,12 @@ pub fn pack_on_fiber_at<R: Rng>(
             let n2 = tang.cross(&n1);
             let phi = rng.gen_range(0.0..std::f32::consts::TAU);
             let radial = n1 * phi.cos() + n2 * phi.sin();
-            let center = confine_center(p + radial * off, n1, n2, phi, off, p, &inset);
+            // Confine inside the envelope; a candidate that can't be confined
+            // is a failed attempt (like an overlap rejection).
+            let Some(center) = confine_center(p + radial * off, n1, n2, phi, off, p, &inset)
+            else {
+                continue;
+            };
             let rot = align_to_normal(ing.principal_vector, tang);
             let cand: Vec<(Point3<f32>, f32)> = ing.shape.world_spheres(center, rot).collect();
             if collides(&index, &spheres, max_r, &cand) {
@@ -257,14 +267,16 @@ pub fn pack_on_fiber_at<R: Rng>(
     out
 }
 
-/// Confine a candidate protein centre to the inset envelope.
+/// Confine a candidate protein centre to the inset envelope, GUARANTEEING
+/// containment: returns `Some(p)` only when `inset.contains(&p)`, and `None`
+/// when no orientation/pull could bring the candidate inside (degenerate
+/// geometry). Callers MUST treat `None` as a failed placement attempt and
+/// skip the candidate — never place an out-of-bounds protein.
 ///
-/// When `raw` escapes the inset, tries 8 azimuthal rotations around the
-/// local strand tangent (no RNG — deterministic from the existing `phi`).
+/// When `raw` escapes the inset, tries 7 azimuthal rotations around the local
+/// strand tangent (no RNG — deterministic from the existing `phi`; the 8th
+/// step would be `phi + TAU == phi`, i.e. the already-failed `raw` direction).
 /// Falls back to a linear pull toward the medial axis until contained.
-/// The obstacle/overlap check still runs *after* confinement, so a
-/// pulled-inward candidate that lands on the strand will be rejected by
-/// the caller's collision check and trigger the next attempt.
 fn confine_center(
     raw: Point3<f32>,
     n1: Vector3<f32>,
@@ -273,17 +285,18 @@ fn confine_center(
     off: f32,
     strand_pt: Point3<f32>,
     inset: &CellShape,
-) -> Point3<f32> {
+) -> Option<Point3<f32>> {
     if inset.contains(&raw) {
-        return raw;
+        return Some(raw);
     }
-    // Try 8 evenly-spaced azimuthal rotations (deterministic, no RNG).
+    // Try 7 evenly-spaced azimuthal rotations (deterministic, no RNG). The 8th
+    // (k == 8) would wrap to `phi`, the already-rejected `raw` direction.
     let step = std::f32::consts::TAU / 8.0;
-    for k in 1..=8_u32 {
+    for k in 1..=7_u32 {
         let p = phi + k as f32 * step;
         let alt = strand_pt + (n1 * p.cos() + n2 * p.sin()) * off;
         if inset.contains(&alt) {
-            return alt;
+            return Some(alt);
         }
     }
     // Fallback: pull linearly toward the medial axis until contained.
@@ -292,11 +305,13 @@ fn confine_center(
     let mut pos = raw;
     for _ in 0..20 {
         if inset.contains(&pos) {
-            return pos;
+            return Some(pos);
         }
         pos += inward * pull;
     }
-    pos // degenerate shape — return best effort
+    // Could not confine (e.g. a degenerate inset): refuse rather than place
+    // an out-of-bounds protein — the confinement invariant is zero protrusions.
+    None
 }
 
 /// True if any candidate sphere overlaps a stored sphere.
@@ -400,6 +415,75 @@ mod tests {
         for b in &binds {
             assert!(inset.contains(&b.position), "binding outside envelope: {:?}", b.position);
         }
+    }
+
+    #[test]
+    fn pathological_confinement_never_places_outside_the_envelope() {
+        use crate::fiber::CellShape;
+        // A tiny capsule with a fiber pinned to the wall and a proxy radius so
+        // large that the radial offset can never fit inside `inset`: the inset
+        // cap radius (radius - proxy) is degenerate, so confinement frequently
+        // fails. The guarantee: every protein that IS placed sits inside the
+        // inset envelope — none is ever placed outside (it's skipped instead).
+        let shape = CellShape::Capsule { half_len: 30.0, radius: 30.0, axis: Vector3::x() };
+        let proxy = 28.0_f32;
+        let fiber: Vec<Point3<f32>> = (0..20)
+            .map(|i| Point3::new(-20.0 + i as f32 * 2.0, 29.0, 0.0))
+            .collect();
+        let ing = sphere_ingredient(proxy);
+        for seed in 0..8_u64 {
+            let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+            let binds = pack_on_fiber(&fiber, &[(0, &ing, 40)], &[], 5.0, shape, &mut rng);
+            let inset = shape.inset(proxy);
+            for b in &binds {
+                assert!(
+                    inset.contains(&b.position),
+                    "seed {seed}: protein placed OUTSIDE the envelope: {:?}",
+                    b.position
+                );
+            }
+            // Same guarantee for the locus-targeted packer.
+            let at = vec![(0u32, &ing, 0.5_f32); 40];
+            let mut rng2 = Xoshiro256PlusPlus::seed_from_u64(seed);
+            let binds2 = pack_on_fiber_at(&fiber, &at, &[], 5.0, shape, &mut rng2);
+            for b in &binds2 {
+                assert!(
+                    inset.contains(&b.position),
+                    "seed {seed}: locus protein placed OUTSIDE the envelope: {:?}",
+                    b.position
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confine_center_returns_none_when_it_cannot_confine_and_some_inside_otherwise() {
+        use crate::fiber::CellShape;
+        let n1 = Vector3::y();
+        let n2 = Vector3::z();
+
+        // Degenerate inset (cap radius 0): only the medial axis is "inside",
+        // and the medial pull (step ∝ cap_radius == 0) cannot move the point.
+        // No orientation/pull can confine → must be None, NOT a best-effort
+        // out-of-bounds point.
+        let degenerate = CellShape::Sphere { radius: 0.0 };
+        let strand_pt = Point3::new(0.0, 50.0, 0.0);
+        let off = 30.0;
+        let raw = strand_pt + n1 * off; // (0, 80, 0): far outside
+        assert!(
+            confine_center(raw, n1, n2, 0.0, off, strand_pt, &degenerate).is_none(),
+            "unconfinable case must return None, never an out-of-bounds point"
+        );
+
+        // A roomy envelope where a rotation around the tangent finds an inside
+        // orientation: the result must be Some(p) AND actually contained.
+        let roomy = CellShape::Sphere { radius: 100.0 };
+        let strand_pt2 = Point3::new(0.0, 95.0, 0.0);
+        let off2 = 50.0;
+        let raw2 = strand_pt2 + n1 * off2; // (0, 145, 0): outside r=100
+        let got = confine_center(raw2, n1, n2, 0.0, off2, strand_pt2, &roomy);
+        let p = got.expect("a confining orientation exists in a roomy sphere");
+        assert!(roomy.contains(&p), "confine_center returned an uncontained point: {p:?}");
     }
 
     #[test]

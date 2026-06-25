@@ -816,6 +816,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                 if fiber_world.len() < 2 {
                     continue;
                 }
+                // TODO: `shape` is origin-relative while `fiber_world` is
+                // world-space (offset by `center`). Exact for the production
+                // compartment (centred at the world origin), approximate for an
+                // off-centre one. Carry `center` into `CellShape` to make exact.
                 // With a genome annotation, seat proteins at real transcription /
                 // replication sites; otherwise spread them randomly.
                 let binds = match &genome {

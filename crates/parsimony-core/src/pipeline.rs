@@ -486,6 +486,12 @@ fn obstacles_from(deps: &[&Snapshot], recipe: &Recipe) -> Vec<(Point3<f32>, f32)
 /// Mirrors the logic in `placer::chromosome_cell`. Returns an effectively
 /// unbounded sphere as a fallback so confinement never rejects anything when
 /// the compartment cannot be resolved.
+///
+// TODO: the returned `CellShape` is origin-relative, but the fiber passed to
+// `pack_on_fiber*` is world-space (offset by the compartment centre). This is
+// exact for the production compartment (centred at the world origin) and only
+// approximate for an off-centre compartment. Carry the compartment centre into
+// `CellShape` (or translate the fiber to origin-relative) to make it exact.
 fn chrom_cell_shape(recipe: &Recipe, compartment: Option<&str>) -> crate::fiber::CellShape {
     use crate::fiber::CellShape;
     for (name, comp) in &recipe.compartments {
