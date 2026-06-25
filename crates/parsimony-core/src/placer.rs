@@ -23,7 +23,7 @@
 //!   counter detects when the surface is full.
 
 use indexmap::IndexMap;
-use nalgebra::{Point3, Quaternion, UnitQuaternion};
+use nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -104,6 +104,76 @@ fn subdivide(
             (CellShape::Sphere { radius: radius * 0.5 }, nalgebra::Vector3::new(0.0, 0.0, z))
         }
     }
+}
+
+/// Map a v2ecoli replication `domain_index` to a strand index into `n_strands`.
+///
+/// Phase-A simplification:
+///   - `domain_index == 0`  → strand 0 (main chromosome)
+///   - `domain_index  > 0`  → last strand (sister / replicated copy)
+///
+/// Clamped to `n_strands - 1` so callers may safely index into the slice.
+/// Replication-domain topology (left vs right replichore, multi-fork index)
+/// is refined in a later phase.
+fn domain_index_to_strand(domain_index: i32, n_strands: usize) -> usize {
+    if n_strands == 0 {
+        return 0; // caller guards empty slice
+    }
+    if domain_index == 0 {
+        0
+    } else {
+        n_strands - 1
+    }
+}
+
+/// Map a v2ecoli genomic coordinate (signed bp, oriC = 0) to a 3D point and
+/// unit tangent on the rendered chromosome strand selected by `domain_index`.
+///
+/// Returns `None` when `strands` is empty.  A single-bead strand returns that
+/// bead with an `+x` unit tangent (degenerate but safe).
+///
+/// **Mapping:**
+/// ```text
+/// frac = (0.5 + coordinate / genome_len_bp).rem_euclid(1.0)
+/// ```
+/// oriC (coordinate = 0) maps to fraction 0.5, i.e. the midpoint of the
+/// rendered strand.  The result is the nearest bead by rounded index.
+pub fn strand_point(
+    strands: &[Vec<Point3<f32>>],
+    domain_index: i32,
+    coordinate: i64,
+    genome_len_bp: u32,
+) -> Option<(Point3<f32>, Vector3<f32>)> {
+    if strands.is_empty() {
+        return None;
+    }
+    let si = domain_index_to_strand(domain_index, strands.len());
+    let strand = &strands[si];
+    if strand.is_empty() {
+        return None;
+    }
+    if strand.len() == 1 {
+        return Some((strand[0], Vector3::x()));
+    }
+
+    // oriC (coordinate = 0) maps to fraction 0.5 (strand midpoint).
+    let frac = (0.5_f64 + coordinate as f64 / genome_len_bp as f64).rem_euclid(1.0) as f32;
+    let last = (strand.len() - 1) as f32;
+    let idx = (frac * last).round() as usize;
+    let idx = idx.min(strand.len() - 1);
+
+    let point = strand[idx];
+
+    // Tangent: forward segment, or backward segment at the very end.
+    let tangent = if idx + 1 < strand.len() {
+        strand[idx + 1] - strand[idx]
+    } else {
+        strand[idx] - strand[idx - 1]
+    };
+    let norm = tangent.norm();
+    let tangent = if norm > 1e-9 { tangent / norm } else { Vector3::x() };
+
+    Some((point, tangent))
 }
 
 /// Cap on consecutive surface-placement rejections before a Surface
@@ -1781,5 +1851,24 @@ mod tests {
         for (pa, pb) in a.snapshot.placements.iter().zip(b.snapshot.placements.iter()) {
             assert_eq!(pa.position, pb.position);
         }
+    }
+
+    #[test]
+    fn strand_point_maps_origin_to_midpoint_and_is_on_strand() {
+        // A simple straight strand of 101 beads along x.
+        let strand: Vec<Point3<f32>> = (0..101)
+            .map(|i| Point3::new(-500.0 + i as f32 * 10.0, 0.0, 0.0))
+            .collect();
+        let strands = vec![strand.clone()];
+        let glen = 4_641_652u32;
+        // coordinate 0 (oriC) -> fraction 0.5 -> bead 50 -> x = 0.0
+        let (p0, t0) = strand_point(&strands, 0, 0, glen).unwrap();
+        assert!((p0.x - 0.0).abs() < 1e-3, "oriC not at midpoint: {}", p0.x);
+        assert!((t0.norm() - 1.0).abs() < 1e-4);
+        // a positive coordinate moves toward the high-index end (downstream of oriC)
+        let (p1, _) = strand_point(&strands, 0, (glen / 4) as i64, glen).unwrap();
+        assert!(p1.x > p0.x);
+        // every mapped point is an actual bead-interpolated point on the strand
+        assert!(strand.iter().map(|b| (b - p1).norm()).fold(f32::MAX, f32::min) < 11.0);
     }
 }
