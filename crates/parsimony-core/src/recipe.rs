@@ -85,6 +85,12 @@ struct RawChromosome {
     /// Ingredient name placed at the replication terminus (terC). Optional.
     #[serde(default)]
     ter_marker: Option<String>,
+    /// Explicit RNAP placements (coordinates in bp, domain index, strand).
+    #[serde(default)]
+    rnaps: Vec<RawRnap>,
+    /// Ingredient name instanced at each explicit RNAP position.
+    #[serde(default)]
+    rnap_marker: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -106,6 +112,14 @@ struct RawSupercoil {
 struct RawFiberProtein {
     object: String,
     count: u32,
+}
+
+/// Raw explicit RNAP placement from the recipe (mirrors [`RnapPlacement`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRnap {
+    coordinates: i64,
+    domain_index: i32,
+    is_forward: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +317,21 @@ pub struct ChromosomeSpec {
     pub oric_marker: Option<String>,
     /// Ingredient name placed at the terminus (terC), if any.
     pub ter_marker: Option<String>,
+    /// Explicit RNAP placements derived from recipe `rnaps` list.
+    pub rnaps: Vec<RnapPlacement>,
+    /// Ingredient name instanced at each explicit RNAP position, if any.
+    pub rnap_marker: Option<String>,
+}
+
+/// A single explicit RNA polymerase placement from the recipe.
+#[derive(Debug, Clone)]
+pub struct RnapPlacement {
+    /// Genomic coordinate (base-pairs) along the chromosome.
+    pub coordinates: i64,
+    /// Replication domain index (which replichore/domain this RNAP belongs to).
+    pub domain_index: i32,
+    /// `true` = leading strand; `false` = lagging strand.
+    pub is_forward: bool,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -662,6 +691,16 @@ fn resolve(
             fork_marker: c.fork_marker,
             oric_marker: c.oric_marker,
             ter_marker: c.ter_marker,
+            rnaps: c
+                .rnaps
+                .into_iter()
+                .map(|r| RnapPlacement {
+                    coordinates: r.coordinates,
+                    domain_index: r.domain_index,
+                    is_forward: r.is_forward,
+                })
+                .collect(),
+            rnap_marker: c.rnap_marker,
         }),
     })
 }
@@ -1380,5 +1419,28 @@ mod tests {
             }
             _ => panic!("expected Mesh shape"),
         }
+    }
+
+    #[test]
+    fn parses_explicit_rnaps_from_recipe_json() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {"space": {"regions": {"interior": []}}},
+            "chromosome": {
+                "beads": 1000, "spacing": 135, "bead_radius": 12, "compartment": "space",
+                "rnap_marker": "rna_polymerase",
+                "rnaps": [
+                    {"coordinates": 100000, "domain_index": 0, "is_forward": true},
+                    {"coordinates": -50000, "domain_index": 0, "is_forward": false}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let chr = recipe.chromosome.as_ref().unwrap();
+        assert_eq!(chr.rnaps.len(), 2);
+        assert_eq!(chr.rnaps[0].coordinates, 100000);
+        assert!(!chr.rnaps[1].is_forward);
+        assert_eq!(chr.rnap_marker.as_deref(), Some("rna_polymerase"));
     }
 }
