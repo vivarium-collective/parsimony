@@ -16,6 +16,7 @@ use rand::Rng;
 use parsimony_spatial::{Aabb, QbvhIndex, Sphere, SpatialIndex};
 
 use crate::compartment::align_to_normal;
+use crate::fiber::CellShape;
 use crate::ingredient::{Ingredient, IngredientId};
 
 /// One protein placed on the fiber.
@@ -45,6 +46,7 @@ pub fn pack_on_fiber<R: Rng>(
     proteins: &[(IngredientId, &Ingredient, u32)],
     obstacles: &[(Point3<f32>, f32)],
     fiber_radius: f32,
+    shape: CellShape,
     rng: &mut R,
 ) -> Vec<FiberBinding> {
     if fiber.len() < 2 {
@@ -107,6 +109,7 @@ pub fn pack_on_fiber<R: Rng>(
     for &&(id, ing, count) in &order {
         let er = ing.shape.enclosing_radius();
         let off = fiber_radius + er + BIND_GAP;
+        let inset = shape.inset(er);
         for inst in 0..count {
             // Stratify the first attempt along the strand so instances
             // spread out; later attempts sample uniformly at random.
@@ -119,7 +122,7 @@ pub fn pack_on_fiber<R: Rng>(
                 let n2 = tang.cross(&n1);
                 let phi = rng.gen_range(0.0..std::f32::consts::TAU);
                 let radial = n1 * phi.cos() + n2 * phi.sin();
-                let center = p + radial * off;
+                let center = confine_center(p + radial * off, n1, n2, phi, off, p, &inset);
                 let rot = align_to_normal(ing.principal_vector, tang);
                 let cand: Vec<(Point3<f32>, f32)> =
                     ing.shape.world_spheres(center, rot).collect();
@@ -157,6 +160,7 @@ pub fn pack_on_fiber_at<R: Rng>(
     placements: &[(IngredientId, &Ingredient, f32)],
     obstacles: &[(Point3<f32>, f32)],
     fiber_radius: f32,
+    shape: CellShape,
     rng: &mut R,
 ) -> Vec<FiberBinding> {
     if fiber.len() < 2 {
@@ -212,6 +216,7 @@ pub fn pack_on_fiber_at<R: Rng>(
         let (id, ing, frac) = placements[pi];
         let er = ing.shape.enclosing_radius();
         let off = fiber_radius + er + BIND_GAP;
+        let inset = shape.inset(er);
         let base_s = frac.rem_euclid(1.0) * total;
         for attempt in 0..ATTEMPTS_PER_INSTANCE {
             // Attempt 0 hits the gene exactly; later attempts wander a little
@@ -229,7 +234,7 @@ pub fn pack_on_fiber_at<R: Rng>(
             let n2 = tang.cross(&n1);
             let phi = rng.gen_range(0.0..std::f32::consts::TAU);
             let radial = n1 * phi.cos() + n2 * phi.sin();
-            let center = p + radial * off;
+            let center = confine_center(p + radial * off, n1, n2, phi, off, p, &inset);
             let rot = align_to_normal(ing.principal_vector, tang);
             let cand: Vec<(Point3<f32>, f32)> = ing.shape.world_spheres(center, rot).collect();
             if collides(&index, &spheres, max_r, &cand) {
@@ -250,6 +255,48 @@ pub fn pack_on_fiber_at<R: Rng>(
         }
     }
     out
+}
+
+/// Confine a candidate protein centre to the inset envelope.
+///
+/// When `raw` escapes the inset, tries 8 azimuthal rotations around the
+/// local strand tangent (no RNG — deterministic from the existing `phi`).
+/// Falls back to a linear pull toward the medial axis until contained.
+/// The obstacle/overlap check still runs *after* confinement, so a
+/// pulled-inward candidate that lands on the strand will be rejected by
+/// the caller's collision check and trigger the next attempt.
+fn confine_center(
+    raw: Point3<f32>,
+    n1: Vector3<f32>,
+    n2: Vector3<f32>,
+    phi: f32,
+    off: f32,
+    strand_pt: Point3<f32>,
+    inset: &CellShape,
+) -> Point3<f32> {
+    if inset.contains(&raw) {
+        return raw;
+    }
+    // Try 8 evenly-spaced azimuthal rotations (deterministic, no RNG).
+    let step = std::f32::consts::TAU / 8.0;
+    for k in 1..=8_u32 {
+        let p = phi + k as f32 * step;
+        let alt = strand_pt + (n1 * p.cos() + n2 * p.sin()) * off;
+        if inset.contains(&alt) {
+            return alt;
+        }
+    }
+    // Fallback: pull linearly toward the medial axis until contained.
+    let inward = inset.inward(&raw);
+    let pull = inset.cap_radius() * 0.1_f32;
+    let mut pos = raw;
+    for _ in 0..20 {
+        if inset.contains(&pos) {
+            return pos;
+        }
+        pos += inward * pull;
+    }
+    pos // degenerate shape — return best effort
 }
 
 /// True if any candidate sphere overlaps a stored sphere.
@@ -307,13 +354,15 @@ mod tests {
 
     #[test]
     fn binds_proteins_on_the_fiber_surface_without_overlap() {
-        // A straight fiber along +x.
+        use crate::fiber::CellShape;
+        // A straight fiber along +x — use a large sphere so confinement never triggers.
         let fiber: Vec<Point3<f32>> =
             (0..50).map(|i| Point3::new(i as f32 * 10.0, 0.0, 0.0)).collect();
         let ing = sphere_ingredient(8.0);
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
         let fiber_radius = 5.0;
-        let binds = pack_on_fiber(&fiber, &[(0, &ing, 30)], &[], fiber_radius, &mut rng);
+        let shape = CellShape::Sphere { radius: 1000.0 };
+        let binds = pack_on_fiber(&fiber, &[(0, &ing, 30)], &[], fiber_radius, shape, &mut rng);
 
         assert!(binds.len() > 15, "placed only {}", binds.len());
         // Each protein sits one (fiber_radius + protein_radius) off the
@@ -336,16 +385,37 @@ mod tests {
     }
 
     #[test]
+    fn bound_proteins_stay_inside_the_cell_envelope() {
+        use crate::fiber::CellShape;
+        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x() };
+        // A fiber hugging the wall (y ~ +radius), where a naive outward offset escapes.
+        let fiber: Vec<Point3<f32>> = (0..40)
+            .map(|i| Point3::new(-300.0 + i as f32 * 15.0, 115.0, 0.0))
+            .collect();
+        let ing = sphere_ingredient(25.0); // proxy radius 25
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
+        let binds = pack_on_fiber(&fiber, &[(0, &ing, 30)], &[], 12.0, shape, &mut rng);
+        assert!(!binds.is_empty());
+        let inset = shape.inset(25.0);
+        for b in &binds {
+            assert!(inset.contains(&b.position), "binding outside envelope: {:?}", b.position);
+        }
+    }
+
+    #[test]
     fn avoids_obstacles_and_is_deterministic() {
+        use crate::fiber::CellShape;
         let fiber: Vec<Point3<f32>> =
             (0..40).map(|i| Point3::new(i as f32 * 10.0, 0.0, 0.0)).collect();
         let ing = sphere_ingredient(8.0);
+        // Large sphere — confinement never triggers, so determinism is preserved.
+        let shape = CellShape::Sphere { radius: 1000.0 };
 
         // An obstacle wall blocking the +y side of the fiber's first half.
         let obstacles: Vec<(Point3<f32>, f32)> =
             (0..20).map(|i| (Point3::new(i as f32 * 10.0, 13.0, 0.0), 9.0)).collect();
         let mut a = Xoshiro256PlusPlus::seed_from_u64(7);
-        let binds = pack_on_fiber(&fiber, &[(0, &ing, 30)], &obstacles, 5.0, &mut a);
+        let binds = pack_on_fiber(&fiber, &[(0, &ing, 30)], &obstacles, 5.0, shape, &mut a);
         for b in &binds {
             for o in &obstacles {
                 let d = (b.position - o.0).norm();
@@ -354,7 +424,7 @@ mod tests {
         }
         // Deterministic for a fixed seed.
         let mut b = Xoshiro256PlusPlus::seed_from_u64(7);
-        let again = pack_on_fiber(&fiber, &[(0, &ing, 30)], &obstacles, 5.0, &mut b);
+        let again = pack_on_fiber(&fiber, &[(0, &ing, 30)], &obstacles, 5.0, shape, &mut b);
         assert_eq!(binds.len(), again.len());
         for (x, y) in binds.iter().zip(again.iter()) {
             assert_eq!(x.position, y.position);

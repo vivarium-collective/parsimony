@@ -835,7 +835,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                                 }
                             }
                         }
-                        crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, rng)
+                        crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, shape, rng)
                     }
                     None => {
                         let proteins: Vec<(u32, &Ingredient, u32)> = self
@@ -843,7 +843,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                             .into_iter()
                             .map(|(id, ing, c)| (id, ing, (c / n_groups).max(1)))
                             .collect();
-                        crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+                        crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, shape, rng)
                     }
                 };
                 for b in binds {

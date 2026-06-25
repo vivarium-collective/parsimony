@@ -482,6 +482,34 @@ fn obstacles_from(deps: &[&Snapshot], recipe: &Recipe) -> Vec<(Point3<f32>, f32)
     obs
 }
 
+/// Derive the `CellShape` for a chromosome compartment from a recipe.
+/// Mirrors the logic in `placer::chromosome_cell`. Returns an effectively
+/// unbounded sphere as a fallback so confinement never rejects anything when
+/// the compartment cannot be resolved.
+fn chrom_cell_shape(recipe: &Recipe, compartment: Option<&str>) -> crate::fiber::CellShape {
+    use crate::fiber::CellShape;
+    for (name, comp) in &recipe.compartments {
+        if let Some(want) = compartment {
+            if name.as_str() != want {
+                continue;
+            }
+        }
+        return match &comp.kind {
+            CompartmentKind::Sphere { radius, .. } => CellShape::Sphere { radius: *radius },
+            CompartmentKind::Capsule { a, b, radius } => {
+                let axis_v = b - a;
+                let half_len = axis_v.norm() * 0.5;
+                let axis = axis_v
+                    .try_normalize(1e-6)
+                    .unwrap_or_else(nalgebra::Vector3::x);
+                CellShape::Capsule { half_len, radius: *radius, axis }
+            }
+            _ => CellShape::Sphere { radius: 1e9 },
+        };
+    }
+    CellShape::Sphere { radius: 1e9 }
+}
+
 /// Execute a [`StageKind::FiberPack`] stage: bind the chromosome's proteins
 /// along the fiber from a `chromosome` dependency, avoiding the
 /// dependencies' placed geometry (e.g. the interior). The DNA beads
@@ -504,6 +532,9 @@ fn run_fiber_pack(
     else {
         return snap;
     };
+
+    // Cell shape used for confining fiber-bound proteins inside the envelope.
+    let chrom_shape = chrom_cell_shape(recipe, chr_spec.compartment.as_deref());
 
     // Pack proteins across ALL strands (every chromosome + its sister bubble),
     // not just the first — otherwise all RNAP piles onto one chromosome. Each
@@ -572,7 +603,7 @@ fn run_fiber_pack(
                         }
                     }
                 }
-                crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chrom.radius, &mut rng)
+                crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chrom.radius, chrom_shape, &mut rng)
             }
             None => {
                 let proteins: Vec<(u32, &Ingredient, u32)> = strand_proteins
@@ -584,7 +615,7 @@ fn run_fiber_pack(
                             .map(|(idx, _, ing)| (idx as u32, ing, *c))
                     })
                     .collect();
-                crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chrom.radius, &mut rng)
+                crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chrom.radius, chrom_shape, &mut rng)
             }
         };
         for b in binds {
