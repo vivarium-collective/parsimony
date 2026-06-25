@@ -277,7 +277,11 @@ pub fn pack_on_fiber_at<R: Rng>(
 /// strand tangent (no RNG — deterministic from the existing `phi`; the 8th
 /// step would be `phi + TAU == phi`, i.e. the already-failed `raw` direction).
 /// Falls back to a linear pull toward the medial axis until contained.
-fn confine_center(
+///
+/// With `off = 0.0` (no radial offset), the azimuthal tries all evaluate to
+/// `strand_pt` and only the linear pull applies — suitable for callers that
+/// need pure confinement without radial placement (e.g. explicit RNAP loci).
+pub(crate) fn confine_center(
     raw: Point3<f32>,
     n1: Vector3<f32>,
     n2: Vector3<f32>,
