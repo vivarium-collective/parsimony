@@ -45,8 +45,10 @@ impl CellShape {
         }
     }
 
-    /// Nearest point on the medial axis (sphere: the origin).
-    fn medial(&self, p: &Point3<f32>) -> Point3<f32> {
+    /// Nearest point on the medial axis (sphere: the origin). Always inside
+    /// the envelope (distance 0 from the medial axis ≤ cap radius), so it is a
+    /// safe guaranteed-inside fallback for confinement.
+    pub(crate) fn medial(&self, p: &Point3<f32>) -> Point3<f32> {
         match *self {
             CellShape::Sphere { .. } => Point3::origin(),
             CellShape::Capsule { half_len, axis, .. } => {

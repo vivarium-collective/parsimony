@@ -181,6 +181,18 @@ pub fn strand_point(
 /// be mapped onto the strand.
 const GENOME_BP_DEFAULT: u32 = 4_641_652;
 
+/// Orientation quaternion seating an ingredient's `+x` reference axis onto
+/// `dir` (a strand tangent, flipped for reverse-strand RNAPs). When `dir` is
+/// antiparallel to `+x`, `UnitQuaternion::rotation_between` returns `None`
+/// (the rotation axis is undefined); identity would then wrongly leave the
+/// molecule pointing at `+x`, so the fallback is a real 180° turn about `+y`,
+/// mapping `+x` onto `-x`.
+fn orient_x_onto(dir: Vector3<f32>) -> UnitQuaternion<f32> {
+    UnitQuaternion::rotation_between(&Vector3::x(), &dir).unwrap_or_else(|| {
+        UnitQuaternion::from_axis_angle(&Vector3::y_axis(), std::f32::consts::PI)
+    })
+}
+
 /// Cap on consecutive surface-placement rejections before a Surface
 /// directive is declared stuck. Surface placements use uniform random
 /// sampling on the compartment boundary (no per-cell filtering), so the
@@ -856,6 +868,12 @@ impl<'a> GreedyRandomPlacer<'a> {
             }
         }
         let pts = strands.first().cloned().unwrap_or_default();
+        // Parse the genome annotation once (shared by the fiber-protein packing
+        // below and the explicit-RNAP loop further down — avoids a double parse).
+        let genome = chr
+            .genome
+            .as_ref()
+            .and_then(|p| crate::genome::Genome::from_csv(p).ok());
         // Pack DNA-binding proteins (RNAP, etc.) PER CHROMOSOME — each chromosome
         // is a full genome, so each gets its share. Packing them on the single
         // concatenated fiber instead piled them all onto whichever chromosome had
@@ -874,10 +892,6 @@ impl<'a> GreedyRandomPlacer<'a> {
                     ing.shape.world_spheres(pl.position, pl.rotation)
                 })
                 .collect();
-            let genome = chr
-                .genome
-                .as_ref()
-                .and_then(|p| crate::genome::Genome::from_csv(p).ok());
             let n_groups = chrom_groups.len() as u32;
             // When explicit RNAP placements are provided, exclude the rnap_marker
             // ingredient from the count-based random packing — it is handled
@@ -959,10 +973,8 @@ impl<'a> GreedyRandomPlacer<'a> {
             if let Some(rnap_name) = &chr.rnap_marker {
                 if let Some((idx, _, ing)) = self.recipe.ingredients.get_full(rnap_name) {
                     // Genome length: CSV-parsed length when available, else E. coli default.
-                    let glen = chr
-                        .genome
+                    let glen = genome
                         .as_ref()
-                        .and_then(|p| crate::genome::Genome::from_csv(p).ok())
                         .map(|g| g.length_bp)
                         .filter(|&l| l > 0)
                         .unwrap_or(GENOME_BP_DEFAULT);
@@ -981,7 +993,15 @@ impl<'a> GreedyRandomPlacer<'a> {
                         // displacement is attempted — the RNAP sits at its locus
                         // and the linear pull handles out-of-bounds cases.
                         // n1/n2 are unused when off=0 but must be valid unit vectors.
-                        let Some(pos) = crate::fiber_pack::confine_center(
+                        //
+                        // NEVER drop an RNAP: 1:1 true-abundance requires every
+                        // entry to be rendered. If confinement fails (degenerate
+                        // inset — proxy larger than the whole cell), fall back to
+                        // the medial-axis projection of the strand point, which
+                        // lies on the centerline and is always inside the inset
+                        // (a medial point has distance 0 ≤ cap_radius). For a
+                        // fully-degenerate inset that collapses to the cell centre.
+                        let pos = crate::fiber_pack::confine_center(
                             world_pt,
                             Vector3::y(),
                             Vector3::z(),
@@ -989,13 +1009,16 @@ impl<'a> GreedyRandomPlacer<'a> {
                             0.0,
                             world_pt,
                             &inset,
-                        ) else {
-                            continue; // degenerate cell or extreme locus — skip
-                        };
+                        )
+                        .unwrap_or_else(|| {
+                            let m = inset.medial(&world_pt);
+                            if inset.contains(&m) { m } else { center }
+                        });
                         // Orientation: rotate +x onto ±tangent depending on strand.
+                        // `orient_x_onto` handles the antiparallel (`dir == -x`)
+                        // case with a real 180° turn instead of a wrong identity.
                         let dir = if rnap.is_forward { tangent } else { -tangent };
-                        let rot = UnitQuaternion::rotation_between(&Vector3::x(), &dir)
-                            .unwrap_or(UnitQuaternion::identity());
+                        let rot = orient_x_onto(dir);
                         snapshot.placements.push(Placement {
                             instance_uid: *next_uid,
                             ingredient_id: idx as u32,
@@ -1952,16 +1975,20 @@ mod tests {
 
     /// Build a capsule recipe with a 1000-bead chromosome and `n` explicit
     /// RNAP placements at evenly-spread genomic coordinates (alternating
-    /// forward/reverse strand). The cell is large enough to hold the strand
-    /// and all RNAPs without crowding.
+    /// forward/reverse strand). The two end entries land at extreme coordinates
+    /// (~±genome_len/2, i.e. the strand tips) to exercise the no-drop
+    /// confinement fallback. The cell is large enough to hold the strand and
+    /// all RNAPs without crowding.
     fn recipe_with_chromosome_and_rnaps(n: usize) -> Recipe {
         let genome_len: i64 = GENOME_BP_DEFAULT as i64;
         let half = genome_len / 2;
         let step = if n > 1 { genome_len / n as i64 } else { 0 };
         let rnap_entries: String = (0..n)
             .map(|i| {
-                // Spread coordinates evenly from -half+step to +half, staying
-                // well away from the endpoints to avoid degenerate tangents.
+                // Spread coordinates evenly across the full [-half, +half]
+                // range. i=0 ≈ -genome_len/2 and i=n-1 ≈ +genome_len/2 are
+                // extreme tip coordinates (frac ≈ 0.01 / 0.99) that map to the
+                // strand ends near the cell wall — the no-drop path.
                 let coord = -half + step / 2 + i as i64 * step;
                 let fwd = if i % 2 == 0 { "true" } else { "false" };
                 format!(
@@ -1990,7 +2017,7 @@ mod tests {
                 }},
                 "chromosome": {{
                     "beads": 1000,
-                    "spacing": 2.5,
+                    "spacing": 10.0,
                     "bead_radius": 5.0,
                     "compartment": "cell",
                     "rnap_marker": "rna_polymerase",
@@ -2020,10 +2047,12 @@ mod tests {
         panic!("first_capsule_cell: no capsule compartment found in recipe");
     }
 
-    /// A4: every explicit RNAP seats inside the inset envelope.
+    /// A4: every explicit RNAP is placed (1:1, no drops), inside the inset
+    /// envelope, AND near an actual strand bead (not collapsed to the centre).
     #[test]
     fn seats_every_rnap_on_strand_inside_envelope() {
-        let recipe = recipe_with_chromosome_and_rnaps(50);
+        const N: usize = 50;
+        let recipe = recipe_with_chromosome_and_rnaps(N);
         let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
         let out = placer.pack(11);
         let (center, shape) = first_capsule_cell(&recipe);
@@ -2034,7 +2063,12 @@ mod tests {
             .iter()
             .filter(|p| p.ingredient_id == rnap_id)
             .collect();
-        assert_eq!(rnaps.len(), 50, "expected 50 RNAPs, got {}", rnaps.len());
+
+        // 1:1 true abundance — every recipe RNAP is rendered, none dropped
+        // (including the extreme tip-coordinate entries via the no-drop path).
+        assert_eq!(rnaps.len(), N, "expected {N} RNAPs, got {}", rnaps.len());
+
+        // Confinement invariant — all inside the inset envelope.
         let proxy = 20.0_f32; // rna_polymerase radius
         let inset = shape.inset(proxy);
         for p in &rnaps {
@@ -2045,13 +2079,74 @@ mod tests {
                 center
             );
         }
-        // Each RNAP should be within a reasonable distance of a strand bead.
-        // The chromosome stores strand points in the snapshot; in this test we
-        // verify proximity by checking the position is inside the cell (which
-        // is a necessary condition for being on the strand).
+
+        // Genomic-axis fidelity — each RNAP tracks ITS OWN locus, not a shared
+        // point. (The strand's first bead is at the origin == cell centre, so a
+        // "near ANY bead" check would let an all-at-centre bug pass; recomputing
+        // the expected strand point per coordinate closes that gap.) Strand beads
+        // are cell-centre-relative; world = center + bead.coords. Placement order
+        // matches `chr.rnaps` order. Tolerance is bead-spacing scale plus the proxy
+        // radius (confinement may pull a wall-hugging bead slightly inward).
+        let chrom = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome was not attached to snapshot");
+        let specs = &recipe.chromosome.as_ref().unwrap().rnaps;
+        assert_eq!(specs.len(), N, "test fixture should declare {N} rnaps");
+        let spacing = 10.0_f32; // chr.spacing
+        let tol = spacing + proxy;
+        for (p, spec) in rnaps.iter().zip(specs.iter()) {
+            let (expected_rel, _) = strand_point(
+                &chrom.strands,
+                spec.domain_index,
+                spec.coordinates,
+                GENOME_BP_DEFAULT,
+            )
+            .expect("strand_point should map every locus");
+            let expected = center + expected_rel.coords;
+            let d = (expected - p.position).norm();
+            assert!(
+                d < tol,
+                "RNAP not at its locus: coord {} placed {:?}, expected {:?} (d={d}, tol={tol})",
+                spec.coordinates,
+                p.position,
+                expected
+            );
+        }
+        // Sanity: the loci genuinely differ (coordinate-dependent mapping), so
+        // the per-locus check above isn't vacuous — the RNAPs span a real extent.
+        // Use the full 3D pairwise extent (the strand walk is not axis-aligned).
+        let mut max_pair = 0.0_f32;
+        for i in 0..rnaps.len() {
+            for j in (i + 1)..rnaps.len() {
+                max_pair = max_pair.max((rnaps[i].position - rnaps[j].position).norm());
+            }
+        }
         assert!(
-            out.snapshot.chromosome.is_some(),
-            "chromosome was not attached to snapshot"
+            max_pair > 50.0,
+            "RNAPs should spread along the strand, max pairwise extent={max_pair}"
         );
+    }
+
+    /// A4: the orientation helper turns the RNAP +x reference axis onto the
+    /// strand tangent — including the antiparallel (`dir == -x`) case, where a
+    /// naive identity fallback would point it the WRONG way (+x).
+    #[test]
+    fn rnap_orientation_handles_antiparallel_tangent() {
+        // Antiparallel: +x must map to -x (a real 180° turn), NOT stay at +x.
+        let r = orient_x_onto(-Vector3::x());
+        let mapped = r * Vector3::x();
+        assert!(
+            (mapped - (-Vector3::x())).norm() < 1e-5,
+            "antiparallel: +x should map to -x, got {mapped:?}"
+        );
+        // Parallel: +x stays +x.
+        let r2 = orient_x_onto(Vector3::x());
+        assert!(((r2 * Vector3::x()) - Vector3::x()).norm() < 1e-5);
+        // Arbitrary direction: +x maps onto the (unit) target.
+        let d = Vector3::new(0.3, -0.7, 0.5).normalize();
+        let r3 = orient_x_onto(d);
+        assert!(((r3 * Vector3::x()) - d).norm() < 1e-5);
     }
 }
