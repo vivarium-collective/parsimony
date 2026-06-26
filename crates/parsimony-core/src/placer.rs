@@ -1252,6 +1252,98 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
             }
         }
+        // C1-3: Ribosome placement (place_translation).
+        // For each RibosomeSpec, seat the ribosome_marker ingredient on the
+        // matching mRNA strand at `pos_on_mRNA`, offset outward from the cell
+        // envelope's medial axis, then confined inside `shape.inset(ribo_r)`.
+        //
+        // Borrow strategy: build the unique_index→strand-index map and collect
+        // all per-ribosome positions into a Vec BEFORE pushing into
+        // `snapshot.placements` — this avoids holding a `&snapshot.rna_strands`
+        // borrow while also mutably borrowing `snapshot.placements`.
+        if !chr.ribosomes.is_empty() {
+            if let Some(ribo_name) = &chr.ribosome_marker {
+                if let Some((ribo_idx, _, ribo_ing)) = self.recipe.ingredients.get_full(ribo_name) {
+                    let ribo_r = {
+                        let r = ribo_ing.shape.enclosing_radius();
+                        if r < 1e-6 { 120.0_f32 } else { r }
+                    };
+                    let inset = shape.inset(ribo_r);
+                    // Build unique_index → strand-index map (skip default-zero entries).
+                    let strand_map: std::collections::HashMap<i64, usize> = snapshot
+                        .rna_strands
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.unique_index != 0)
+                        .map(|(i, s)| (s.unique_index, i))
+                        .collect();
+                    // Collect ribosome world positions; count those without a strand.
+                    let mut dropped = 0usize;
+                    let ribo_positions: Vec<Point3<f32>> = chr
+                        .ribosomes
+                        .iter()
+                        .filter_map(|ribo| {
+                            let Some(&si) = strand_map.get(&ribo.mRNA_index) else {
+                                dropped += 1;
+                                return None;
+                            };
+                            let strand = &snapshot.rna_strands[si];
+                            if strand.points.len() < 2 {
+                                dropped += 1;
+                                return None;
+                            }
+                            let frac = (ribo.pos_on_mRNA as f32
+                                / strand.length_nt.max(1) as f32)
+                                .clamp(0.0, 1.0);
+                            let idx = ((frac * (strand.points.len() - 1) as f32).round()
+                                as usize)
+                                .min(strand.points.len() - 1);
+                            // Strands are center-relative; convert to world space.
+                            let base = center + strand.points[idx].coords;
+                            // Offset outward so the ribosome sits ON the mRNA,
+                            // not buried inside it. `shape.outward` expects a
+                            // center-relative point; `base` is world-relative, which
+                            // equals center-relative when center == origin (production).
+                            let out = shape.outward(&base);
+                            let pos_raw = base + out * ribo_r;
+                            // Confine to the inset envelope (same pattern as RNAP).
+                            let pos = crate::fiber_pack::confine_center(
+                                pos_raw,
+                                Vector3::y(),
+                                Vector3::z(),
+                                0.0,
+                                0.0,
+                                pos_raw,
+                                &inset,
+                            )
+                            .unwrap_or_else(|| {
+                                let m = inset.medial(&pos_raw);
+                                if inset.contains(&m) { m } else { center }
+                            });
+                            Some(pos)
+                        })
+                        .collect();
+                    if dropped > 0 {
+                        eprintln!(
+                            "[parsimony] ribosome placement: {dropped} ribosomes dropped \
+                             (mRNA_index not matched to any rendered strand)"
+                        );
+                    }
+                    // Push placements after releasing the rna_strands borrow.
+                    for pos in ribo_positions {
+                        snapshot.placements.push(Placement {
+                            instance_uid: *next_uid,
+                            ingredient_id: ribo_idx as u32,
+                            variant_id: 0,
+                            compartment_id: 0,
+                            position: pos,
+                            rotation: UnitQuaternion::identity(),
+                        });
+                        *next_uid += 1;
+                    }
+                }
+            }
+        }
         // Seat the chromosome landmark molecules: the replisome at each fork,
         // oriC at each origin, terC at the terminus — so they read as real
         // machinery/loci on the DNA and are individually selectable.
@@ -3114,5 +3206,84 @@ mod tests {
             "unique_index not carried onto RnaStrand");
         assert_eq!(out.snapshot.rna_strands[0].length_nt, 400,
             "length_nt not carried onto RnaStrand");
+    }
+
+    /// C1-3: ribosome is placed on its mRNA strand at `pos_on_mRNA`, offset
+    /// outward; a ribosome whose `mRNA_index` matches no rendered strand is
+    /// silently dropped.
+    #[test]
+    fn place_translation_seats_ribosome_on_mrna_and_drops_unknown_mrna() {
+        // Large capsule so inset(120) is still usable.
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome": { "type": "single_sphere", "radius": 120 }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 0},
+                    {"mRNA_index": 999, "pos_on_mRNA": 0, "peptide_length": 0}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+
+        let (ribo_idx, _, ribo_ing) = recipe.ingredients.get_full("70S_ribosome")
+            .expect("70S_ribosome ingredient not found");
+        let ribo_r = ribo_ing.shape.enclosing_radius();
+        let ribo_id = ribo_idx as u32;
+
+        // Exactly one ribosome placement: mRNA 20 placed, mRNA 999 dropped.
+        let ribo_placements: Vec<_> = out.snapshot.placements.iter()
+            .filter(|p| p.ingredient_id == ribo_id)
+            .collect();
+        assert_eq!(ribo_placements.len(), 1,
+            "expected exactly 1 ribosome placement (mRNA_index 999 must be dropped), got {}",
+            ribo_placements.len());
+
+        // Ribosome should be inside the inset envelope (shape.inset(ribo_r)).
+        let (center, shape) = first_capsule_cell(&recipe);
+        let inset = shape.inset(ribo_r);
+        let ribo_pos = ribo_placements[0].position;
+        // For a centered compartment (center == origin) the world position
+        // is identical to the center-relative position that inset.contains expects.
+        let pos_rel = ribo_pos - center.coords;
+        assert!(
+            inset.contains(&Point3::from(pos_rel)),
+            "ribosome placement outside inset envelope: world={:?}, center={:?}, rel={:?}",
+            ribo_pos, center, pos_rel
+        );
+
+        // Ribosome should be near the mRNA strand's midpoint bead (frac = 300/600 = 0.5).
+        let strand = out.snapshot.rna_strands.iter()
+            .find(|s| s.unique_index == 20)
+            .expect("RNA strand with unique_index 20 not found");
+        assert!(strand.points.len() >= 2, "strand has fewer than 2 points");
+        let frac = 0.5_f32; // pos_on_mRNA=300, length_nt=600
+        let mid_idx = (frac * (strand.points.len() - 1) as f32).round() as usize;
+        let base = center + strand.points[mid_idx].coords;
+        let dist = (ribo_pos - base).norm();
+        // The raw offset is ribo_r; after possible confinement the ribosome
+        // stays within inset, so the distance can deviate, but must stay
+        // well inside the capsule cross-section (< 3 * ribo_r is generous).
+        assert!(
+            dist < 3.0 * ribo_r,
+            "ribosome too far from mRNA midpoint bead: dist={:.1} Å, threshold={:.1} Å",
+            dist, 3.0 * ribo_r
+        );
     }
 }
