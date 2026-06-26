@@ -284,29 +284,32 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
     // world coordinates. seg_step = 40.0 Å (one segment per bead, matching the
     // strand bead spacing); twist = 0.0 (ssRNA, no helical twist).
     if !snapshot.rna_strands.is_empty() {
-        let rna_seg = recipe
+        let chrom = recipe.chromosome.as_ref();
+        let resolve =
+            |name: Option<&String>| name.and_then(|n| recipe.ingredients.get_index_of(n));
+        // Nascent strands tile `rna_segment`; free strands tile `rna_segment_free`
+        // (falling back to `rna_segment` when no separate free ingredient is set).
+        let nascent_seg = resolve(chrom.and_then(|c| c.rna_segment.as_ref()));
+        let free_seg =
+            resolve(chrom.and_then(|c| c.rna_segment_free.as_ref())).or(nascent_seg);
+        let center = snapshot
             .chromosome
             .as_ref()
-            .and_then(|c| c.rna_segment.as_ref())
-            .and_then(|name| recipe.ingredients.get_index_of(name));
-        if let Some(rna_seg_id) = rna_seg {
-            let center = snapshot
-                .chromosome
-                .as_ref()
-                .map(|c| c.center)
-                .unwrap_or(nalgebra::Point3::origin());
-            let seg_step = 40.0_f32; // one segment per bead (bead spacing = 40 Å)
-            for rna in &snapshot.rna_strands {
-                let world: Vec<_> = rna.points.iter().map(|p| center + p.coords).collect();
-                for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, 0.0) {
-                    placements.push(json!({
-                        "uid": placements.len() as u64,
-                        "ingredient": rna_seg_id as u64,
-                        "compartment": 0,
-                        "position": [pos.x, pos.y, pos.z],
-                        "rotation": [rot.w, rot.i, rot.j, rot.k],
-                    }));
-                }
+            .map(|c| c.center)
+            .unwrap_or(nalgebra::Point3::origin());
+        let seg_step = 40.0_f32; // one segment per bead (bead spacing = 40 Å)
+        for rna in &snapshot.rna_strands {
+            let seg_id = if rna.is_free { free_seg } else { nascent_seg };
+            let Some(seg_id) = seg_id else { continue };
+            let world: Vec<_> = rna.points.iter().map(|p| center + p.coords).collect();
+            for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, 0.0) {
+                placements.push(json!({
+                    "uid": placements.len() as u64,
+                    "ingredient": seg_id as u64,
+                    "compartment": 0,
+                    "position": [pos.x, pos.y, pos.z],
+                    "rotation": [rot.w, rot.i, rot.j, rot.k],
+                }));
             }
         }
     }

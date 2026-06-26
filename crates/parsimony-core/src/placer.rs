@@ -1098,6 +1098,7 @@ impl<'a> GreedyRandomPlacer<'a> {
             snapshot.rna_strands.push(crate::placement::RnaStrand {
                 points,
                 is_mrna: rna.is_mRNA,
+                is_free: rna.is_free,
             });
         }
         // Seat the chromosome landmark molecules: the replisome at each fork,

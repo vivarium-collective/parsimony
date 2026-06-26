@@ -97,6 +97,10 @@ struct RawChromosome {
     /// Ingredient name instanced as each RNA strand mesh.
     #[serde(default)]
     rna_segment: Option<String>,
+    /// Ingredient name for FREE (released) mRNA strands; nascent strands use
+    /// `rna_segment`. Falls back to `rna_segment` when absent.
+    #[serde(default)]
+    rna_segment_free: Option<String>,
     /// Ångströms per nucleotide for extended strand length (default 2.0 when absent).
     #[serde(default)]
     rna_angstrom_per_nt: Option<f32>,
@@ -347,6 +351,9 @@ pub struct ChromosomeSpec {
     pub rnas: Vec<RnaSpec>,
     /// Ingredient name instanced as each RNA strand mesh, if any.
     pub rna_segment: Option<String>,
+    /// Ingredient name for free (released) mRNA strands; falls back to
+    /// `rna_segment` when absent.
+    pub rna_segment_free: Option<String>,
     /// Ångströms per nucleotide (strand contour length scale); default 2.0.
     pub rna_angstrom_per_nt: f32,
 }
@@ -757,6 +764,7 @@ fn resolve(
                 })
                 .collect(),
             rna_segment: c.rna_segment,
+            rna_segment_free: c.rna_segment_free,
             rna_angstrom_per_nt: c.rna_angstrom_per_nt.unwrap_or(2.0),
         }),
     })

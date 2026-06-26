@@ -16,6 +16,9 @@ pub struct RnaStrand {
     pub points: Vec<Point3<f32>>,
     /// `true` = mRNA; `false` = other RNA class (rRNA, tRNA, …).
     pub is_mrna: bool,
+    /// `true` = free (released) transcript seeded in the cytoplasm; `false` =
+    /// nascent transcript rooted at its RNAP. Selects the render segment.
+    pub is_free: bool,
 }
 
 /// Stable handle for an ingredient variant within an ingredient family.
