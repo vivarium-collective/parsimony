@@ -1030,6 +1030,53 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
             }
         }
+        // Nascent-RNA strands (B1-3): grow one confined strand per RnaSpec rooted
+        // at its RNAP's genomic locus on the chromosome strand.
+        //
+        // Frame: chromosome strands are center-relative; `shape` is origin/center-
+        // relative (production cell is origin-centered).  We compute the root via
+        // `strand_point` (already center-relative) and grow in that same frame —
+        // so `rna_strands` entries are center-relative, consistent with
+        // `Chromosome::strands`.
+        //
+        // Constants:
+        //   rna_step        = 40.0 Å  — fixed coarse-grain step for nascent RNA beads
+        //   rna_bead_radius =  4.0 Å  — thin bead (smaller than DNA to reduce steric load)
+        if !chr.rnas.is_empty() {
+            let glen = genome
+                .as_ref()
+                .map(|g| g.length_bp)
+                .filter(|&l| l > 0)
+                .unwrap_or(GENOME_BP_DEFAULT);
+            // Fixed constants (documented above).
+            let rna_step: f32 = 40.0;
+            let rna_bead_radius: f32 = 4.0;
+            for rna in &chr.rnas {
+                // Bead count: extended contour length / step, clamped to ≥ 2.
+                let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
+                    .round() as usize;
+                let bead_count = bead_count.max(2);
+                // Root: strand_point returns a center-relative point on the chromosome.
+                // Fall back to the center-relative origin (Point3::origin) on degenerate
+                // inputs so we NEVER drop a spec (1:1 true-abundance constraint).
+                let root = strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
+                    .map(|(p, _)| p)
+                    .unwrap_or_else(Point3::origin);
+                // Grow a confined self-avoiding walk from the root inside `shape`.
+                let points = crate::fiber::generate_rna_strand(
+                    root,
+                    bead_count,
+                    rna_step,
+                    rna_bead_radius,
+                    shape,
+                    rng,
+                );
+                snapshot.rna_strands.push(crate::placement::RnaStrand {
+                    points,
+                    is_mrna: rna.is_mRNA,
+                });
+            }
+        }
         // Seat the chromosome landmark molecules: the replisome at each fork,
         // oriC at each origin, terC at the terminus — so they read as real
         // machinery/loci on the DNA and are individually selectable.
@@ -2124,6 +2171,114 @@ mod tests {
         assert!(
             max_pair > 50.0,
             "RNAPs should spread along the strand, max pairwise extent={max_pair}"
+        );
+    }
+
+    // ---- B1-3 test helpers -----------------------------------------------
+
+    /// Build a capsule recipe with a 1000-bead chromosome and N explicit nascent
+    /// RNA strands at the given (root_coordinate, length_nt) pairs.  Mirrors
+    /// `recipe_with_chromosome_and_rnaps`.
+    fn recipe_with_chromosome_and_rnas(specs: &[(i64, i64)]) -> Recipe {
+        let rna_entries: String = specs
+            .iter()
+            .map(|&(coord, len)| {
+                format!(
+                    r#"{{"root_coordinate": {coord}, "root_domain": 0, "length_nt": {len}, "is_mRNA": true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "rnas": [{rna_entries}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json).expect("recipe_with_chromosome_and_rnas: parse failed")
+    }
+
+    /// B1-3: one confined nascent-RNA strand per RnaSpec, rooted near its
+    /// RNAP genomic locus, all beads inside the envelope, and longer
+    /// length_nt → more beads.
+    #[test]
+    fn grows_one_confined_strand_per_rna_rooted_at_rnap() {
+        let recipe = recipe_with_chromosome_and_rnas(&[(100_000_i64, 400_i64), (-50_000, 1200)]);
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(9);
+
+        // 1:1 true abundance — exactly one strand per RnaSpec.
+        assert_eq!(
+            out.snapshot.rna_strands.len(),
+            2,
+            "expected 2 rna_strands, got {}",
+            out.snapshot.rna_strands.len()
+        );
+
+        let (center, shape) = first_capsule_cell(&recipe);
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        // RNA bead radius matches the production value (4.0 Å).
+        let rna_bead_radius = 4.0_f32;
+        let inset = shape.inset(rna_bead_radius);
+
+        for (rs, &(coord, _len)) in out
+            .snapshot
+            .rna_strands
+            .iter()
+            .zip(&[(100_000_i64, 400_i64), (-50_000, 1200)])
+        {
+            // Root proximity: strand[0] within 30 Å of the strand_point locus.
+            // Strands and rna_strands are both center-relative; center=[0,0,0]
+            // for this cell so world == center-relative.
+            let (root, _t) = strand_point(strands, 0, coord, 4_641_652)
+                .expect("strand_point should map every coordinate");
+            assert!(
+                (rs.points[0] - root).norm() < 30.0,
+                "strand not rooted at its RNAP: points[0]={:?} root={:?} dist={}",
+                rs.points[0],
+                root,
+                (rs.points[0] - root).norm()
+            );
+
+            // Confinement: every bead inside the inset envelope.
+            // rna_strands are center-relative; the cell center is the origin,
+            // so p and center+p.coords are the same point here — OR-ed for
+            // robustness if the frame ever shifts.
+            for p in &rs.points {
+                assert!(
+                    inset.contains(&(center + p.coords)) || inset.contains(p),
+                    "RNA bead outside envelope: {:?}",
+                    p
+                );
+            }
+        }
+
+        // Relative-length fidelity: longer length_nt → more beads.
+        assert!(
+            out.snapshot.rna_strands[1].points.len()
+                > out.snapshot.rna_strands[0].points.len(),
+            "expected longer strand for length_nt=1200 vs 400: got {} vs {}",
+            out.snapshot.rna_strands[1].points.len(),
+            out.snapshot.rna_strands[0].points.len()
         );
     }
 
