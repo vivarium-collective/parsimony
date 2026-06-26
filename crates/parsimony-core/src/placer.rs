@@ -1030,11 +1030,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                         // EVERY RNAP is placed on the MAIN genome contour (strand 0) by
                         // its coordinate, regardless of `domain_index` — matching the
                         // v2ecoli `_draw_chromosome` reference ("rim RNAPs: ALL of them,
-                        // regardless of domain"). Routing daughter-domain RNAPs onto the
-                        // short sister strand instead left the main strand's replicated
-                        // (bubble) region bare. (`is_forward` orientation still uses the
-                        // RNAP's own direction.) Showing the second daughter copy on the
-                        // sister bubble is a separate future enhancement.
+                        // regardless of domain"). Additionally, daughter-domain RNAPs
+                        // (`domain_index != 0`) also receive a SECOND placement on the
+                        // sister (replication bubble) strand — the two copies represent
+                        // the biologically distinct positions on each replicated arm.
                         let Some((strand_pt, tangent)) =
                             strand_point(&strands, 0, rnap.coordinates, glen)
                         else {
@@ -1042,10 +1041,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                         };
                         // Convert to world space (strands are cell-centre-relative).
                         let world_pt = center + strand_pt.coords;
-                        // Confine to the inset envelope. Pass off=0 so no radial
-                        // displacement is attempted — the RNAP sits at its locus
-                        // and the linear pull handles out-of-bounds cases.
-                        // n1/n2 are unused when off=0 but must be valid unit vectors.
+
+                        // Shared confine+orient+push logic for both main and bubble
+                        // placements.  Captures `inset`, `center`, `idx` by value/ref;
+                        // `snapshot` and `next_uid` through mutable reborrow.
                         //
                         // NEVER drop an RNAP: 1:1 true-abundance requires every
                         // entry to be rendered. If confinement fails (degenerate
@@ -1054,33 +1053,54 @@ impl<'a> GreedyRandomPlacer<'a> {
                         // lies on the centerline and is always inside the inset
                         // (a medial point has distance 0 ≤ cap_radius). For a
                         // fully-degenerate inset that collapses to the cell centre.
-                        let pos = crate::fiber_pack::confine_center(
-                            world_pt,
-                            Vector3::y(),
-                            Vector3::z(),
-                            0.0,
-                            0.0,
-                            world_pt,
-                            &inset,
-                        )
-                        .unwrap_or_else(|| {
-                            let m = inset.medial(&world_pt);
-                            if inset.contains(&m) { m } else { center }
-                        });
-                        // Orientation: rotate +x onto ±tangent depending on strand.
-                        // `orient_x_onto` handles the antiparallel (`dir == -x`)
-                        // case with a real 180° turn instead of a wrong identity.
-                        let dir = if rnap.is_forward { tangent } else { -tangent };
-                        let rot = orient_x_onto(dir);
-                        snapshot.placements.push(Placement {
-                            instance_uid: *next_uid,
-                            ingredient_id: idx as u32,
-                            variant_id: 0,
-                            compartment_id: 0,
-                            position: pos,
-                            rotation: rot,
-                        });
-                        *next_uid += 1;
+                        let is_forward = rnap.is_forward;
+                        let mut place_at = |wp: Point3<f32>, tan: Vector3<f32>| {
+                            let pos = crate::fiber_pack::confine_center(
+                                wp,
+                                Vector3::y(),
+                                Vector3::z(),
+                                0.0,
+                                0.0,
+                                wp,
+                                &inset,
+                            )
+                            .unwrap_or_else(|| {
+                                let m = inset.medial(&wp);
+                                if inset.contains(&m) { m } else { center }
+                            });
+                            // Orientation: rotate +x onto ±tangent depending on strand.
+                            // `orient_x_onto` handles the antiparallel (`dir == -x`)
+                            // case with a real 180° turn instead of a wrong identity.
+                            let dir = if is_forward { tan } else { -tan };
+                            let rot = orient_x_onto(dir);
+                            snapshot.placements.push(Placement {
+                                instance_uid: *next_uid,
+                                ingredient_id: idx as u32,
+                                variant_id: 0,
+                                compartment_id: 0,
+                                position: pos,
+                                rotation: rot,
+                            });
+                            *next_uid += 1;
+                        };
+
+                        // Main placement (strand 0).
+                        place_at(world_pt, tangent);
+
+                        // Bubble overlay: daughter RNAPs also appear on the sister
+                        // strand at their bubble-relative position.  Domain 0 = no
+                        // overlay (those RNAPs are on the pre-replication chromosome).
+                        if rnap.domain_index != 0 && strands.len() > 1 {
+                            if let Some((bub_pt, bub_tan)) = bubble_point(
+                                &strands[strands.len() - 1],
+                                rnap.coordinates,
+                                chr.fork_fraction,
+                                glen,
+                            ) {
+                                let bub_world = center + bub_pt.coords;
+                                place_at(bub_world, bub_tan);
+                            }
+                        }
                     }
                 }
             }
@@ -2216,11 +2236,10 @@ mod tests {
         Recipe::from_json_str(&json).expect("recipe_replicating_with_one_rnap: parse failed")
     }
 
-    /// A daughter-domain RNAP must be placed on the MAIN chromosome contour at
-    /// its genomic coordinate — NOT routed onto the (short) sister strand. This
-    /// matches the v2ecoli reference, where every RNAP is plotted on the rim by
-    /// coordinate regardless of domain; routing daughter RNAPs onto the sister
-    /// only left the main strand's replicated region bare.
+    /// A daughter-domain RNAP is placed on BOTH the main chromosome contour AND
+    /// the sister (replication bubble) strand.  Two placements are expected: one
+    /// near the main locus (`strand_point` on strand 0) and one near the bubble
+    /// locus (`bubble_point` on the last strand).
     #[test]
     fn rnap_placed_on_main_contour_regardless_of_domain() {
         let coord = 0_i64; // oriC — mid-bubble, where main and sister diverge
@@ -2234,22 +2253,59 @@ mod tests {
             .iter()
             .filter(|p| p.ingredient_id == rnap_id)
             .collect();
-        assert_eq!(rnaps.len(), 1, "expected exactly one RNAP");
+        // Daughter RNAP renders on main contour AND the sister bubble strand.
+        assert_eq!(rnaps.len(), 2, "daughter RNAP renders on main + bubble");
 
         let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
         assert!(strands.len() >= 2, "replicating chromosome should have a sister strand");
-        let (main_pt, _) = strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap();
-        let (sister_pt, _) = strand_point(strands, 2, coord, GENOME_BP_DEFAULT).unwrap();
-        let main_world = center + main_pt.coords;
-        let sister_world = center + sister_pt.coords;
-        let d_main = (rnaps[0].position - main_world).norm();
-        let d_sister = (rnaps[0].position - sister_world).norm();
-        // The RNAP must sit on the MAIN contour, not the sister bulge. Before the
-        // fix it was routed to the sister (d_sister ≈ 0, d_main ≈ bulge).
-        assert!(
-            d_main < d_sister,
-            "daughter-domain RNAP should be on the main contour (d_main={d_main}, d_sister={d_sister})"
-        );
+        let ff = 0.45_f32;
+        let sister = strands.last().unwrap();
+        let main_w = center + strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let bub_w = center + bubble_point(sister, coord, ff, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let near_main = rnaps.iter().any(|p| (p.position - main_w).norm() < 30.0);
+        let near_bubble = rnaps.iter().any(|p| (p.position - bub_w).norm() < 30.0);
+        assert!(near_main && near_bubble, "expected one RNAP near main and one near the bubble");
+    }
+
+    /// A daughter-domain RNAP at oriC (coord 0) produces two placements, both
+    /// confined inside the inset envelope.
+    #[test]
+    fn daughter_rnap_overlaid_on_bubble() {
+        let recipe = recipe_replicating_with_one_rnap(0, 2); // domain 2, coord 0
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (_, shape) = first_capsule_cell(&recipe);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        assert_eq!(rnaps.len(), 2, "daughter RNAP should yield exactly 2 placements (main + bubble)");
+        let proxy = 20.0_f32;
+        let inset = shape.inset(proxy);
+        for p in &rnaps {
+            assert!(
+                inset.contains(&p.position),
+                "daughter RNAP placement outside inset envelope: {:?}",
+                p.position
+            );
+        }
+    }
+
+    /// A domain-0 RNAP yields exactly ONE placement — no bubble overlay.
+    #[test]
+    fn domain_zero_rnap_yields_one_placement() {
+        let recipe = recipe_replicating_with_one_rnap(0, 0); // domain 0
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        assert_eq!(rnaps.len(), 1, "domain-0 RNAP must produce exactly one placement (no bubble overlay)");
     }
 
     /// A nascent RNA rooted at a daughter-domain RNAP must emanate from the MAIN
