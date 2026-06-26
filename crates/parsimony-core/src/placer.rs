@@ -1044,7 +1044,9 @@ impl<'a> GreedyRandomPlacer<'a> {
                     for rnap in &chr.rnaps {
                         // BF2-3: route to chromosome_index's OWN main strand, not always 0.
                         // Clamp to valid range (single-chromosome recipes default to 0).
-                        let g = (rnap.chromosome_index as usize)
+                        // max(0) before the usize cast so a stray negative index
+                        // can't wrap to usize::MAX and route to the last chromosome.
+                        let g = (rnap.chromosome_index.max(0) as usize)
                             .min(chrom_strand_idx.len().saturating_sub(1));
                         let (main_idx, sister_idx_opt) =
                             chrom_strand_idx.get(g).copied().unwrap_or((0, None));
@@ -1162,8 +1164,9 @@ impl<'a> GreedyRandomPlacer<'a> {
                 .round() as usize;
             let bead_count = bead_count.max(2);
             // BF2-3: per-chromosome routing — map chromosome_index to its own
-            // main/sister strands (same clamped-index logic as the RNAP loop).
-            let rna_g = (rna.chromosome_index as usize)
+            // main/sister strands (same clamped-index logic as the RNAP loop;
+            // max(0) guards a stray negative index from wrapping via usize cast).
+            let rna_g = (rna.chromosome_index.max(0) as usize)
                 .min(chrom_strand_idx.len().saturating_sub(1));
             let (rna_main_idx, rna_sister_idx_opt) =
                 chrom_strand_idx.get(rna_g).copied().unwrap_or((0, None));
