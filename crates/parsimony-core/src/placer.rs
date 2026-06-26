@@ -817,47 +817,63 @@ impl<'a> GreedyRandomPlacer<'a> {
                     sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
                     sc_radius, sc_pitch, rng,
                 );
-                // Pin this chromosome's centre-of-mass onto its target offset
-                // (`sub_off`): the cell centre for a single chromosome, each
-                // daughter's centre when replicated. The raw supercoiled walk
-                // drifts off-centre (it can pile up toward one pole), so shift the
-                // whole chromosome by (target − DNA centroid) rather than just
-                // adding `sub_off` — keeping its spread but centring its mass.
-                let mut sum = nalgebra::Vector3::<f32>::zeros();
-                let mut cnt = 0usize;
-                for s in &theta.strands {
-                    for p in s {
-                        sum += p.coords;
-                        cnt += 1;
+                // Translate strands to their sub-region (sub_off applied first).
+                let mut group: Vec<Vec<Point3<f32>>> = theta
+                    .strands
+                    .into_iter()
+                    .map(|mut s| {
+                        for p in &mut s {
+                            *p += sub_off;
+                        }
+                        s
+                    })
+                    .collect();
+                // Per-chromosome landmark positions (sub_off applied, not yet
+                // extended into the flat vecs — shift must be applied first).
+                let mut chrom_forks: Vec<Point3<f32>> = theta
+                    .forks
+                    .into_iter()
+                    .map(|mut fk| { fk += sub_off; fk })
+                    .collect();
+                let mut chrom_orics: Vec<Point3<f32>> = theta
+                    .oric
+                    .into_iter()
+                    .map(|mut o| { o += sub_off; o })
+                    .collect();
+                let mut chrom_ters: Vec<Point3<f32>> = theta
+                    .ter
+                    .into_iter()
+                    .map(|mut t| { t += sub_off; t })
+                    .collect();
+                // COM recenter: pull the group's centroid to sub_off so the
+                // chromosome lands in its intended sub-region rather than
+                // drifting with the SAW start-at-origin bias.  Landmarks
+                // (forks, oriC, terC) receive the same shift so they stay
+                // co-located with the strand.
+                let n_beads: usize = group.iter().map(|s| s.len()).sum();
+                if n_beads > 0 {
+                    let centroid = group
+                        .iter()
+                        .flatten()
+                        .fold(Vector3::zeros(), |acc, p| acc + p.coords)
+                        / n_beads as f32;
+                    let shift = sub_off - centroid;
+                    let inset = shape.inset(chr.bead_radius);
+                    for s in &mut group {
+                        for p in s {
+                            *p += shift;
+                            if !inset.contains(p) {
+                                *p = inset.medial(p);
+                            }
+                        }
                     }
+                    for p in &mut chrom_forks { *p += shift; }
+                    for p in &mut chrom_orics { *p += shift; }
+                    for p in &mut chrom_ters  { *p += shift; }
                 }
-                let shift = if cnt > 0 {
-                    sub_off - sum / cnt as f32
-                } else {
-                    sub_off
-                };
-                // The recentring shift can push the spread-out walk's leading end
-                // past a narrowing cap; clamp every bead back inside the cell
-                // envelope (inset by the bead radius) so the nucleoid stays
-                // centred AND fully contained.
-                let inset = shape.inset(chr.bead_radius);
-                let place = |p: Point3<f32>| inset.clamp_inside(p + shift);
-                let mut group: Vec<Vec<Point3<f32>>> = Vec::new();
-                for mut s in theta.strands {
-                    for p in &mut s {
-                        *p = place(*p);
-                    }
-                    group.push(s);
-                }
-                for fk in theta.forks {
-                    forks.push(place(fk));
-                }
-                for o in theta.oric {
-                    orics.push(place(o));
-                }
-                for t in theta.ter {
-                    ters.push(place(t));
-                }
+                forks.extend(chrom_forks);
+                orics.extend(chrom_orics);
+                ters.extend(chrom_ters);
                 chrom_groups.push(group);
             }
         }
@@ -2148,5 +2164,131 @@ mod tests {
         let d = Vector3::new(0.3, -0.7, 0.5).normalize();
         let r3 = orient_x_onto(d);
         assert!(((r3 * Vector3::x()) - d).norm() < 1e-5);
+    }
+
+    // ---- Chromosome centering tests -------------------------------------
+
+    /// Build a minimal capsule recipe with a replicating chromosome
+    /// (fork_fraction = 0.45). Used by centering + segregation tests.
+    fn replicating_chromosome_recipe_json(n_chromosomes: usize) -> String {
+        format!(
+            r#"{{
+                "bounding_box": [[-600,-200,-200],[600,200,200]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-500, 0, 0],
+                            "b": [500, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 500,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "n_chromosomes": {n_chromosomes},
+                    "fork_fraction": 0.45
+                }}
+            }}"#
+        )
+    }
+
+    /// A single replicating chromosome (theta/supercoiled path) must have its
+    /// bead centroid near the cell centre after packing. Before the COM-recenter
+    /// fix the SAW backbone drifts from the origin, pushing the centroid to
+    /// ≈ ±0.47 × half_len; after the fix it must be < 0.12 × half_len.
+    #[test]
+    fn replicating_chromosome_is_centered() {
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(1)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+
+        // Centroid of every strand bead (stored center-relative; cell center = origin).
+        let all_beads: Vec<&Point3<f32>> = chr.strands.iter().flatten().collect();
+        assert!(!all_beads.is_empty(), "no strand beads in snapshot");
+        let n = all_beads.len() as f32;
+        let centroid_x = all_beads.iter().map(|p| p.x).sum::<f32>() / n;
+
+        assert!(
+            centroid_x.abs() < 0.12 * half_len,
+            "replicating chromosome not centered: centroid.x = {:.1} \
+             (|{:.3}| × half_len = {:.1}), must be < {:.1}",
+            centroid_x,
+            centroid_x.abs() / half_len,
+            centroid_x.abs() / half_len * half_len,
+            0.12 * half_len,
+        );
+
+        // Every bead must remain inside the full cell envelope.
+        let shape = crate::fiber::CellShape::Capsule {
+            half_len,
+            radius: 80.0,
+            axis: Vector3::x(),
+        };
+        for p in &all_beads {
+            assert!(
+                shape.contains(p),
+                "bead {:?} escaped the cell envelope after clamping",
+                p,
+            );
+        }
+    }
+
+    /// With two replicating chromosomes, COM recentering must move each
+    /// chromosome to its OWN pole sub-region — NOT collapse both to the
+    /// cell centre. Centroids must be on opposite sides of x = 0 and
+    /// separated by at least 30 % of the cell half-length.
+    #[test]
+    fn two_chromosomes_stay_segregated() {
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(2)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+
+        // 2 chromosomes × 2 strands each (main + sister) = 4 strands total.
+        let n_strands = chr.strands.len();
+        assert_eq!(
+            n_strands, 4,
+            "expected 4 strands (2 chromosomes × 2 each), got {n_strands}"
+        );
+        let mid = n_strands / 2;
+        let group0: Vec<&Point3<f32>> = chr.strands[..mid].iter().flatten().collect();
+        let group1: Vec<&Point3<f32>> = chr.strands[mid..].iter().flatten().collect();
+
+        let cx0 = group0.iter().map(|p| p.x).sum::<f32>() / group0.len() as f32;
+        let cx1 = group1.iter().map(|p| p.x).sum::<f32>() / group1.len() as f32;
+
+        assert!(
+            cx0 * cx1 < 0.0,
+            "chromosomes collapsed to the same side: cx0 = {cx0:.1}, cx1 = {cx1:.1}"
+        );
+        assert!(
+            (cx1 - cx0).abs() > 0.3 * half_len,
+            "chromosomes not sufficiently separated: cx0 = {cx0:.1}, cx1 = {cx1:.1}, \
+             |Δx| = {:.1} (need > {:.1})",
+            (cx1 - cx0).abs(),
+            0.3 * half_len,
+        );
     }
 }
