@@ -8,6 +8,27 @@ use serde::{Deserialize, Serialize};
 use crate::compartment::CompartmentId;
 use crate::ingredient::IngredientId;
 
+/// A single confined nascent-RNA strand produced by `place_chromosome`.
+/// Points are in the same center-relative frame as `Chromosome::strands`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RnaStrand {
+    /// Bead positions, center-relative.
+    pub points: Vec<Point3<f32>>,
+    /// `true` = mRNA; `false` = other RNA class (rRNA, tRNA, …).
+    pub is_mrna: bool,
+    /// `true` = free (released) transcript seeded in the cytoplasm; `false` =
+    /// nascent transcript rooted at its RNAP. Selects the render segment.
+    pub is_free: bool,
+    /// Unique integer identity of this RNA (mirrors the simulation's `unique_index`).
+    /// 0 when absent (pre-C1-2 snapshots).
+    #[serde(default)]
+    pub unique_index: i64,
+    /// Transcript length in nucleotides (mirrors `RnaSpec::length_nt`).
+    /// 0 when absent (pre-C1-2 snapshots).
+    #[serde(default)]
+    pub length_nt: i64,
+}
+
 /// Stable handle for an ingredient variant within an ingredient family.
 /// Default 0 = canonical form (see design doc §5.2.1).
 pub type VariantId = u16;
@@ -57,6 +78,14 @@ pub struct Snapshot {
     pub placements: Vec<Placement>,
     /// The genome fiber, if the recipe declared a chromosome.
     pub chromosome: Option<Chromosome>,
+    /// Nascent-RNA strands grown from `ChromosomeSpec::rnas`.
+    /// One entry per `RnaSpec`, in recipe order, center-relative.
+    #[serde(default)]
+    pub rna_strands: Vec<RnaStrand>,
+    /// Nascent peptide coils grown from ribosomes with `peptide_length > 0`.
+    /// One entry per such ribosome, in recipe order, center-relative.
+    #[serde(default)]
+    pub peptide_strands: Vec<Vec<Point3<f32>>>,
 }
 
 impl Snapshot {
@@ -66,6 +95,8 @@ impl Snapshot {
             seed,
             placements: Vec::new(),
             chromosome: None,
+            rna_strands: Vec::new(),
+            peptide_strands: Vec::new(),
         }
     }
 }

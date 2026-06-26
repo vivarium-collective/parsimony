@@ -45,8 +45,10 @@ impl CellShape {
         }
     }
 
-    /// Nearest point on the medial axis (sphere: the origin).
-    fn medial(&self, p: &Point3<f32>) -> Point3<f32> {
+    /// Nearest point on the medial axis (sphere: the origin). Always inside
+    /// the envelope (distance 0 from the medial axis ≤ cap radius), so it is a
+    /// safe guaranteed-inside fallback for confinement.
+    pub(crate) fn medial(&self, p: &Point3<f32>) -> Point3<f32> {
         match *self {
             CellShape::Sphere { .. } => Point3::origin(),
             CellShape::Capsule { half_len, axis, .. } => {
@@ -117,27 +119,24 @@ fn random_unit<R: Rng>(rng: &mut R) -> Vector3<f32> {
     }
 }
 
-/// Generate a coarse-grained chromosome path inside a sphere of
-/// `cell_radius` centred at the origin: a self-avoiding random walk of up
-/// to `bead_count` beads spaced `step` apart, kept inside the cell
-/// (allowing for `bead_radius`) and ≥ ~1.5·`bead_radius` from any
-/// non-adjacent bead, with worm-like-chain persistence. Points are
-/// origin-relative (the caller places the fiber at the compartment
-/// centre). Returns however many beads it placed — if the walk traps
-/// itself in the confined volume it stops early rather than spinning.
-pub fn generate_fiber<R: Rng>(
-    shape: CellShape,
+/// Internal: self-avoiding worm-like-chain walk starting from `start`,
+/// placing up to `bead_count` beads spaced `step` apart, kept inside
+/// `inset`. `bead_radius` controls the min-separation exclusion zone.
+/// Stops early if the walk traps itself. Shared by [`generate_fiber`] and
+/// [`generate_rna_strand`].
+fn walk_from<R: Rng>(
+    start: Point3<f32>,
+    inset: CellShape,
     bead_count: usize,
     step: f32,
     bead_radius: f32,
     rng: &mut R,
 ) -> Vec<Point3<f32>> {
-    let inset = shape.inset(bead_radius);
     let min_sep = 1.5 * bead_radius;
     let min_sep2 = min_sep * min_sep;
 
     let mut pts: Vec<Point3<f32>> = Vec::with_capacity(bead_count);
-    pts.push(Point3::origin());
+    pts.push(start);
     let mut dir = random_unit(rng);
     let mut stuck_runs = 0usize;
 
@@ -185,6 +184,60 @@ pub fn generate_fiber<R: Rng>(
     pts
 }
 
+/// Generate a coarse-grained chromosome path inside a sphere of
+/// `cell_radius` centred at the origin: a self-avoiding random walk of up
+/// to `bead_count` beads spaced `step` apart, kept inside the cell
+/// (allowing for `bead_radius`) and ≥ ~1.5·`bead_radius` from any
+/// non-adjacent bead, with worm-like-chain persistence. Points are
+/// origin-relative (the caller places the fiber at the compartment
+/// centre). Returns however many beads it placed — if the walk traps
+/// itself in the confined volume it stops early rather than spinning.
+pub fn generate_fiber<R: Rng>(
+    shape: CellShape,
+    bead_count: usize,
+    step: f32,
+    bead_radius: f32,
+    rng: &mut R,
+) -> Vec<Point3<f32>> {
+    walk_from(Point3::origin(), shape.inset(bead_radius), bead_count, step, bead_radius, rng)
+}
+
+/// Generate a confined self-avoiding RNA strand grown from a given `root`
+/// (the RNAP attachment point). Behaves identically to [`generate_fiber`]
+/// but seeds the walk at `root` rather than the origin, making it suitable
+/// for every nascent transcript in the cell.
+///
+/// If `root` is marginally outside `shape.inset(bead_radius)` it is
+/// surface-pulled just inside along the inward-radial normal (never
+/// collapsed to the medial axis). When a step cannot find an in-bounds
+/// candidate within the retry budget the walk stops early and returns
+/// however many beads were placed (≥ 1). Deterministic for a fixed `rng`
+/// seed.
+pub fn generate_rna_strand<R: Rng>(
+    root: Point3<f32>,
+    bead_count: usize,
+    step: f32,
+    bead_radius: f32,
+    shape: CellShape,
+    rng: &mut R,
+) -> Vec<Point3<f32>> {
+    let inset = shape.inset(bead_radius);
+    // Clamp root to just inside the inset via surface-pull if needed. We
+    // move along the inward-radial direction (outward from medial axis) —
+    // never to the medial axis — preserving the azimuthal location of the
+    // RNAP attachment point.
+    let root_clamped = if inset.contains(&root) {
+        root
+    } else {
+        let m = inset.medial(&root);
+        let rad = root.coords - m.coords;
+        let r = rad.norm();
+        let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
+        m + dir * (inset.cap_radius() * 0.999)
+    };
+    walk_from(root_clamped, inset, bead_count, step, bead_radius, rng)
+}
+
 /// Generate a *plectonemically supercoiled* chromosome inside a sphere of
 /// `cell_radius`: a coarse-grained backbone axis (a confined self-avoiding
 /// walk) with the genome wound around it as an interwound double helix —
@@ -226,7 +279,8 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     let axis_len_target = n_half as f32 * da * 1.8;
     let axis_step = (sc_pitch / 6.0).max(2.0 * bead_radius);
     let axis_n = ((axis_len_target / axis_step).ceil() as usize + 2).max(2);
-    let mut axis = generate_fiber(shape.inset(sc_radius), axis_n, axis_step, bead_radius, rng);
+    let axis_inset = shape.inset(sc_radius);
+    let mut axis = generate_fiber(axis_inset, axis_n, axis_step, bead_radius, rng);
     if axis.len() < 2 {
         return generate_fiber(shape, bead_count, step, bead_radius, rng);
     }
@@ -236,6 +290,37 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     // so Laplacian-smooth the axis until its curvature is gentle relative to
     // the coil radius and the helix winds evenly.
     smooth_polyline(&mut axis, 25);
+    // Recenter the backbone axis to the shape origin.  The SAW starts at the
+    // origin and drifts toward one pole; the wound coil inherits that drift,
+    // pushing the chromosome centroid away from centre.  Translate the axis
+    // centroid to the origin (a deterministic shift, no new RNG draws), then
+    // pull any vertex that now lies outside axis_inset back to the inset
+    // SURFACE along the inward-radial direction — preserving azimuthal position
+    // and never projecting to the centerline, which would cause a
+    // collinear-convergence artifact.  Use the bead-radius inset as the
+    // confinement boundary so wound beads (axis + sc_radius offset) stay
+    // within the cell envelope.
+    {
+        let n = axis.len() as f32;
+        let c = axis.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / n;
+        for p in &mut axis {
+            p.coords -= c;
+        }
+        // Pull to axis_inset.inset(bead_radius) so the sc_radius winding offset
+        // keeps the wound beads inside the cell (cap_radius - bead_radius + sc_radius
+        // ≤ cap_radius when bead_radius ≥ sc_radius, which holds for typical params).
+        let tight = axis_inset.inset(bead_radius);
+        let cr = tight.cap_radius();
+        for p in &mut axis {
+            if !tight.contains(p) {
+                let m = tight.medial(p);
+                let rad = p.coords - m.coords;
+                let r = rad.norm();
+                let dir = if r > 1e-6 { rad / r } else { perp(axis_inset.long_axis()) };
+                *p = m + dir * (cr * 0.999);
+            }
+        }
+    }
 
     // Rotation-minimizing frames + cumulative arc length along the axis.
     let frames = frames_along(&axis);
@@ -319,7 +404,36 @@ pub fn generate_theta_chromosome<R: Rng>(
     sc_pitch: f32,
     rng: &mut R,
 ) -> ThetaChromosome {
-    let main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
+    // `generate_supercoiled_fiber` recenters the backbone axis when sc_radius > 0,
+    // but falls back to a plain `generate_fiber` walk for sc_radius = 0.  That
+    // walk starts at the origin and drifts; the caller (`place_chromosome`) used
+    // to correct this with a rigid centroid shift + `medial()` clamp — which
+    // created the centerline-collapse artifact (beads projected onto the cell
+    // axis in cap regions).  We fix it here, at the source: translate the main
+    // strand so its centroid is at the shape origin, then surface-pull any bead
+    // that falls outside the inset (inward-radial direction only, never medial).
+    let inset = shape.inset(bead_radius);
+    let mut main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
+    if !main.is_empty() {
+        let nm = main.len() as f32;
+        let c = main.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / nm;
+        for p in &mut main {
+            p.coords -= c;
+        }
+        // Surface-pull: beads that fell outside the inset after recentering are
+        // moved to the inset surface at their own azimuthal angle — NOT to the
+        // medial axis (which would create the centerline convergence we are fixing).
+        let cr = inset.cap_radius();
+        for p in &mut main {
+            if !inset.contains(p) {
+                let m = inset.medial(p);
+                let rad = p.coords - m.coords;
+                let r = rad.norm();
+                let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
+                *p = m + dir * (cr * 0.999);
+            }
+        }
+    }
     let n = main.len();
     let f = fork_fraction.clamp(0.0, 0.95);
     // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
@@ -340,7 +454,6 @@ pub fn generate_theta_chromosome<R: Rng>(
     let oric = n / 2;
     let lo = oric - r; // forward fork
     let hi = oric + r; // reverse fork
-    let inset = shape.inset(bead_radius);
     // One stable bulge direction for the whole bubble (perpendicular to the
     // fork-to-fork chord, biased outward from the medial axis) → a clean lens.
     let chord = main[hi] - main[lo];
@@ -637,6 +750,28 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;
+
+    /// Convenience: seed an RNG from a u64 (used by multiple tests below).
+    fn rng_from(seed: u64) -> Xoshiro256PlusPlus {
+        Xoshiro256PlusPlus::seed_from_u64(seed)
+    }
+
+    #[test]
+    fn rna_strand_roots_at_given_point_and_stays_inside() {
+        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x() };
+        let root = Point3::new(-200.0, 50.0, 0.0);
+        let mut rng = rng_from(3);
+        let strand = generate_rna_strand(root, 60, 18.0, 4.0, shape, &mut rng);
+        assert!(strand.len() >= 30, "expected a substantial strand, got {}", strand.len());
+        assert!((strand[0] - root).norm() < 8.0, "strand must root at the RNAP point");
+        let inset = shape.inset(4.0);
+        for p in &strand {
+            assert!(inset.contains(p), "RNA bead outside envelope: {:?}", p);
+        }
+        // longer request → longer strand (monotone in bead_count)
+        let longer = generate_rna_strand(root, 120, 18.0, 4.0, shape, &mut rng_from(3));
+        assert!(longer.len() >= strand.len());
+    }
 
     #[test]
     fn cellshape_sphere_and_capsule_contain_and_inset() {

@@ -23,7 +23,7 @@
 //!   counter detects when the surface is full.
 
 use indexmap::IndexMap;
-use nalgebra::{Point3, Quaternion, UnitQuaternion};
+use nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -104,6 +104,140 @@ fn subdivide(
             (CellShape::Sphere { radius: radius * 0.5 }, nalgebra::Vector3::new(0.0, 0.0, z))
         }
     }
+}
+
+/// Map a v2ecoli replication `domain_index` to a strand index into `n_strands`.
+///
+/// Phase-A simplification:
+///   - `domain_index == 0`  → strand 0 (main chromosome)
+///   - `domain_index  > 0`  → last strand (sister / replicated copy)
+///
+/// Clamped to `n_strands - 1` so callers may safely index into the slice.
+/// Replication-domain topology (left vs right replichore, multi-fork index)
+/// is refined in a later phase.
+fn domain_index_to_strand(domain_index: i32, n_strands: usize) -> usize {
+    if n_strands == 0 {
+        return 0; // caller guards empty slice
+    }
+    if domain_index == 0 {
+        0
+    } else {
+        n_strands - 1
+    }
+}
+
+/// Map a v2ecoli genomic coordinate (signed bp, oriC = 0) to a 3D point and
+/// unit tangent on the rendered chromosome strand selected by `domain_index`.
+///
+/// Returns `None` when `strands` is empty.  A single-bead strand returns that
+/// bead with an `+x` unit tangent (degenerate but safe).
+///
+/// **Mapping:**
+/// ```text
+/// frac = (0.5 + coordinate / genome_len_bp).rem_euclid(1.0)
+/// ```
+/// oriC (coordinate = 0) maps to fraction 0.5, i.e. the midpoint of the
+/// rendered strand.  The result is the nearest bead by rounded index.
+pub fn strand_point(
+    strands: &[Vec<Point3<f32>>],
+    domain_index: i32,
+    coordinate: i64,
+    genome_len_bp: u32,
+) -> Option<(Point3<f32>, Vector3<f32>)> {
+    if strands.is_empty() {
+        return None;
+    }
+    let si = domain_index_to_strand(domain_index, strands.len());
+    let strand = &strands[si];
+    if strand.is_empty() {
+        return None;
+    }
+    if strand.len() == 1 {
+        return Some((strand[0], Vector3::x()));
+    }
+
+    // oriC (coordinate = 0) maps to fraction 0.5 (strand midpoint).
+    let frac = (0.5_f64 + coordinate as f64 / genome_len_bp as f64).rem_euclid(1.0) as f32;
+    let last = (strand.len() - 1) as f32;
+    let idx = (frac * last).round() as usize;
+    let idx = idx.min(strand.len() - 1);
+
+    let point = strand[idx];
+
+    // Tangent: forward segment, or backward segment at the very end.
+    let tangent = if idx + 1 < strand.len() {
+        strand[idx + 1] - strand[idx]
+    } else {
+        strand[idx] - strand[idx - 1]
+    };
+    let norm = tangent.norm();
+    let tangent = if norm > 1e-9 { tangent / norm } else { Vector3::x() };
+
+    Some((point, tangent))
+}
+
+/// Map a genomic coordinate (signed bp, oriC = 0) to a 3D point and unit
+/// tangent on the *sister* (replication-bubble) strand.
+///
+/// The bubble spans `[-fork_bp, +fork_bp]` where
+/// `fork_bp = fork_fraction × (genome_len_bp / 2)`.  The coordinate is
+/// linearly mapped onto `[0, 1]` over that range and clamped:
+///
+/// ```text
+/// frac = ((coordinate + fork_bp) / (2 · fork_bp)).clamp(0, 1)
+/// idx  = round(frac × (sister.len() - 1))
+/// ```
+///
+/// oriC (coordinate = 0) maps to fraction 0.5 (the sister midpoint).
+/// `+fork_bp` maps to the far end; `-fork_bp` maps to the near end.
+/// Coordinates outside `[-fork_bp, fork_bp]` are clamped (no panic).
+///
+/// Returns `None` when `sister.len() < 2` or `fork_bp <= 0`.
+pub fn bubble_point(
+    sister: &[Point3<f32>],
+    coordinate: i64,
+    fork_fraction: f32,
+    genome_len_bp: u32,
+) -> Option<(Point3<f32>, Vector3<f32>)> {
+    let fork_bp = fork_fraction * (genome_len_bp as f32 / 2.0);
+    if sister.len() < 2 || fork_bp <= 0.0 {
+        return None;
+    }
+
+    let frac = ((coordinate as f32 + fork_bp) / (2.0 * fork_bp)).clamp(0.0, 1.0);
+    let last = (sister.len() - 1) as f32;
+    let idx = (frac * last).round() as usize;
+    let idx = idx.min(sister.len() - 1);
+
+    let point = sister[idx];
+
+    // Tangent: forward segment, or backward segment at the very end.
+    let tangent = if idx + 1 < sister.len() {
+        sister[idx + 1] - sister[idx]
+    } else {
+        sister[idx] - sister[idx - 1]
+    };
+    let norm = tangent.norm();
+    let tangent = if norm > 1e-9 { tangent / norm } else { Vector3::x() };
+
+    Some((point, tangent))
+}
+
+/// Default E. coli K-12 genome length in base pairs. Used when no genome CSV
+/// is configured on the chromosome spec but explicit RNAP coordinates must
+/// be mapped onto the strand.
+const GENOME_BP_DEFAULT: u32 = 4_641_652;
+
+/// Orientation quaternion seating an ingredient's `+x` reference axis onto
+/// `dir` (a strand tangent, flipped for reverse-strand RNAPs). When `dir` is
+/// antiparallel to `+x`, `UnitQuaternion::rotation_between` returns `None`
+/// (the rotation axis is undefined); identity would then wrongly leave the
+/// molecule pointing at `+x`, so the fallback is a real 180° turn about `+y`,
+/// mapping `+x` onto `-x`.
+fn orient_x_onto(dir: Vector3<f32>) -> UnitQuaternion<f32> {
+    UnitQuaternion::rotation_between(&Vector3::x(), &dir).unwrap_or_else(|| {
+        UnitQuaternion::from_axis_angle(&Vector3::y_axis(), std::f32::consts::PI)
+    })
 }
 
 /// Cap on consecutive surface-placement rejections before a Surface
@@ -730,48 +864,62 @@ impl<'a> GreedyRandomPlacer<'a> {
                     sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
                     sc_radius, sc_pitch, rng,
                 );
-                // Pin this chromosome's centre-of-mass onto its target offset
-                // (`sub_off`): the cell centre for a single chromosome, each
-                // daughter's centre when replicated. The raw supercoiled walk
-                // drifts off-centre (it can pile up toward one pole), so shift the
-                // whole chromosome by (target − DNA centroid) rather than just
-                // adding `sub_off` — keeping its spread but centring its mass.
-                let mut sum = nalgebra::Vector3::<f32>::zeros();
-                let mut cnt = 0usize;
-                for s in &theta.strands {
-                    for p in s {
-                        sum += p.coords;
-                        cnt += 1;
-                    }
-                }
-                let shift = if cnt > 0 {
-                    sub_off - sum / cnt as f32
-                } else {
-                    sub_off
-                };
-                // The recentring shift can push the spread-out walk's leading end
-                // past a narrowing cap; clamp every bead back inside the cell
-                // envelope (inset by the bead radius) so the nucleoid stays
-                // centred AND fully contained.
-                let inset = shape.inset(chr.bead_radius);
-                let place = |p: Point3<f32>| inset.clamp_inside(p + shift);
-                let mut group: Vec<Vec<Point3<f32>>> = Vec::new();
-                for mut s in theta.strands {
-                    for p in &mut s {
-                        *p = place(*p);
-                    }
-                    group.push(s);
-                }
-                for fk in theta.forks {
-                    forks.push(place(fk));
-                }
-                for o in theta.oric {
-                    orics.push(place(o));
-                }
-                for t in theta.ter {
-                    ters.push(place(t));
-                }
+                // Translate strands to their sub-region (sub_off positions each
+                // chromosome at its pole; centering is done inside
+                // `generate_theta_chromosome`, so no further shift is needed).
+                let group: Vec<Vec<Point3<f32>>> = theta
+                    .strands
+                    .into_iter()
+                    .map(|mut s| {
+                        for p in &mut s {
+                            *p += sub_off;
+                        }
+                        s
+                    })
+                    .collect();
+                // Per-chromosome landmark positions (sub_off applied).
+                let chrom_forks: Vec<Point3<f32>> = theta
+                    .forks
+                    .into_iter()
+                    .map(|mut fk| { fk += sub_off; fk })
+                    .collect();
+                let chrom_orics: Vec<Point3<f32>> = theta
+                    .oric
+                    .into_iter()
+                    .map(|mut o| { o += sub_off; o })
+                    .collect();
+                let chrom_ters: Vec<Point3<f32>> = theta
+                    .ter
+                    .into_iter()
+                    .map(|mut t| { t += sub_off; t })
+                    .collect();
+                // Centering is now done at the source: `generate_theta_chromosome`
+                // recenters the main strand (and derives the sister from the
+                // centred main), so adding `sub_off` above already places each
+                // chromosome at its intended pole sub-region.  The prior rigid
+                // `shift = sub_off − centroid` + `medial()` clamp has been
+                // removed: it caused the centerline-collapse artifact (beads
+                // projected to the x-axis in cap regions via `medial()`).
+                forks.extend(chrom_forks);
+                orics.extend(chrom_orics);
+                ters.extend(chrom_ters);
                 chrom_groups.push(group);
+            }
+        }
+        // Map chromosome k → (main_strand_idx, sister_strand_idx) in the flat list.
+        // Built before flattening so both the RNAP loop and RNA loop can share it.
+        // For chromosome k, main = its first strand's flat index; sister = the
+        // second strand's index if the group has ≥ 2 strands (theta/replicating),
+        // else None (unreplicated). This avoids hardcoding "2k" — a chromosome
+        // without a sister has only 1 strand in its group.
+        let mut chrom_strand_idx: Vec<(usize, Option<usize>)> = Vec::new();
+        {
+            let mut flat = 0usize;
+            for g in &chrom_groups {
+                let main = flat;
+                let sister = if g.len() >= 2 { Some(flat + 1) } else { None };
+                chrom_strand_idx.push((main, sister));
+                flat += g.len();
             }
         }
         // Flat list of every strand, for the rendered chromosome.
@@ -781,6 +929,12 @@ impl<'a> GreedyRandomPlacer<'a> {
             }
         }
         let pts = strands.first().cloned().unwrap_or_default();
+        // Parse the genome annotation once (shared by the fiber-protein packing
+        // below and the explicit-RNAP loop further down — avoids a double parse).
+        let genome = chr
+            .genome
+            .as_ref()
+            .and_then(|p| crate::genome::Genome::from_csv(p).ok());
         // Pack DNA-binding proteins (RNAP, etc.) PER CHROMOSOME — each chromosome
         // is a full genome, so each gets its share. Packing them on the single
         // concatenated fiber instead piled them all onto whichever chromosome had
@@ -799,15 +953,19 @@ impl<'a> GreedyRandomPlacer<'a> {
                     ing.shape.world_spheres(pl.position, pl.rotation)
                 })
                 .collect();
-            let genome = chr
-                .genome
-                .as_ref()
-                .and_then(|p| crate::genome::Genome::from_csv(p).ok());
             let n_groups = chrom_groups.len() as u32;
+            // When explicit RNAP placements are provided, exclude the rnap_marker
+            // ingredient from the count-based random packing — it is handled
+            // separately below by the explicit-RNAP loop.
+            let skip_rnap_in_random = !chr.rnaps.is_empty();
             // Split each protein's total count across the chromosomes.
             let per_chrom: Vec<(String, u32)> = chr
                 .proteins
                 .iter()
+                .filter(|(name, _)| {
+                    !skip_rnap_in_random
+                        || chr.rnap_marker.as_deref() != Some(name.as_str())
+                })
                 .map(|(name, c)| (name.clone(), (c / n_groups).max(1)))
                 .collect();
             for group in &chrom_groups {
@@ -816,6 +974,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                 if fiber_world.len() < 2 {
                     continue;
                 }
+                // TODO: `shape` is origin-relative while `fiber_world` is
+                // world-space (offset by `center`). Exact for the production
+                // compartment (centred at the world origin), approximate for an
+                // off-centre one. Carry `center` into `CellShape` to make exact.
                 // With a genome annotation, seat proteins at real transcription /
                 // replication sites; otherwise spread them randomly.
                 let binds = match &genome {
@@ -835,15 +997,19 @@ impl<'a> GreedyRandomPlacer<'a> {
                                 }
                             }
                         }
-                        crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, rng)
+                        crate::fiber_pack::pack_on_fiber_at(&fiber_world, &at, &obstacles, chr.bead_radius, shape, rng)
                     }
                     None => {
                         let proteins: Vec<(u32, &Ingredient, u32)> = self
                             .resolve_fiber_proteins(chr)
                             .into_iter()
+                            .filter(|(_, ing, _)| {
+                                !skip_rnap_in_random
+                                    || chr.rnap_marker.as_deref() != Some(ing.name.as_str())
+                            })
                             .map(|(id, ing, c)| (id, ing, (c / n_groups).max(1)))
                             .collect();
-                        crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, rng)
+                        crate::fiber_pack::pack_on_fiber(&fiber_world, &proteins, &obstacles, chr.bead_radius, shape, rng)
                     }
                 };
                 for b in binds {
@@ -856,6 +1022,347 @@ impl<'a> GreedyRandomPlacer<'a> {
                         rotation: b.rotation,
                     });
                     *next_uid += 1;
+                }
+            }
+        }
+        // Explicit RNAP placement: seat every RNAP from the recipe at its real
+        // genomic locus on the strand, oriented along (or against) the tangent,
+        // and confined to the cell envelope. This supersedes the count-based
+        // random packing for the rnap_marker ingredient (filtered above) when
+        // `chr.rnaps` is non-empty.
+        if !chr.rnaps.is_empty() {
+            if let Some(rnap_name) = &chr.rnap_marker {
+                if let Some((idx, _, ing)) = self.recipe.ingredients.get_full(rnap_name) {
+                    // Genome length: CSV-parsed length when available, else E. coli default.
+                    let glen = genome
+                        .as_ref()
+                        .map(|g| g.length_bp)
+                        .filter(|&l| l > 0)
+                        .unwrap_or(GENOME_BP_DEFAULT);
+                    let er = ing.shape.enclosing_radius();
+                    let inset = shape.inset(er);
+                    for rnap in &chr.rnaps {
+                        // BF2-3: route to chromosome_index's OWN main strand, not always 0.
+                        // Clamp to valid range (single-chromosome recipes default to 0).
+                        // max(0) before the usize cast so a stray negative index
+                        // can't wrap to usize::MAX and route to the last chromosome.
+                        let g = (rnap.chromosome_index.max(0) as usize)
+                            .min(chrom_strand_idx.len().saturating_sub(1));
+                        let (main_idx, sister_idx_opt) =
+                            chrom_strand_idx.get(g).copied().unwrap_or((0, None));
+                        // Map genomic coordinate → cell-centre-relative position + tangent
+                        // on chromosome g's main strand.  We pass a 1-element slice so that
+                        // `strand_point` (which selects domain 0 → strand[0]) operates on
+                        // exactly the desired strand — DRY without changing its signature.
+                        let Some(main_strand) = strands.get(main_idx) else {
+                            continue;
+                        };
+                        let Some((strand_pt, tangent)) = strand_point(
+                            std::slice::from_ref(main_strand),
+                            0,
+                            rnap.coordinates,
+                            glen,
+                        ) else {
+                            continue;
+                        };
+                        // Convert to world space (strands are cell-centre-relative).
+                        let world_pt = center + strand_pt.coords;
+
+                        // Shared confine+orient+push logic for both main and bubble
+                        // placements.  Captures `inset`, `center`, `idx` by value/ref;
+                        // `snapshot` and `next_uid` through mutable reborrow.
+                        //
+                        // NEVER drop an RNAP: 1:1 true-abundance requires every
+                        // entry to be rendered. If confinement fails (degenerate
+                        // inset — proxy larger than the whole cell), fall back to
+                        // the medial-axis projection of the strand point, which
+                        // lies on the centerline and is always inside the inset
+                        // (a medial point has distance 0 ≤ cap_radius). For a
+                        // fully-degenerate inset that collapses to the cell centre.
+                        let is_forward = rnap.is_forward;
+                        let mut place_at = |wp: Point3<f32>, tan: Vector3<f32>| {
+                            let pos = crate::fiber_pack::confine_center(
+                                wp,
+                                Vector3::y(),
+                                Vector3::z(),
+                                0.0,
+                                0.0,
+                                wp,
+                                &inset,
+                            )
+                            .unwrap_or_else(|| {
+                                let m = inset.medial(&wp);
+                                if inset.contains(&m) { m } else { center }
+                            });
+                            // Orientation: rotate +x onto ±tangent depending on strand.
+                            // `orient_x_onto` handles the antiparallel (`dir == -x`)
+                            // case with a real 180° turn instead of a wrong identity.
+                            let dir = if is_forward { tan } else { -tan };
+                            let rot = orient_x_onto(dir);
+                            snapshot.placements.push(Placement {
+                                instance_uid: *next_uid,
+                                ingredient_id: idx as u32,
+                                variant_id: 0,
+                                compartment_id: 0,
+                                position: pos,
+                                rotation: rot,
+                            });
+                            *next_uid += 1;
+                        };
+
+                        // Main placement (strand 0).
+                        place_at(world_pt, tangent);
+
+                        // Bubble overlay: daughter RNAPs also appear on the sister
+                        // strand at their bubble-relative position.  BF2-3: the
+                        // sister is chromosome g's OWN sister (sister_idx_opt),
+                        // not always the last strand.  Backward-compat: honour
+                        // domain_index != 0 as a pre-BF2 daughter signal alongside
+                        // the new is_daughter flag so existing BF1 tests pass.
+                        if rnap.is_daughter || rnap.domain_index != 0 {
+                            if let Some(sister_idx) = sister_idx_opt {
+                                if let Some(sister) = strands.get(sister_idx) {
+                                    if let Some((bub_pt, bub_tan)) = bubble_point(
+                                        sister,
+                                        rnap.coordinates,
+                                        chr.fork_fraction,
+                                        glen,
+                                    ) {
+                                        let bub_world = center + bub_pt.coords;
+                                        place_at(bub_world, bub_tan);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Nascent-RNA strands (B1-3): grow one confined strand per RnaSpec rooted
+        // at its RNAP's genomic locus on the chromosome strand.
+        //
+        // Frame: chromosome strands are center-relative; `shape` is origin/center-
+        // relative (production cell is origin-centered).  We compute the root via
+        // `strand_point` (already center-relative) and grow in that same frame —
+        // so `rna_strands` entries are center-relative, consistent with
+        // `Chromosome::strands`.
+        //
+        // Constants:
+        //   rna_step        = 40.0 Å  — fixed coarse-grain step for nascent RNA beads
+        //   rna_bead_radius =  4.0 Å  — thin bead (smaller than DNA to reduce steric load)
+        let glen = genome
+            .as_ref()
+            .map(|g| g.length_bp)
+            .filter(|&l| l > 0)
+            .unwrap_or(GENOME_BP_DEFAULT);
+        // Fixed constants (documented above).
+        let rna_step: f32 = 40.0;
+        let rna_bead_radius: f32 = 4.0;
+        for rna in &chr.rnas {
+            // Bead count: extended contour length / step, clamped to ≥ 2.
+            let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
+                .round() as usize;
+            let bead_count = bead_count.max(2);
+            // BF2-3: per-chromosome routing — map chromosome_index to its own
+            // main/sister strands (same clamped-index logic as the RNAP loop;
+            // max(0) guards a stray negative index from wrapping via usize cast).
+            let rna_g = (rna.chromosome_index.max(0) as usize)
+                .min(chrom_strand_idx.len().saturating_sub(1));
+            let (rna_main_idx, rna_sister_idx_opt) =
+                chrom_strand_idx.get(rna_g).copied().unwrap_or((0, None));
+            // Root: for nascent (is_free=false), strand_point gives a center-relative
+            // point on the chromosome; for free (is_free=true), rejection-sample a
+            // random interior point inside shape.inset(rna_bead_radius).
+            let root = if rna.is_free {
+                // Rejection-sample a uniformly random point inside the inset envelope.
+                // We sample within the axis-aligned bounding box of the inset (a cube of
+                // side 2*reach) and accept when the point is inside the capsule/sphere.
+                // Up to 64 tries; fall back to Point3::origin() (cell centre) if none
+                // accepted — this satisfies the 1:1 abundance constraint even in
+                // degenerate cells where the inset collapses to zero volume.
+                let inset = shape.inset(rna_bead_radius);
+                let reach = inset.reach();
+                let mut chosen = Point3::origin();
+                for _ in 0..64 {
+                    let candidate = Point3::new(
+                        rng.gen_range(-reach..=reach),
+                        rng.gen_range(-reach..=reach),
+                        rng.gen_range(-reach..=reach),
+                    );
+                    if inset.contains(&candidate) {
+                        chosen = candidate;
+                        break;
+                    }
+                }
+                chosen
+            } else {
+                // Nascent: root on chromosome rna_g's MAIN genome contour, matching
+                // where its RNAP is placed (BF2-3 per-chromosome routing).
+                strands.get(rna_main_idx)
+                    .and_then(|s| strand_point(std::slice::from_ref(s), 0, rna.root_coordinate, glen))
+                    .map(|(p, _)| p)
+                    .unwrap_or_else(Point3::origin)
+            };
+            // Grow a confined self-avoiding walk from the root inside `shape`.
+            let points = crate::fiber::generate_rna_strand(
+                root,
+                bead_count,
+                rna_step,
+                rna_bead_radius,
+                shape,
+                rng,
+            );
+            snapshot.rna_strands.push(crate::placement::RnaStrand {
+                points,
+                is_mrna: rna.is_mRNA,
+                is_free: rna.is_free,
+                unique_index: rna.unique_index,
+                length_nt: rna.length_nt,
+            });
+            // BF2-3: daughter-domain nascent RNA also appears on chromosome
+            // rna_g's OWN sister (replication bubble) strand.  Free strands and
+            // domain-0 entries are NOT overlaid.  Backward-compat: honour
+            // root_domain != 0 as a pre-BF2 daughter signal alongside is_daughter.
+            if !rna.is_free && (rna.is_daughter || rna.root_domain != 0) {
+                if let Some(sister_idx) = rna_sister_idx_opt {
+                    if let Some(sister) = strands.get(sister_idx) {
+                        if let Some((bubble_root, _)) = bubble_point(
+                            sister,
+                            rna.root_coordinate,
+                            chr.fork_fraction,
+                            glen,
+                        ) {
+                            let points = crate::fiber::generate_rna_strand(
+                                bubble_root,
+                                bead_count,
+                                rna_step,
+                                rna_bead_radius,
+                                shape,
+                                rng,
+                            );
+                            snapshot.rna_strands.push(crate::placement::RnaStrand {
+                                points,
+                                is_mrna: rna.is_mRNA,
+                                is_free: false,
+                                unique_index: rna.unique_index,
+                                length_nt: rna.length_nt,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // C1-3: Ribosome placement (place_translation).
+        // For each RibosomeSpec, seat the ribosome_marker ingredient on the
+        // matching mRNA strand at `pos_on_mRNA`, offset outward from the cell
+        // envelope's medial axis, then confined inside `shape.inset(ribo_r)`.
+        //
+        // Borrow strategy: build the unique_index→strand-index map and collect
+        // all per-ribosome positions into a Vec BEFORE pushing into
+        // `snapshot.placements` — this avoids holding a `&snapshot.rna_strands`
+        // borrow while also mutably borrowing `snapshot.placements`.
+        if !chr.ribosomes.is_empty() {
+            if let Some(ribo_name) = &chr.ribosome_marker {
+                if let Some((ribo_idx, _, ribo_ing)) = self.recipe.ingredients.get_full(ribo_name) {
+                    let ribo_r = {
+                        let r = ribo_ing.shape.enclosing_radius();
+                        if r < 1e-6 { 120.0_f32 } else { r }
+                    };
+                    let inset = shape.inset(ribo_r);
+                    // Build unique_index → strand-index map (skip default-zero entries).
+                    let strand_map: std::collections::HashMap<i64, usize> = snapshot
+                        .rna_strands
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.unique_index != 0)
+                        .map(|(i, s)| (s.unique_index, i))
+                        .collect();
+                    // Collect ribosome world positions and peptide lengths; count those without a strand.
+                    let mut dropped = 0usize;
+                    let ribo_positions: Vec<(Point3<f32>, i64)> = chr
+                        .ribosomes
+                        .iter()
+                        .filter_map(|ribo| {
+                            let Some(&si) = strand_map.get(&ribo.mRNA_index) else {
+                                dropped += 1;
+                                return None;
+                            };
+                            let strand = &snapshot.rna_strands[si];
+                            if strand.points.len() < 2 {
+                                dropped += 1;
+                                return None;
+                            }
+                            let frac = (ribo.pos_on_mRNA as f32
+                                / strand.length_nt.max(1) as f32)
+                                .clamp(0.0, 1.0);
+                            let idx = ((frac * (strand.points.len() - 1) as f32).round()
+                                as usize)
+                                .min(strand.points.len() - 1);
+                            // Strands are center-relative; convert to world space.
+                            let base = center + strand.points[idx].coords;
+                            // Offset outward so the ribosome sits ON the mRNA,
+                            // not buried inside it. `shape.outward` expects a
+                            // center-relative point; `base` is world-relative, which
+                            // equals center-relative when center == origin (production).
+                            let out = shape.outward(&base);
+                            let pos_raw = base + out * ribo_r;
+                            // Confine to the inset envelope (same pattern as RNAP).
+                            let pos = crate::fiber_pack::confine_center(
+                                pos_raw,
+                                Vector3::y(),
+                                Vector3::z(),
+                                0.0,
+                                0.0,
+                                pos_raw,
+                                &inset,
+                            )
+                            .unwrap_or_else(|| {
+                                let m = inset.medial(&pos_raw);
+                                if inset.contains(&m) { m } else { center }
+                            });
+                            Some((pos, ribo.peptide_length))
+                        })
+                        .collect();
+                    if dropped > 0 {
+                        eprintln!(
+                            "[parsimony] ribosome placement: {dropped} ribosomes dropped \
+                             (mRNA_index not matched to any rendered strand)"
+                        );
+                    }
+                    // Push placements after releasing the rna_strands borrow.
+                    // C2-1: for ribosomes with peptide_length > 0, also grow a
+                    // confined coil from the ribosome world position.
+                    let pep_step: f32 = 30.0;
+                    let pep_bead_radius: f32 = 3.0;
+                    for (pos, peptide_length) in ribo_positions {
+                        snapshot.placements.push(Placement {
+                            instance_uid: *next_uid,
+                            ingredient_id: ribo_idx as u32,
+                            variant_id: 0,
+                            compartment_id: 0,
+                            position: pos,
+                            rotation: UnitQuaternion::identity(),
+                        });
+                        *next_uid += 1;
+                        // Grow a nascent-peptide coil from this ribosome's world
+                        // position.  Root is center-relative (strands frame).
+                        if peptide_length > 0 {
+                            let bead_count = ((peptide_length as f32 * chr.peptide_angstrom_per_aa)
+                                / pep_step)
+                                .round() as usize;
+                            let bead_count = bead_count.max(2);
+                            let root_rel = Point3::from(pos.coords - center.coords);
+                            let points = crate::fiber::generate_rna_strand(
+                                root_rel,
+                                bead_count,
+                                pep_step,
+                                pep_bead_radius,
+                                shape,
+                                rng,
+                            );
+                            snapshot.peptide_strands.push(points);
+                        }
+                    }
                 }
             }
         }
@@ -1777,5 +2284,1116 @@ mod tests {
         for (pa, pb) in a.snapshot.placements.iter().zip(b.snapshot.placements.iter()) {
             assert_eq!(pa.position, pb.position);
         }
+    }
+
+    #[test]
+    fn strand_point_maps_origin_to_midpoint_and_is_on_strand() {
+        // A simple straight strand of 101 beads along x.
+        let strand: Vec<Point3<f32>> = (0..101)
+            .map(|i| Point3::new(-500.0 + i as f32 * 10.0, 0.0, 0.0))
+            .collect();
+        let strands = vec![strand.clone()];
+        let glen = 4_641_652u32;
+        // coordinate 0 (oriC) -> fraction 0.5 -> bead 50 -> x = 0.0
+        let (p0, t0) = strand_point(&strands, 0, 0, glen).unwrap();
+        assert!((p0.x - 0.0).abs() < 1e-3, "oriC not at midpoint: {}", p0.x);
+        assert!((t0.norm() - 1.0).abs() < 1e-4);
+        // a positive coordinate moves toward the high-index end (downstream of oriC)
+        let (p1, _) = strand_point(&strands, 0, (glen / 4) as i64, glen).unwrap();
+        assert!(p1.x > p0.x);
+        // every mapped point is an actual bead-interpolated point on the strand
+        assert!(strand.iter().map(|b| (b - p1).norm()).fold(f32::MAX, f32::min) < 11.0);
+    }
+
+    #[test]
+    fn bubble_point_maps_forks_to_ends_and_oric_to_middle() {
+        // sister of 101 beads along x in [-500, 500]
+        let sister: Vec<Point3<f32>> = (0..101).map(|i| Point3::new(-500.0 + i as f32 * 10.0, 0.0, 0.0)).collect();
+        let glen = 4_641_652u32;
+        let ff = 0.45_f32;
+        let fork_bp = (ff * glen as f32 / 2.0) as i64; // bubble half-width in bp
+        // oriC (coord 0) → frac 0.5 → middle (x≈0)
+        let (mid, _) = bubble_point(&sister, 0, ff, glen).unwrap();
+        assert!(mid.x.abs() < 6.0, "oriC should map near the sister middle, got {}", mid.x);
+        // +fork → frac 1.0 → last bead (x≈+500)
+        let (hi, _) = bubble_point(&sister, fork_bp, ff, glen).unwrap();
+        assert!(hi.x > 480.0, "+fork should map near the sister far end, got {}", hi.x);
+        // -fork → frac 0.0 → first bead (x≈-500)
+        let (lo, _) = bubble_point(&sister, -fork_bp, ff, glen).unwrap();
+        assert!(lo.x < -480.0, "-fork should map near the sister near end, got {}", lo.x);
+        // coordinate beyond the bubble clamps to an end (does not panic / wrap)
+        let (clamped, _) = bubble_point(&sister, glen as i64, ff, glen).unwrap();
+        assert!(clamped.x > 480.0);
+    }
+
+    // ---- A4 test helpers ------------------------------------------------
+
+    /// Build a capsule recipe with a 1000-bead chromosome and `n` explicit
+    /// RNAP placements at evenly-spread genomic coordinates (alternating
+    /// forward/reverse strand). The two end entries land at extreme coordinates
+    /// (~±genome_len/2, i.e. the strand tips) to exercise the no-drop
+    /// confinement fallback. The cell is large enough to hold the strand and
+    /// all RNAPs without crowding.
+    fn recipe_with_chromosome_and_rnaps(n: usize) -> Recipe {
+        let genome_len: i64 = GENOME_BP_DEFAULT as i64;
+        let half = genome_len / 2;
+        let step = if n > 1 { genome_len / n as i64 } else { 0 };
+        let rnap_entries: String = (0..n)
+            .map(|i| {
+                // Spread coordinates evenly across the full [-half, +half]
+                // range. i=0 ≈ -genome_len/2 and i=n-1 ≈ +genome_len/2 are
+                // extreme tip coordinates (frac ≈ 0.01 / 0.99) that map to the
+                // strand ends near the cell wall — the no-drop path.
+                let coord = -half + step / 2 + i as i64 * step;
+                let fwd = if i % 2 == 0 { "true" } else { "false" };
+                format!(
+                    r#"{{"coordinates": {coord}, "domain_index": 0, "is_forward": {fwd}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{
+                    "rna_polymerase": {{ "type": "single_sphere", "radius": 20 }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "rnap_marker": "rna_polymerase",
+                    "rnaps": [{rnap_entries}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json).expect("recipe_with_chromosome_and_rnaps: parse failed")
+    }
+
+    /// A *replicating* chromosome (`fork_fraction > 0` → main + sister strands)
+    /// with a single RNAP at `(coord, domain)`. Used to verify that an RNAP on a
+    /// daughter domain is still placed on the MAIN genome contour by coordinate
+    /// (matching the v2ecoli `_draw_chromosome` reference: "rim RNAPs: ALL of
+    /// them, regardless of domain").
+    fn recipe_replicating_with_one_rnap(coord: i64, domain: i32) -> Recipe {
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{
+                    "rna_polymerase": {{ "type": "single_sphere", "radius": 20 }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "n_chromosomes": 1,
+                    "fork_fraction": 0.45,
+                    "rnap_marker": "rna_polymerase",
+                    "rnaps": [{{"coordinates": {coord}, "domain_index": {domain}, "is_forward": true}}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json).expect("recipe_replicating_with_one_rnap: parse failed")
+    }
+
+    /// A daughter-domain RNAP is placed on BOTH the main chromosome contour AND
+    /// the sister (replication bubble) strand.  Two placements are expected: one
+    /// near the main locus (`strand_point` on strand 0) and one near the bubble
+    /// locus (`bubble_point` on the last strand).
+    #[test]
+    fn rnap_placed_on_main_contour_regardless_of_domain() {
+        let coord = 0_i64; // oriC — mid-bubble, where main and sister diverge
+        let recipe = recipe_replicating_with_one_rnap(coord, 2); // daughter domain 2
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (center, _shape) = first_capsule_cell(&recipe);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        // Daughter RNAP renders on main contour AND the sister bubble strand.
+        assert_eq!(rnaps.len(), 2, "daughter RNAP renders on main + bubble");
+
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        assert!(strands.len() >= 2, "replicating chromosome should have a sister strand");
+        let ff = 0.45_f32;
+        let sister = strands.last().unwrap();
+        let main_w = center + strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let bub_w = center + bubble_point(sister, coord, ff, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let near_main = rnaps.iter().any(|p| (p.position - main_w).norm() < 30.0);
+        let near_bubble = rnaps.iter().any(|p| (p.position - bub_w).norm() < 30.0);
+        assert!(near_main && near_bubble, "expected one RNAP near main and one near the bubble");
+    }
+
+    /// A daughter-domain RNAP at oriC (coord 0) produces two placements, both
+    /// confined inside the inset envelope.
+    #[test]
+    fn daughter_rnap_overlaid_on_bubble() {
+        let recipe = recipe_replicating_with_one_rnap(0, 2); // domain 2, coord 0
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (_, shape) = first_capsule_cell(&recipe);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        assert_eq!(rnaps.len(), 2, "daughter RNAP should yield exactly 2 placements (main + bubble)");
+        let proxy = 20.0_f32;
+        let inset = shape.inset(proxy);
+        for p in &rnaps {
+            assert!(
+                inset.contains(&p.position),
+                "daughter RNAP placement outside inset envelope: {:?}",
+                p.position
+            );
+        }
+    }
+
+    /// A domain-0 RNAP yields exactly ONE placement — no bubble overlay.
+    #[test]
+    fn domain_zero_rnap_yields_one_placement() {
+        let recipe = recipe_replicating_with_one_rnap(0, 0); // domain 0
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        assert_eq!(rnaps.len(), 1, "domain-0 RNAP must produce exactly one placement (no bubble overlay)");
+    }
+
+    /// BF1-3: a domain-2 nascent RNA yields TWO strands — one rooted on the main
+    /// chromosome contour (strand 0) and a second on the sister (bubble) strand.
+    /// The original single-strand assertion is replaced: we now verify that one
+    /// root is ≤ 30 Å from the main locus and one is ≤ 30 Å from the bubble
+    /// locus, both computed in world space (center + center-relative coords).
+    #[test]
+    fn nascent_rna_roots_on_main_contour_like_its_rnap() {
+        let coord = 0_i64; // oriC — where main and sister diverge most
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{ "rna_segment": {{ "type": "single_sphere", "radius": 4 }} }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{ "kind": "capsule", "a": [-150,0,0], "b": [150,0,0], "radius": 80 }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                    "n_chromosomes": 1, "fork_fraction": 0.45,
+                    "rna_segment": "rna_segment", "rna_angstrom_per_nt": 2.0,
+                    "rnas": [{{"root_coordinate": {coord}, "root_domain": 2, "length_nt": 400, "is_mRNA": true}}]
+                }}
+            }}"#
+        );
+        let recipe = Recipe::from_json_str(&json).unwrap();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (center, _shape) = first_capsule_cell(&recipe);
+        let rna_strands = &out.snapshot.rna_strands;
+        // BF1-3: domain-2 nascent RNA now yields TWO strands (main + bubble).
+        assert_eq!(rna_strands.len(), 2, "domain-2 nascent RNA must yield 2 strands (main + bubble overlay)");
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        let main_world = center + strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let bub_world = center
+            + bubble_point(strands.last().unwrap(), coord, 0.45, GENOME_BP_DEFAULT)
+                .unwrap()
+                .0
+                .coords;
+        let near_main = rna_strands
+            .iter()
+            .any(|s| (center + s.points[0].coords - main_world).norm() < 30.0);
+        let near_bub = rna_strands
+            .iter()
+            .any(|s| (center + s.points[0].coords - bub_world).norm() < 30.0);
+        assert!(near_main, "one RNA strand must root ≤ 30 Å from the main locus");
+        assert!(near_bub, "one RNA strand must root ≤ 30 Å from the bubble locus");
+    }
+
+    /// BF1-3: overlay rules — domain-2 nascent → 2 strands; domain-0 nascent
+    /// → 1 strand (no overlay); free RNA (`is_free=true`) → 1 strand (no overlay).
+    #[test]
+    fn daughter_rna_overlaid_on_bubble() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {"rna_segment": {"type": "single_sphere", "radius": 4}},
+            "composition": {
+                "space": {"regions": {"interior": ["cell"]}},
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-150,0,0], "b": [150,0,0], "radius": 80},
+                    "regions": {"interior": []}
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "n_chromosomes": 1, "fork_fraction": 0.45,
+                "rna_segment": "rna_segment", "rna_angstrom_per_nt": 2.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 2, "length_nt": 400, "is_mRNA": true},
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 400, "is_mRNA": true},
+                    {"root_coordinate": 0, "root_domain": 2, "length_nt": 400, "is_mRNA": true, "is_free": true}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        // domain-2 nascent = 2 strands (main + bubble)
+        // domain-0 nascent = 1 strand (no overlay)
+        // free RNA         = 1 strand (no overlay, regardless of domain)
+        // Total            = 4
+        assert_eq!(
+            out.snapshot.rna_strands.len(),
+            4,
+            "expected 4 rna_strands: 2 from domain-2 nascent + 1 from domain-0 + 1 free; \
+             got {}",
+            out.snapshot.rna_strands.len()
+        );
+    }
+
+    /// Return `(center, CellShape)` for the first capsule compartment in the
+    /// recipe — mirrors the logic in `GreedyRandomPlacer::chromosome_cell`.
+    fn first_capsule_cell(recipe: &Recipe) -> (Point3<f32>, crate::fiber::CellShape) {
+        use crate::compartment::CompartmentKind;
+        use crate::fiber::CellShape;
+        for (_, comp) in &recipe.compartments {
+            if let CompartmentKind::Capsule { a, b, radius } = &comp.kind {
+                let axis_v = b - a;
+                let half_len = axis_v.norm() * 0.5;
+                let axis = axis_v
+                    .try_normalize(1e-6)
+                    .unwrap_or_else(nalgebra::Vector3::x);
+                let center = Point3::from((a.coords + b.coords) * 0.5);
+                return (center, CellShape::Capsule { half_len, radius: *radius, axis });
+            }
+        }
+        panic!("first_capsule_cell: no capsule compartment found in recipe");
+    }
+
+    /// A4: every explicit RNAP is placed (1:1, no drops), inside the inset
+    /// envelope, AND near an actual strand bead (not collapsed to the centre).
+    #[test]
+    fn seats_every_rnap_on_strand_inside_envelope() {
+        const N: usize = 50;
+        let recipe = recipe_with_chromosome_and_rnaps(N);
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(11);
+        let (center, shape) = first_capsule_cell(&recipe);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+
+        // 1:1 true abundance — every recipe RNAP is rendered, none dropped
+        // (including the extreme tip-coordinate entries via the no-drop path).
+        assert_eq!(rnaps.len(), N, "expected {N} RNAPs, got {}", rnaps.len());
+
+        // Confinement invariant — all inside the inset envelope.
+        let proxy = 20.0_f32; // rna_polymerase radius
+        let inset = shape.inset(proxy);
+        for p in &rnaps {
+            assert!(
+                inset.contains(&p.position),
+                "RNAP outside envelope: {:?} (center={:?})",
+                p.position,
+                center
+            );
+        }
+
+        // Genomic-axis fidelity — each RNAP tracks ITS OWN locus, not a shared
+        // point. (The strand's first bead is at the origin == cell centre, so a
+        // "near ANY bead" check would let an all-at-centre bug pass; recomputing
+        // the expected strand point per coordinate closes that gap.) Strand beads
+        // are cell-centre-relative; world = center + bead.coords. Placement order
+        // matches `chr.rnaps` order. Tolerance is bead-spacing scale plus the proxy
+        // radius (confinement may pull a wall-hugging bead slightly inward).
+        let chrom = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome was not attached to snapshot");
+        let specs = &recipe.chromosome.as_ref().unwrap().rnaps;
+        assert_eq!(specs.len(), N, "test fixture should declare {N} rnaps");
+        let spacing = 10.0_f32; // chr.spacing
+        let tol = spacing + proxy;
+        for (p, spec) in rnaps.iter().zip(specs.iter()) {
+            let (expected_rel, _) = strand_point(
+                &chrom.strands,
+                spec.domain_index,
+                spec.coordinates,
+                GENOME_BP_DEFAULT,
+            )
+            .expect("strand_point should map every locus");
+            let expected = center + expected_rel.coords;
+            let d = (expected - p.position).norm();
+            assert!(
+                d < tol,
+                "RNAP not at its locus: coord {} placed {:?}, expected {:?} (d={d}, tol={tol})",
+                spec.coordinates,
+                p.position,
+                expected
+            );
+        }
+        // Sanity: the loci genuinely differ (coordinate-dependent mapping), so
+        // the per-locus check above isn't vacuous — the RNAPs span a real extent.
+        // Use the full 3D pairwise extent (the strand walk is not axis-aligned).
+        let mut max_pair = 0.0_f32;
+        for i in 0..rnaps.len() {
+            for j in (i + 1)..rnaps.len() {
+                max_pair = max_pair.max((rnaps[i].position - rnaps[j].position).norm());
+            }
+        }
+        assert!(
+            max_pair > 50.0,
+            "RNAPs should spread along the strand, max pairwise extent={max_pair}"
+        );
+    }
+
+    // ---- B1-3 test helpers -----------------------------------------------
+
+    /// Build a capsule recipe with a 1000-bead chromosome and N explicit nascent
+    /// RNA strands at the given (root_coordinate, length_nt) pairs.  Mirrors
+    /// `recipe_with_chromosome_and_rnaps`.
+    fn recipe_with_chromosome_and_rnas(specs: &[(i64, i64)]) -> Recipe {
+        let rna_entries: String = specs
+            .iter()
+            .map(|&(coord, len)| {
+                format!(
+                    r#"{{"root_coordinate": {coord}, "root_domain": 0, "length_nt": {len}, "is_mRNA": true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "rnas": [{rna_entries}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json).expect("recipe_with_chromosome_and_rnas: parse failed")
+    }
+
+    /// Build a capsule recipe with a 1000-bead chromosome and N explicit RNA
+    /// strands at the given (root_coordinate, length_nt, is_free) triples.
+    /// Mirrors `recipe_with_chromosome_and_rnas` but emits the `is_free` key.
+    fn recipe_with_chromosome_and_rnas_freeflag(specs: &[(i64, i64, bool)]) -> Recipe {
+        let rna_entries: String = specs
+            .iter()
+            .map(|&(coord, len, free)| {
+                format!(
+                    r#"{{"root_coordinate": {coord}, "root_domain": 0, "length_nt": {len}, "is_mRNA": true, "is_free": {free}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "rnas": [{rna_entries}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json)
+            .expect("recipe_with_chromosome_and_rnas_freeflag: parse failed")
+    }
+
+    /// B2-1: free RNA (`is_free=true`) seeds at a random interior point, NOT
+    /// at the chromosome-rooted strand_point, while still confined.
+    #[test]
+    fn free_rna_seeds_in_interior_not_at_strand_point() {
+        // one nascent (is_free=false) and one free (is_free=true) at the SAME
+        // root_coordinate: if `is_free` routing were ignored, both would root at
+        // the same chromosome strand_point (norm ≈ 0) and the `> 1.0` assertion
+        // below would FAIL — so this gates the actual is_free behavior, not just
+        // a coordinate difference.
+        let recipe = recipe_with_chromosome_and_rnas_freeflag(
+            &[(100000_i64, 600_i64, false), (100000, 600, true)],
+        );
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        assert_eq!(out.snapshot.rna_strands.len(), 2);
+        let (center, shape) = first_capsule_cell(&recipe);
+        let inset = shape.inset(4.0);
+        for rs in &out.snapshot.rna_strands {
+            for p in &rs.points {
+                assert!(
+                    inset.contains(&(center + p.coords)) || inset.contains(p),
+                    "RNA bead outside envelope"
+                );
+            }
+        }
+        // the free strand's root must NOT coincide with the nascent strand's chromosome-rooted start
+        let nascent_root = out.snapshot.rna_strands[0].points[0];
+        let free_root = out.snapshot.rna_strands[1].points[0];
+        assert!(
+            (nascent_root - free_root).norm() > 1.0,
+            "free strand should not root at the same chromosome point"
+        );
+    }
+
+    /// B1-3: one confined nascent-RNA strand per RnaSpec, rooted near its
+    /// RNAP genomic locus, all beads inside the envelope, and longer
+    /// length_nt → more beads.
+    #[test]
+    fn grows_one_confined_strand_per_rna_rooted_at_rnap() {
+        let recipe = recipe_with_chromosome_and_rnas(&[(100_000_i64, 400_i64), (-50_000, 1200)]);
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(9);
+
+        // 1:1 true abundance — exactly one strand per RnaSpec.
+        assert_eq!(
+            out.snapshot.rna_strands.len(),
+            2,
+            "expected 2 rna_strands, got {}",
+            out.snapshot.rna_strands.len()
+        );
+
+        let (center, shape) = first_capsule_cell(&recipe);
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        // RNA bead radius matches the production value (4.0 Å).
+        let rna_bead_radius = 4.0_f32;
+        let inset = shape.inset(rna_bead_radius);
+
+        for (rs, &(coord, _len)) in out
+            .snapshot
+            .rna_strands
+            .iter()
+            .zip(&[(100_000_i64, 400_i64), (-50_000, 1200)])
+        {
+            // Root proximity: strand[0] within 30 Å of the strand_point locus.
+            // Strands and rna_strands are both center-relative; center=[0,0,0]
+            // for this cell so world == center-relative.
+            let (root, _t) = strand_point(strands, 0, coord, GENOME_BP_DEFAULT)
+                .expect("strand_point should map every coordinate");
+            assert!(
+                (rs.points[0] - root).norm() < 30.0,
+                "strand not rooted at its RNAP: points[0]={:?} root={:?} dist={}",
+                rs.points[0],
+                root,
+                (rs.points[0] - root).norm()
+            );
+
+            // Confinement: every bead inside the inset envelope.
+            // rna_strands are center-relative; the cell center is the origin,
+            // so p and center+p.coords are the same point here — OR-ed for
+            // robustness if the frame ever shifts.
+            for p in &rs.points {
+                assert!(
+                    inset.contains(&(center + p.coords)) || inset.contains(p),
+                    "RNA bead outside envelope: {:?}",
+                    p
+                );
+            }
+        }
+
+        // Relative-length fidelity: longer length_nt → more beads.
+        assert!(
+            out.snapshot.rna_strands[1].points.len()
+                > out.snapshot.rna_strands[0].points.len(),
+            "expected longer strand for length_nt=1200 vs 400: got {} vs {}",
+            out.snapshot.rna_strands[1].points.len(),
+            out.snapshot.rna_strands[0].points.len()
+        );
+    }
+
+    /// A4: the orientation helper turns the RNAP +x reference axis onto the
+    /// strand tangent — including the antiparallel (`dir == -x`) case, where a
+    /// naive identity fallback would point it the WRONG way (+x).
+    #[test]
+    fn rnap_orientation_handles_antiparallel_tangent() {
+        // Antiparallel: +x must map to -x (a real 180° turn), NOT stay at +x.
+        let r = orient_x_onto(-Vector3::x());
+        let mapped = r * Vector3::x();
+        assert!(
+            (mapped - (-Vector3::x())).norm() < 1e-5,
+            "antiparallel: +x should map to -x, got {mapped:?}"
+        );
+        // Parallel: +x stays +x.
+        let r2 = orient_x_onto(Vector3::x());
+        assert!(((r2 * Vector3::x()) - Vector3::x()).norm() < 1e-5);
+        // Arbitrary direction: +x maps onto the (unit) target.
+        let d = Vector3::new(0.3, -0.7, 0.5).normalize();
+        let r3 = orient_x_onto(d);
+        assert!(((r3 * Vector3::x()) - d).norm() < 1e-5);
+    }
+
+    // ---- Chromosome centering tests -------------------------------------
+
+    /// Build a minimal capsule recipe with a replicating chromosome
+    /// (fork_fraction = 0.45). Used by centering + segregation tests.
+    fn replicating_chromosome_recipe_json(n_chromosomes: usize) -> String {
+        format!(
+            r#"{{
+                "bounding_box": [[-600,-200,-200],[600,200,200]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-500, 0, 0],
+                            "b": [500, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 500,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "n_chromosomes": {n_chromosomes},
+                    "fork_fraction": 0.45
+                }}
+            }}"#
+        )
+    }
+
+    /// A single replicating chromosome (theta/supercoiled path) must have its
+    /// bead centroid near the cell centre after packing. Before the COM-recenter
+    /// fix the SAW backbone drifts from the origin, pushing the centroid to
+    /// ≈ ±0.47 × half_len; after the fix it must be < 0.12 × half_len.
+    #[test]
+    fn replicating_chromosome_is_centered() {
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(1)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+
+        // Centroid of every strand bead (stored center-relative; cell center = origin).
+        let all_beads: Vec<&Point3<f32>> = chr.strands.iter().flatten().collect();
+        assert!(!all_beads.is_empty(), "no strand beads in snapshot");
+        let n = all_beads.len() as f32;
+        let centroid_x = all_beads.iter().map(|p| p.x).sum::<f32>() / n;
+
+        assert!(
+            centroid_x.abs() < 0.12 * half_len,
+            "replicating chromosome not centered: centroid.x = {:.1} \
+             (|{:.3}| × half_len = {:.1}), must be < {:.1}",
+            centroid_x,
+            centroid_x.abs() / half_len,
+            centroid_x.abs() / half_len * half_len,
+            0.12 * half_len,
+        );
+
+        // Every bead must remain inside the full cell envelope.
+        let shape = crate::fiber::CellShape::Capsule {
+            half_len,
+            radius: 80.0,
+            axis: Vector3::x(),
+        };
+        for p in &all_beads {
+            assert!(
+                shape.contains(p),
+                "bead {:?} escaped the cell envelope after clamping",
+                p,
+            );
+        }
+    }
+
+    /// With two replicating chromosomes, COM recentering must move each
+    /// chromosome to its OWN pole sub-region — NOT collapse both to the
+    /// cell centre. Centroids must be on opposite sides of x = 0 and
+    /// separated by at least 30 % of the cell half-length.
+    #[test]
+    fn two_chromosomes_stay_segregated() {
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(2)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+
+        // 2 chromosomes × 2 strands each (main + sister) = 4 strands total.
+        let n_strands = chr.strands.len();
+        assert_eq!(
+            n_strands, 4,
+            "expected 4 strands (2 chromosomes × 2 each), got {n_strands}"
+        );
+        let mid = n_strands / 2;
+        let group0: Vec<&Point3<f32>> = chr.strands[..mid].iter().flatten().collect();
+        let group1: Vec<&Point3<f32>> = chr.strands[mid..].iter().flatten().collect();
+
+        let cx0 = group0.iter().map(|p| p.x).sum::<f32>() / group0.len() as f32;
+        let cx1 = group1.iter().map(|p| p.x).sum::<f32>() / group1.len() as f32;
+
+        assert!(
+            cx0 * cx1 < 0.0,
+            "chromosomes collapsed to the same side: cx0 = {cx0:.1}, cx1 = {cx1:.1}"
+        );
+        assert!(
+            (cx1 - cx0).abs() > 0.3 * half_len,
+            "chromosomes not sufficiently separated: cx0 = {cx0:.1}, cx1 = {cx1:.1}, \
+             |Δx| = {:.1} (need > {:.1})",
+            (cx1 - cx0).abs(),
+            0.3 * half_len,
+        );
+    }
+
+    // ---- BF2-3 tests: per-chromosome RNAP/RNA routing ----------------------
+
+    /// Build a 2-chromosome replicating recipe with two explicit RNAPs:
+    /// one on chromosome_index 0 and one on chromosome_index 1.  The cell is
+    /// long enough (±500 Å) that the two chromosome groups segregate to
+    /// clearly opposite poles — allowing a centroid-proximity assertion.
+    fn recipe_two_chromosomes_two_rnaps() -> Recipe {
+        let json = r#"{
+            "bounding_box": [[-600,-200,-200],[600,200,200]],
+            "objects": {
+                "rna_polymerase": { "type": "single_sphere", "radius": 20 }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {
+                        "kind": "capsule",
+                        "a": [-500, 0, 0],
+                        "b": [500, 0, 0],
+                        "radius": 80
+                    },
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 500,
+                "spacing": 10.0,
+                "bead_radius": 5.0,
+                "compartment": "cell",
+                "n_chromosomes": 2,
+                "fork_fraction": 0.45,
+                "rnap_marker": "rna_polymerase",
+                "rnaps": [
+                    {"coordinates": 0, "domain_index": 0, "is_forward": true, "chromosome_index": 0},
+                    {"coordinates": 0, "domain_index": 0, "is_forward": true, "chromosome_index": 1}
+                ]
+            }
+        }"#;
+        Recipe::from_json_str(json).expect("recipe_two_chromosomes_two_rnaps: parse failed")
+    }
+
+    /// BF2-3: each RNAP must land near its OWN chromosome's strand group, not
+    /// always chromosome 0.  Before the fix both RNAPs route to strand 0
+    /// (chromosome 0's main), so the chromosome-1 RNAP fails the proximity
+    /// check for chromosome 1's centroid.
+    #[test]
+    fn rnap_routes_to_own_chromosome() {
+        let recipe = recipe_two_chromosomes_two_rnaps();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+
+        // Two non-daughter RNAPs → exactly 2 placements (no bubble overlay).
+        assert_eq!(rnaps.len(), 2, "expected 2 RNAP placements, got {}", rnaps.len());
+
+        let chr = out.snapshot.chromosome.as_ref().expect("chromosome missing");
+        // 2 replicating chromosomes × 2 strands each = 4 strands total.
+        assert_eq!(
+            chr.strands.len(),
+            4,
+            "expected 4 strands (2 chrom × 2 each), got {}",
+            chr.strands.len()
+        );
+
+        // Per-chromosome strand-group centroids (cell-relative; center = origin).
+        let c0_beads: Vec<&Point3<f32>> = chr.strands[0..2].iter().flatten().collect();
+        let c1_beads: Vec<&Point3<f32>> = chr.strands[2..4].iter().flatten().collect();
+        let centroid = |beads: &[&Point3<f32>]| {
+            let n = beads.len() as f32;
+            Point3::new(
+                beads.iter().map(|p| p.x).sum::<f32>() / n,
+                beads.iter().map(|p| p.y).sum::<f32>() / n,
+                beads.iter().map(|p| p.z).sum::<f32>() / n,
+            )
+        };
+        let c0 = centroid(&c0_beads);
+        let c1 = centroid(&c1_beads);
+
+        // Chromosomes must be on opposite x sides (segregated).
+        assert!(
+            c0.x * c1.x < 0.0,
+            "chromosomes not segregated: c0.x={:.1} c1.x={:.1}",
+            c0.x, c1.x
+        );
+
+        // Recipe order: rnaps[0] = chromosome_index 0, rnaps[1] = chromosome_index 1.
+        // After the fix: rnap 0 closer to c0, rnap 1 closer to c1.
+        let d0_c0 = (rnaps[0].position - c0).norm();
+        let d0_c1 = (rnaps[0].position - c1).norm();
+        let d1_c0 = (rnaps[1].position - c0).norm();
+        let d1_c1 = (rnaps[1].position - c1).norm();
+
+        assert!(
+            d0_c0 < d0_c1,
+            "RNAP 0 (chromosome_index=0) not near c0: d_c0={d0_c0:.1} d_c1={d0_c1:.1}"
+        );
+        assert!(
+            d1_c1 < d1_c0,
+            "RNAP 1 (chromosome_index=1) not near c1: d_c1={d1_c1:.1} d_c0={d1_c0:.1}"
+        );
+    }
+
+    /// A single replicating chromosome must have its bead centroid near the
+    /// cell centre AND must show NO centerline-collapse artifact — i.e., no
+    /// sheaf of DNA beads projected onto the long-axis centerline in the cap
+    /// regions.
+    ///
+    /// The artifact (commit 1b80cab) was caused by `place_chromosome` rigidly
+    /// shifting finished beads by `sub_off − centroid` and then clamping
+    /// out-of-bounds beads with `inset.medial(p)`.  `medial()` on a capsule
+    /// projects onto the x-axis centerline (y=z=0), creating a visible sheaf
+    /// of straight DNA strands converging on the axis (measured: ~1.3 % of
+    /// beads at radial < 250 Å in the production E. coli model).
+    ///
+    /// Collapse threshold: beads with
+    ///   radial_distance_from_x_axis < 0.05 × cap_radius  (= 4.0 Å here)
+    ///   AND |x| > 0.6 × half_len                         (= 300 Å here)
+    /// must be ≤ max(⌈0.3 % × n_beads⌉, 2).
+    /// The medial-clamp bug produces radial = 0 for every clamped bead, and
+    /// even a small centroid drift pushes several beads past the cap.
+    /// A naturally confined fiber has ≈ 0 such beads (the first SAW bead
+    /// starts at the origin, on-axis, but at |x|=0 — not in the cap region).
+    #[test]
+    fn replicating_chromosome_centered_without_centerline_collapse() {
+        // Seed 404 was selected diagnostically: it produces 24 clamped beads on
+        // the buggy code (vs 0 for seed 42 which happens not to trigger clamping).
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(1)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(404);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+        let cap_radius = 80.0_f32;
+
+        let all_beads: Vec<&Point3<f32>> = chr.strands.iter().flatten().collect();
+        assert!(!all_beads.is_empty(), "no strand beads in snapshot");
+        let n = all_beads.len() as f32;
+
+        // (i) Centroid must be near the cell centre (same as replicating_chromosome_is_centered).
+        let cx = all_beads.iter().map(|p| p.x).sum::<f32>() / n;
+        assert!(
+            cx.abs() < 0.12 * half_len,
+            "centroid x = {cx:.1} Å (|{:.3}| × half_len), must be < {:.1} Å",
+            cx.abs() / half_len,
+            0.12 * half_len,
+        );
+
+        // (ii) No centerline-collapse artifact.
+        // For a bead at (x, y, z), the radial distance from the x-axis is
+        // sqrt(y² + z²).  A bead clamped by `medial()` is placed at (t, 0, 0)
+        // giving radial = 0.  The 4 Å threshold catches all such beads while
+        // being generous enough to exclude natural near-axis beads: with
+        // bead_radius = 5 Å the closest two beads can sit is 7.5 Å apart, so
+        // even a bead leaning against the axis bead has radial ≥ 5 Å from the
+        // centerline.  cap_region_axial = 300 Å excludes the origin (x=0)
+        // where the very first bead starts.
+        let cap_r_thresh = 0.05 * cap_radius; // 4.0 Å
+        let axial_thresh = 0.6 * half_len;    // 300.0 Å
+        let collapse_count: usize = all_beads
+            .iter()
+            .filter(|p| {
+                let r = (p.y * p.y + p.z * p.z).sqrt();
+                r < cap_r_thresh && p.x.abs() > axial_thresh
+            })
+            .count();
+        // Allow at most 0.3 % of beads (minimum 2) to avoid brittleness.
+        let max_allowed = ((0.003 * n).ceil() as usize).max(2);
+        assert!(
+            collapse_count <= max_allowed,
+            "centerline-collapse artifact: {collapse_count} beads have radial < \
+             {cap_r_thresh:.1} Å and |x| > {axial_thresh:.0} Å \
+             (threshold = {max_allowed} = max(⌈0.3 %×{n}⌉, 2)); \
+             medial-axis clamping is likely still active",
+        );
+    }
+
+    /// C1-2: RnaStrand carries `unique_index` and `length_nt` from the RnaSpec.
+    #[test]
+    fn rna_strand_carries_unique_index_and_length_nt() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-150, 0, 0], "b": [150, 0, 0], "radius": 80},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "rnas": [{"root_coordinate": 100000, "root_domain": 0, "length_nt": 400,
+                           "is_mRNA": true, "unique_index": 20}]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        assert_eq!(out.snapshot.rna_strands.len(), 1);
+        assert_eq!(out.snapshot.rna_strands[0].unique_index, 20,
+            "unique_index not carried onto RnaStrand");
+        assert_eq!(out.snapshot.rna_strands[0].length_nt, 400,
+            "length_nt not carried onto RnaStrand");
+    }
+
+    /// C1-3: ribosome is placed on its mRNA strand at `pos_on_mRNA`, offset
+    /// outward; a ribosome whose `mRNA_index` matches no rendered strand is
+    /// silently dropped.
+    #[test]
+    fn place_translation_seats_ribosome_on_mrna_and_drops_unknown_mrna() {
+        // Large capsule so inset(120) is still usable.
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome": { "type": "single_sphere", "radius": 120 }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 0},
+                    {"mRNA_index": 999, "pos_on_mRNA": 0, "peptide_length": 0}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+
+        let (ribo_idx, _, ribo_ing) = recipe.ingredients.get_full("70S_ribosome")
+            .expect("70S_ribosome ingredient not found");
+        let ribo_r = ribo_ing.shape.enclosing_radius();
+        let ribo_id = ribo_idx as u32;
+
+        // Exactly one ribosome placement: mRNA 20 placed, mRNA 999 dropped.
+        let ribo_placements: Vec<_> = out.snapshot.placements.iter()
+            .filter(|p| p.ingredient_id == ribo_id)
+            .collect();
+        assert_eq!(ribo_placements.len(), 1,
+            "expected exactly 1 ribosome placement (mRNA_index 999 must be dropped), got {}",
+            ribo_placements.len());
+
+        // Ribosome should be inside the inset envelope (shape.inset(ribo_r)).
+        let (center, shape) = first_capsule_cell(&recipe);
+        let inset = shape.inset(ribo_r);
+        let ribo_pos = ribo_placements[0].position;
+        // For a centered compartment (center == origin) the world position
+        // is identical to the center-relative position that inset.contains expects.
+        let pos_rel = ribo_pos - center.coords;
+        assert!(
+            inset.contains(&Point3::from(pos_rel)),
+            "ribosome placement outside inset envelope: world={:?}, center={:?}, rel={:?}",
+            ribo_pos, center, pos_rel
+        );
+
+        // Ribosome should be near the mRNA strand's midpoint bead (frac = 300/600 = 0.5).
+        let strand = out.snapshot.rna_strands.iter()
+            .find(|s| s.unique_index == 20)
+            .expect("RNA strand with unique_index 20 not found");
+        assert!(strand.points.len() >= 2, "strand has fewer than 2 points");
+        let frac = 0.5_f32; // pos_on_mRNA=300, length_nt=600
+        let mid_idx = (frac * (strand.points.len() - 1) as f32).round() as usize;
+        let base = center + strand.points[mid_idx].coords;
+        let dist = (ribo_pos - base).norm();
+        // The raw offset is ribo_r; after possible confinement the ribosome
+        // stays within inset, so the distance can deviate, but must stay
+        // well inside the capsule cross-section (< 3 * ribo_r is generous).
+        assert!(
+            dist < 3.0 * ribo_r,
+            "ribosome too far from mRNA midpoint bead: dist={:.1} Å, threshold={:.1} Å",
+            dist, 3.0 * ribo_r
+        );
+    }
+
+    /// C2-1: a ribosome with `peptide_length > 0` generates one peptide_strand;
+    /// a ribosome with `peptide_length == 0` generates none.
+    #[test]
+    fn peptide_coil_grown_only_for_positive_peptide_length() {
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome":   { "type": "single_sphere", "radius": 120 },
+                "peptide_segment": { "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "peptide_segment": "peptide_segment",
+                "peptide_angstrom_per_aa": 3.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 200},
+                    {"mRNA_index": 20, "pos_on_mRNA": 0,   "peptide_length": 0}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+        assert_eq!(
+            out.snapshot.peptide_strands.len(), 1,
+            "expected exactly 1 peptide strand (only peptide_length>0), got {}",
+            out.snapshot.peptide_strands.len()
+        );
+        assert!(
+            out.snapshot.peptide_strands[0].len() >= 2,
+            "peptide strand must have at least 2 beads"
+        );
+    }
+
+    /// C2-1: a longer peptide_length yields more beads than a shorter one.
+    #[test]
+    fn longer_peptide_grows_more_beads() {
+        let make_recipe = |peptide_length: i64| -> Recipe {
+            let json = format!(r#"{{
+                "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+                "objects": {{
+                    "70S_ribosome":    {{ "type": "single_sphere", "radius": 120 }},
+                    "peptide_segment": {{ "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000}},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                    "ribosome_marker": "70S_ribosome",
+                    "peptide_segment": "peptide_segment",
+                    "peptide_angstrom_per_aa": 3.0,
+                    "rnas": [
+                        {{"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                          "is_mRNA": true, "is_free": true, "unique_index": 20}}
+                    ],
+                    "ribosomes": [
+                        {{"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": {peptide_length}}}
+                    ]
+                }}
+            }}"#);
+            Recipe::from_json_str(&json).expect("parse failed")
+        };
+        let out_short = GreedyRandomPlacer::new(&make_recipe(200), PlacerConfig::default()).pack(42);
+        let out_long  = GreedyRandomPlacer::new(&make_recipe(600), PlacerConfig::default()).pack(42);
+        let beads_short = out_short.snapshot.peptide_strands.first().map_or(0, |s| s.len());
+        let beads_long  = out_long.snapshot.peptide_strands.first().map_or(0, |s| s.len());
+        assert!(
+            beads_long > beads_short,
+            "longer peptide should produce more beads: short={beads_short} long={beads_long}"
+        );
     }
 }

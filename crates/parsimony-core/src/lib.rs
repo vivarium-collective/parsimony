@@ -29,7 +29,7 @@ pub use pipeline::{
 };
 pub use placement::{Op, Placement, ReplaceChange, Snapshot, VariantId};
 pub use placer::{
-    GreedyRandomPlacer, PlacementBackend, PlacerConfig, PlacerOutcome, PlacerStats,
+    GreedyRandomPlacer, PlacementBackend, PlacerConfig, PlacerOutcome, PlacerStats, strand_point,
 };
 pub use recipe::{
     PackingMode, PlacementDirective, Recipe, RecipeError, RegionKind,

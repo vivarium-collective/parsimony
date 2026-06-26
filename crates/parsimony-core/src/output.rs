@@ -278,6 +278,74 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         }
     }
 
+    // Nascent-RNA strands: tile the `rna_segment` mesh along each strand,
+    // mirroring the dna_segment block above. Points are center-relative (same
+    // frame as `Chromosome::strands`); add the chromosome center to recover
+    // world coordinates. seg_step = 40.0 Å (one segment per bead, matching the
+    // strand bead spacing); twist = 0.0 (ssRNA, no helical twist).
+    if !snapshot.rna_strands.is_empty() {
+        let chrom = recipe.chromosome.as_ref();
+        let resolve =
+            |name: Option<&String>| name.and_then(|n| recipe.ingredients.get_index_of(n));
+        // Nascent strands tile `rna_segment`; free strands tile `rna_segment_free`
+        // (falling back to `rna_segment` when no separate free ingredient is set).
+        let nascent_seg = resolve(chrom.and_then(|c| c.rna_segment.as_ref()));
+        let free_seg =
+            resolve(chrom.and_then(|c| c.rna_segment_free.as_ref())).or(nascent_seg);
+        let center = snapshot
+            .chromosome
+            .as_ref()
+            .map(|c| c.center)
+            .unwrap_or(nalgebra::Point3::origin());
+        let seg_step = 40.0_f32; // one segment per bead (bead spacing = 40 Å)
+        for rna in &snapshot.rna_strands {
+            let seg_id = if rna.is_free { free_seg } else { nascent_seg };
+            let Some(seg_id) = seg_id else { continue };
+            let world: Vec<_> = rna.points.iter().map(|p| center + p.coords).collect();
+            for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, 0.0) {
+                placements.push(json!({
+                    "uid": placements.len() as u64,
+                    "ingredient": seg_id as u64,
+                    "compartment": 0,
+                    "position": [pos.x, pos.y, pos.z],
+                    "rotation": [rot.w, rot.i, rot.j, rot.k],
+                }));
+            }
+        }
+    }
+
+    // Nascent-peptide coils: tile the `peptide_segment` mesh along each strand,
+    // mirroring the rna_segment block above.  Points are center-relative (same
+    // frame as rna_strands); add the chromosome center for world coordinates.
+    // seg_step = 30.0 Å (one segment per bead, matching the peptide bead spacing);
+    // twist = 0.0 (unstructured coil, no helical twist).
+    if !snapshot.peptide_strands.is_empty() {
+        let chrom = recipe.chromosome.as_ref();
+        let pep_seg = chrom
+            .and_then(|c| c.peptide_segment.as_ref())
+            .and_then(|n| recipe.ingredients.get_index_of(n));
+        if let Some(pep_seg_id) = pep_seg {
+            let center = snapshot
+                .chromosome
+                .as_ref()
+                .map(|c| c.center)
+                .unwrap_or(nalgebra::Point3::origin());
+            let seg_step = 30.0_f32;
+            for strand in &snapshot.peptide_strands {
+                let world: Vec<_> = strand.iter().map(|p| center + p.coords).collect();
+                for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, 0.0) {
+                    placements.push(json!({
+                        "uid": placements.len() as u64,
+                        "ingredient": pep_seg_id as u64,
+                        "compartment": 0,
+                        "position": [pos.x, pos.y, pos.z],
+                        "rotation": [rot.w, rot.i, rot.j, rot.k],
+                    }));
+                }
+            }
+        }
+    }
+
     // Cache-busting token for the viewer's IndexedDB mesh cache: a fresh value
     // each write, so regenerating the pack/meshes invalidates cached geometry
     // (which is keyed by URL and would otherwise serve stale meshes).
@@ -504,6 +572,202 @@ mod tests {
         // Frame data has placements × 11 floats.
         let data = bd[0]["data"].as_array().unwrap();
         assert_eq!(data.len(), snap.placements.len() * 11);
+    }
+
+    /// B1-4: `write_pack_json` tiles the `rna_segment` mesh along every nascent-RNA
+    /// strand in `snapshot.rna_strands`, emitting one placement per bead-step
+    /// (seg_step = 40 Å, twist = 0).  With two 800-nt strands (40 beads each)
+    /// the output must contain many more than 20 `rna_segment` placements.
+    #[test]
+    fn emits_rna_segment_placements_for_each_strand() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {
+                "rna_segment": { "type": "single_sphere", "radius": 4.0, "color": [0.2, 0.8, 0.4] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {
+                        "kind": "capsule",
+                        "a": [-150, 0, 0],
+                        "b": [150, 0, 0],
+                        "radius": 80
+                    },
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000,
+                "spacing": 10.0,
+                "bead_radius": 5.0,
+                "compartment": "cell",
+                "rna_segment": "rna_segment",
+                "rnas": [
+                    {"root_coordinate": 100000, "root_domain": 0, "length_nt": 800, "is_mRNA": true},
+                    {"root_coordinate": -50000,  "root_domain": 0, "length_nt": 800, "is_mRNA": false}
+                ]
+            }
+        }"#;
+        let recipe = crate::recipe::Recipe::from_json_str(json).expect("recipe parse failed");
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(5);
+        let pack = write_pack_json(&out.snapshot, &recipe);
+        let seg_id = recipe.ingredients.get_index_of("rna_segment").unwrap();
+        let n = pack["placements"].as_array().unwrap().iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(seg_id as u64))
+            .count();
+        assert!(n > 20, "expected many tiled rna_segment placements, got {n}");
+    }
+
+    /// B1-5: `write_pack_json` routes nascent strands to `rna_segment` and free
+    /// strands to `rna_segment_free` when both ingredients are configured.  With
+    /// one nascent RNA and one free RNA in the recipe, both ingredients must
+    /// appear in the placements list.
+    #[test]
+    fn free_rna_strands_tile_rna_segment_free() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {
+                "rna_segment":      { "type": "single_sphere", "radius": 4.0, "color": [0.2, 0.8, 0.4] },
+                "rna_segment_free": { "type": "single_sphere", "radius": 4.0, "color": [0.8, 0.2, 0.4] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {
+                        "kind": "capsule",
+                        "a": [-150, 0, 0],
+                        "b": [150, 0, 0],
+                        "radius": 80
+                    },
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000,
+                "spacing": 10.0,
+                "bead_radius": 5.0,
+                "compartment": "cell",
+                "rna_segment":      "rna_segment",
+                "rna_segment_free": "rna_segment_free",
+                "rnas": [
+                    {"root_coordinate": 100000, "root_domain": 0, "length_nt": 800, "is_mRNA": true, "is_free": false},
+                    {"root_coordinate": -50000,  "root_domain": 0, "length_nt": 800, "is_mRNA": true, "is_free": true}
+                ]
+            }
+        }"#;
+        let recipe = crate::recipe::Recipe::from_json_str(json).expect("recipe parse failed");
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(7);
+        let pack = write_pack_json(&out.snapshot, &recipe);
+        let placements = pack["placements"].as_array().unwrap();
+
+        let nascent_id = recipe.ingredients.get_index_of("rna_segment").unwrap() as u64;
+        let free_id = recipe.ingredients.get_index_of("rna_segment_free").unwrap() as u64;
+
+        let nascent_count = placements.iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(nascent_id))
+            .count();
+        let free_count = placements.iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(free_id))
+            .count();
+
+        assert!(nascent_count > 0,
+            "expected rna_segment placements for nascent strand, got {nascent_count}");
+        assert!(free_count > 0,
+            "expected rna_segment_free placements for free strand, got {free_count}");
+    }
+
+    /// B1-5b: when `rna_segment_free` is NOT defined, a free strand falls back
+    /// to tiling `rna_segment` (same ingredient as nascent strands).
+    #[test]
+    fn free_rna_falls_back_to_rna_segment_when_no_free_ingredient() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {
+                "rna_segment": { "type": "single_sphere", "radius": 4.0, "color": [0.2, 0.8, 0.4] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {
+                        "kind": "capsule",
+                        "a": [-150, 0, 0],
+                        "b": [150, 0, 0],
+                        "radius": 80
+                    },
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000,
+                "spacing": 10.0,
+                "bead_radius": 5.0,
+                "compartment": "cell",
+                "rna_segment": "rna_segment",
+                "rnas": [
+                    {"root_coordinate": 100000, "root_domain": 0, "length_nt": 800, "is_mRNA": true, "is_free": false},
+                    {"root_coordinate": -50000,  "root_domain": 0, "length_nt": 800, "is_mRNA": true, "is_free": true}
+                ]
+            }
+        }"#;
+        let recipe = crate::recipe::Recipe::from_json_str(json).expect("recipe parse failed");
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(9);
+        let pack = write_pack_json(&out.snapshot, &recipe);
+        let placements = pack["placements"].as_array().unwrap();
+
+        let seg_id = recipe.ingredients.get_index_of("rna_segment").unwrap() as u64;
+        let n = placements.iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(seg_id))
+            .count();
+
+        // Both nascent and free strands tile rna_segment (no free-specific ingredient)
+        assert!(n > 20,
+            "expected both strands tiled via rna_segment fallback, got {n} placements");
+    }
+
+    /// C2-1: `write_pack_json` tiles `peptide_segment` along each peptide strand
+    /// in `snapshot.peptide_strands`, emitting at least one placement per strand.
+    #[test]
+    fn emits_peptide_segment_placements_for_peptide_strands() {
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome":    { "type": "single_sphere", "radius": 120 },
+                "peptide_segment": { "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "peptide_segment": "peptide_segment",
+                "peptide_angstrom_per_aa": 3.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 200}
+                ]
+            }
+        }"#;
+        let recipe = crate::recipe::Recipe::from_json_str(json).expect("recipe parse failed");
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+        let pack = write_pack_json(&out.snapshot, &recipe);
+        let seg_id = recipe.ingredients.get_index_of("peptide_segment").unwrap();
+        let n = pack["placements"].as_array().unwrap().iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(seg_id as u64))
+            .count();
+        assert!(n > 0, "expected peptide_segment placements, got {n}");
     }
 
     #[test]
