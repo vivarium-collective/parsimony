@@ -826,6 +826,29 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // A sphere cell with 10 proteins + a 100-bead chromosome with 2 nascent-RNA
+    // strands.  Used by `pipeline_merge_preserves_rna_strands` to exercise the
+    // merge-loop fix from commit 3aa6e0b: rna_strands were dropped during the
+    // multi-stage merge.
+    const RECIPE_WITH_RNAS: &str = r#"{
+        "bounding_box": [[-100,-100,-100],[100,100,100]],
+        "objects": { "prot": { "type": "single_sphere", "radius": 5 } },
+        "composition": {
+            "space": { "regions": { "interior": ["cell"] } },
+            "cell": {
+                "compartment": { "kind": "sphere", "center": [0,0,0], "radius": 80 },
+                "regions": { "interior": [ { "object": "prot", "count": 10 } ] }
+            }
+        },
+        "chromosome": {
+            "beads": 100, "spacing": 8, "bead_radius": 4,
+            "rnas": [
+                {"root_coordinate": 10000, "root_domain": 0, "length_nt": 200, "is_mRNA": true},
+                {"root_coordinate": -5000, "root_domain": 0, "length_nt": 100, "is_mRNA": false}
+            ]
+        }
+    }"#;
+
     // A sphere cell with 50 proteins + a 100-bead chromosome.
     const RECIPE: &str = r#"{
         "bounding_box": [[-100,-100,-100],[100,100,100]],
@@ -981,4 +1004,41 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// Regression test for commit 3aa6e0b: the multi-stage Pipeline merge loop
+    /// was dropping `snapshot.rna_strands` from each stage's output, so a full
+    /// chromosome+pack build rendered no RNA strands in the merged result.
+    /// The fix added `merged.rna_strands.extend(snap.rna_strands)` to the loop.
+    ///
+    /// This test runs a two-stage pipeline (Chromosome + Pack) against a recipe
+    /// that declares 2 nascent RNA strands and asserts that exactly 2 survive
+    /// into `run.merged.rna_strands`.
+    #[test]
+    fn pipeline_merge_preserves_rna_strands() {
+        let base = scratch_dir();
+        let cache = base.join("cache");
+        std::fs::write(base.join("recipe.json"), RECIPE_WITH_RNAS).unwrap();
+        let pipeline = two_stage_pipeline();
+
+        let run = pipeline.run(&base, &cache, true, None).unwrap();
+
+        // The chromosome stage populates rna_strands (one per RnaSpec).
+        // The merge loop must carry them through — the pre-3aa6e0b bug
+        // silently dropped them, leaving merged.rna_strands empty.
+        const N_RNAS: usize = 2;
+        assert_eq!(
+            run.merged.rna_strands.len(),
+            N_RNAS,
+            "pipeline merge must preserve rna_strands: expected {N_RNAS}, got {}",
+            run.merged.rna_strands.len()
+        );
+        for (i, strand) in run.merged.rna_strands.iter().enumerate() {
+            assert!(
+                !strand.points.is_empty(),
+                "rna_strand {i} has no beads after pipeline merge"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
+
