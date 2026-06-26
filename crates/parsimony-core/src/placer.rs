@@ -817,8 +817,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                     sub_shape, beads, chr.fork_fraction, chr.spacing, chr.bead_radius,
                     sc_radius, sc_pitch, rng,
                 );
-                // Translate strands to their sub-region (sub_off applied first).
-                let mut group: Vec<Vec<Point3<f32>>> = theta
+                // Translate strands to their sub-region (sub_off positions each
+                // chromosome at its pole; centering is done inside
+                // `generate_theta_chromosome`, so no further shift is needed).
+                let group: Vec<Vec<Point3<f32>>> = theta
                     .strands
                     .into_iter()
                     .map(|mut s| {
@@ -828,49 +830,29 @@ impl<'a> GreedyRandomPlacer<'a> {
                         s
                     })
                     .collect();
-                // Per-chromosome landmark positions (sub_off applied, not yet
-                // extended into the flat vecs — shift must be applied first).
-                let mut chrom_forks: Vec<Point3<f32>> = theta
+                // Per-chromosome landmark positions (sub_off applied).
+                let chrom_forks: Vec<Point3<f32>> = theta
                     .forks
                     .into_iter()
                     .map(|mut fk| { fk += sub_off; fk })
                     .collect();
-                let mut chrom_orics: Vec<Point3<f32>> = theta
+                let chrom_orics: Vec<Point3<f32>> = theta
                     .oric
                     .into_iter()
                     .map(|mut o| { o += sub_off; o })
                     .collect();
-                let mut chrom_ters: Vec<Point3<f32>> = theta
+                let chrom_ters: Vec<Point3<f32>> = theta
                     .ter
                     .into_iter()
                     .map(|mut t| { t += sub_off; t })
                     .collect();
-                // COM recenter: pull the group's centroid to sub_off so the
-                // chromosome lands in its intended sub-region rather than
-                // drifting with the SAW start-at-origin bias.  Landmarks
-                // (forks, oriC, terC) receive the same shift so they stay
-                // co-located with the strand.
-                let n_beads: usize = group.iter().map(|s| s.len()).sum();
-                if n_beads > 0 {
-                    let centroid = group
-                        .iter()
-                        .flatten()
-                        .fold(Vector3::zeros(), |acc, p| acc + p.coords)
-                        / n_beads as f32;
-                    let shift = sub_off - centroid;
-                    let inset = shape.inset(chr.bead_radius);
-                    for s in &mut group {
-                        for p in s {
-                            *p += shift;
-                            if !inset.contains(p) {
-                                *p = inset.medial(p);
-                            }
-                        }
-                    }
-                    for p in &mut chrom_forks { *p += shift; }
-                    for p in &mut chrom_orics { *p += shift; }
-                    for p in &mut chrom_ters  { *p += shift; }
-                }
+                // Centering is now done at the source: `generate_theta_chromosome`
+                // recenters the main strand (and derives the sister from the
+                // centred main), so adding `sub_off` above already places each
+                // chromosome at its intended pole sub-region.  The prior rigid
+                // `shift = sub_off − centroid` + `medial()` clamp has been
+                // removed: it caused the centerline-collapse artifact (beads
+                // projected to the x-axis in cap regions via `medial()`).
                 forks.extend(chrom_forks);
                 orics.extend(chrom_orics);
                 ters.extend(chrom_ters);
@@ -2289,6 +2271,85 @@ mod tests {
              |Δx| = {:.1} (need > {:.1})",
             (cx1 - cx0).abs(),
             0.3 * half_len,
+        );
+    }
+
+    /// A single replicating chromosome must have its bead centroid near the
+    /// cell centre AND must show NO centerline-collapse artifact — i.e., no
+    /// sheaf of DNA beads projected onto the long-axis centerline in the cap
+    /// regions.
+    ///
+    /// The artifact (commit 1b80cab) was caused by `place_chromosome` rigidly
+    /// shifting finished beads by `sub_off − centroid` and then clamping
+    /// out-of-bounds beads with `inset.medial(p)`.  `medial()` on a capsule
+    /// projects onto the x-axis centerline (y=z=0), creating a visible sheaf
+    /// of straight DNA strands converging on the axis (measured: ~1.3 % of
+    /// beads at radial < 250 Å in the production E. coli model).
+    ///
+    /// Collapse threshold: beads with
+    ///   radial_distance_from_x_axis < 0.05 × cap_radius  (= 4.0 Å here)
+    ///   AND |x| > 0.6 × half_len                         (= 300 Å here)
+    /// must be ≤ max(⌈0.3 % × n_beads⌉, 2).
+    /// The medial-clamp bug produces radial = 0 for every clamped bead, and
+    /// even a small centroid drift pushes several beads past the cap.
+    /// A naturally confined fiber has ≈ 0 such beads (the first SAW bead
+    /// starts at the origin, on-axis, but at |x|=0 — not in the cap region).
+    #[test]
+    fn replicating_chromosome_centered_without_centerline_collapse() {
+        // Seed 404 was selected diagnostically: it produces 24 clamped beads on
+        // the buggy code (vs 0 for seed 42 which happens not to trigger clamping).
+        let recipe =
+            Recipe::from_json_str(&replicating_chromosome_recipe_json(1)).unwrap();
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(404);
+
+        let chr = out
+            .snapshot
+            .chromosome
+            .as_ref()
+            .expect("chromosome missing from snapshot");
+        let half_len = 500.0_f32;
+        let cap_radius = 80.0_f32;
+
+        let all_beads: Vec<&Point3<f32>> = chr.strands.iter().flatten().collect();
+        assert!(!all_beads.is_empty(), "no strand beads in snapshot");
+        let n = all_beads.len() as f32;
+
+        // (i) Centroid must be near the cell centre (same as replicating_chromosome_is_centered).
+        let cx = all_beads.iter().map(|p| p.x).sum::<f32>() / n;
+        assert!(
+            cx.abs() < 0.12 * half_len,
+            "centroid x = {cx:.1} Å (|{:.3}| × half_len), must be < {:.1} Å",
+            cx.abs() / half_len,
+            0.12 * half_len,
+        );
+
+        // (ii) No centerline-collapse artifact.
+        // For a bead at (x, y, z), the radial distance from the x-axis is
+        // sqrt(y² + z²).  A bead clamped by `medial()` is placed at (t, 0, 0)
+        // giving radial = 0.  The 4 Å threshold catches all such beads while
+        // being generous enough to exclude natural near-axis beads: with
+        // bead_radius = 5 Å the closest two beads can sit is 7.5 Å apart, so
+        // even a bead leaning against the axis bead has radial ≥ 5 Å from the
+        // centerline.  cap_region_axial = 300 Å excludes the origin (x=0)
+        // where the very first bead starts.
+        let cap_r_thresh = 0.05 * cap_radius; // 4.0 Å
+        let axial_thresh = 0.6 * half_len;    // 300.0 Å
+        let collapse_count: usize = all_beads
+            .iter()
+            .filter(|p| {
+                let r = (p.y * p.y + p.z * p.z).sqrt();
+                r < cap_r_thresh && p.x.abs() > axial_thresh
+            })
+            .count();
+        // Allow at most 0.3 % of beads (minimum 2) to avoid brittleness.
+        let max_allowed = ((0.003 * n).ceil() as usize).max(2);
+        assert!(
+            collapse_count <= max_allowed,
+            "centerline-collapse artifact: {collapse_count} beads have radial < \
+             {cap_r_thresh:.1} Å and |x| > {axial_thresh:.0} Å \
+             (threshold = {max_allowed} = max(⌈0.3 %×{n}⌉, 2)); \
+             medial-axis clamping is likely still active",
         );
     }
 }

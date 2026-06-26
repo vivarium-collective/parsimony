@@ -228,7 +228,8 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     let axis_len_target = n_half as f32 * da * 1.8;
     let axis_step = (sc_pitch / 6.0).max(2.0 * bead_radius);
     let axis_n = ((axis_len_target / axis_step).ceil() as usize + 2).max(2);
-    let mut axis = generate_fiber(shape.inset(sc_radius), axis_n, axis_step, bead_radius, rng);
+    let axis_inset = shape.inset(sc_radius);
+    let mut axis = generate_fiber(axis_inset, axis_n, axis_step, bead_radius, rng);
     if axis.len() < 2 {
         return generate_fiber(shape, bead_count, step, bead_radius, rng);
     }
@@ -238,6 +239,37 @@ pub fn generate_supercoiled_fiber<R: Rng>(
     // so Laplacian-smooth the axis until its curvature is gentle relative to
     // the coil radius and the helix winds evenly.
     smooth_polyline(&mut axis, 25);
+    // Recenter the backbone axis to the shape origin.  The SAW starts at the
+    // origin and drifts toward one pole; the wound coil inherits that drift,
+    // pushing the chromosome centroid away from centre.  Translate the axis
+    // centroid to the origin (a deterministic shift, no new RNG draws), then
+    // pull any vertex that now lies outside axis_inset back to the inset
+    // SURFACE along the inward-radial direction — preserving azimuthal position
+    // and never projecting to the centerline, which would cause a
+    // collinear-convergence artifact.  Use the bead-radius inset as the
+    // confinement boundary so wound beads (axis + sc_radius offset) stay
+    // within the cell envelope.
+    {
+        let n = axis.len() as f32;
+        let c = axis.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / n;
+        for p in &mut axis {
+            p.coords -= c;
+        }
+        // Pull to axis_inset.inset(bead_radius) so the sc_radius winding offset
+        // keeps the wound beads inside the cell (cap_radius - bead_radius + sc_radius
+        // ≤ cap_radius when bead_radius ≥ sc_radius, which holds for typical params).
+        let tight = axis_inset.inset(bead_radius);
+        let cr = tight.cap_radius();
+        for p in &mut axis {
+            if !tight.contains(p) {
+                let m = tight.medial(p);
+                let rad = p.coords - m.coords;
+                let r = rad.norm();
+                let dir = if r > 1e-6 { rad / r } else { perp(axis_inset.long_axis()) };
+                *p = m + dir * (cr * 0.999);
+            }
+        }
+    }
 
     // Rotation-minimizing frames + cumulative arc length along the axis.
     let frames = frames_along(&axis);
@@ -321,7 +353,36 @@ pub fn generate_theta_chromosome<R: Rng>(
     sc_pitch: f32,
     rng: &mut R,
 ) -> ThetaChromosome {
-    let main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
+    // `generate_supercoiled_fiber` recenters the backbone axis when sc_radius > 0,
+    // but falls back to a plain `generate_fiber` walk for sc_radius = 0.  That
+    // walk starts at the origin and drifts; the caller (`place_chromosome`) used
+    // to correct this with a rigid centroid shift + `medial()` clamp — which
+    // created the centerline-collapse artifact (beads projected onto the cell
+    // axis in cap regions).  We fix it here, at the source: translate the main
+    // strand so its centroid is at the shape origin, then surface-pull any bead
+    // that falls outside the inset (inward-radial direction only, never medial).
+    let inset = shape.inset(bead_radius);
+    let mut main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
+    if !main.is_empty() {
+        let nm = main.len() as f32;
+        let c = main.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / nm;
+        for p in &mut main {
+            p.coords -= c;
+        }
+        // Surface-pull: beads that fell outside the inset after recentering are
+        // moved to the inset surface at their own azimuthal angle — NOT to the
+        // medial axis (which would create the centerline convergence we are fixing).
+        let cr = inset.cap_radius();
+        for p in &mut main {
+            if !inset.contains(p) {
+                let m = inset.medial(p);
+                let rad = p.coords - m.coords;
+                let r = rad.norm();
+                let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
+                *p = m + dir * (cr * 0.999);
+            }
+        }
+    }
     let n = main.len();
     let f = fork_fraction.clamp(0.0, 0.95);
     // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
@@ -342,7 +403,6 @@ pub fn generate_theta_chromosome<R: Rng>(
     let oric = n / 2;
     let lo = oric - r; // forward fork
     let hi = oric + r; // reverse fork
-    let inset = shape.inset(bead_radius);
     // One stable bulge direction for the whole bubble (perpendicular to the
     // fork-to-fork chord, biased outward from the medial axis) → a clean lens.
     let chord = main[hi] - main[lo];
