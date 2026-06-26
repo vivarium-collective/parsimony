@@ -980,8 +980,16 @@ impl<'a> GreedyRandomPlacer<'a> {
                     let inset = shape.inset(er);
                     for rnap in &chr.rnaps {
                         // Map genomic coordinate → cell-centre-relative position + tangent.
+                        // EVERY RNAP is placed on the MAIN genome contour (strand 0) by
+                        // its coordinate, regardless of `domain_index` — matching the
+                        // v2ecoli `_draw_chromosome` reference ("rim RNAPs: ALL of them,
+                        // regardless of domain"). Routing daughter-domain RNAPs onto the
+                        // short sister strand instead left the main strand's replicated
+                        // (bubble) region bare. (`is_forward` orientation still uses the
+                        // RNAP's own direction.) Showing the second daughter copy on the
+                        // sister bubble is a separate future enhancement.
                         let Some((strand_pt, tangent)) =
-                            strand_point(&strands, rnap.domain_index, rnap.coordinates, glen)
+                            strand_point(&strands, 0, rnap.coordinates, glen)
                         else {
                             continue;
                         };
@@ -2095,6 +2103,81 @@ mod tests {
             }}"#
         );
         Recipe::from_json_str(&json).expect("recipe_with_chromosome_and_rnaps: parse failed")
+    }
+
+    /// A *replicating* chromosome (`fork_fraction > 0` → main + sister strands)
+    /// with a single RNAP at `(coord, domain)`. Used to verify that an RNAP on a
+    /// daughter domain is still placed on the MAIN genome contour by coordinate
+    /// (matching the v2ecoli `_draw_chromosome` reference: "rim RNAPs: ALL of
+    /// them, regardless of domain").
+    fn recipe_replicating_with_one_rnap(coord: i64, domain: i32) -> Recipe {
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{
+                    "rna_polymerase": {{ "type": "single_sphere", "radius": 20 }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "n_chromosomes": 1,
+                    "fork_fraction": 0.45,
+                    "rnap_marker": "rna_polymerase",
+                    "rnaps": [{{"coordinates": {coord}, "domain_index": {domain}, "is_forward": true}}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json).expect("recipe_replicating_with_one_rnap: parse failed")
+    }
+
+    /// A daughter-domain RNAP must be placed on the MAIN chromosome contour at
+    /// its genomic coordinate — NOT routed onto the (short) sister strand. This
+    /// matches the v2ecoli reference, where every RNAP is plotted on the rim by
+    /// coordinate regardless of domain; routing daughter RNAPs onto the sister
+    /// only left the main strand's replicated region bare.
+    #[test]
+    fn rnap_placed_on_main_contour_regardless_of_domain() {
+        let coord = 0_i64; // oriC — mid-bubble, where main and sister diverge
+        let recipe = recipe_replicating_with_one_rnap(coord, 2); // daughter domain 2
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (center, _shape) = first_capsule_cell(&recipe);
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+        assert_eq!(rnaps.len(), 1, "expected exactly one RNAP");
+
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        assert!(strands.len() >= 2, "replicating chromosome should have a sister strand");
+        let (main_pt, _) = strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap();
+        let (sister_pt, _) = strand_point(strands, 2, coord, GENOME_BP_DEFAULT).unwrap();
+        let main_world = center + main_pt.coords;
+        let sister_world = center + sister_pt.coords;
+        let d_main = (rnaps[0].position - main_world).norm();
+        let d_sister = (rnaps[0].position - sister_world).norm();
+        // The RNAP must sit on the MAIN contour, not the sister bulge. Before the
+        // fix it was routed to the sister (d_sister ≈ 0, d_main ≈ bulge).
+        assert!(
+            d_main < d_sister,
+            "daughter-domain RNAP should be on the main contour (d_main={d_main}, d_sister={d_sister})"
+        );
     }
 
     /// Return `(center, CellShape)` for the first capsule compartment in the
