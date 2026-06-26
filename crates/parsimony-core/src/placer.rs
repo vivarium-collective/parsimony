@@ -176,6 +176,53 @@ pub fn strand_point(
     Some((point, tangent))
 }
 
+/// Map a genomic coordinate (signed bp, oriC = 0) to a 3D point and unit
+/// tangent on the *sister* (replication-bubble) strand.
+///
+/// The bubble spans `[-fork_bp, +fork_bp]` where
+/// `fork_bp = fork_fraction × (genome_len_bp / 2)`.  The coordinate is
+/// linearly mapped onto `[0, 1]` over that range and clamped:
+///
+/// ```text
+/// frac = ((coordinate + fork_bp) / (2 · fork_bp)).clamp(0, 1)
+/// idx  = round(frac × (sister.len() - 1))
+/// ```
+///
+/// oriC (coordinate = 0) maps to fraction 0.5 (the sister midpoint).
+/// `+fork_bp` maps to the far end; `-fork_bp` maps to the near end.
+/// Coordinates outside `[-fork_bp, fork_bp]` are clamped (no panic).
+///
+/// Returns `None` when `sister.len() < 2` or `fork_bp <= 0`.
+pub fn bubble_point(
+    sister: &[Point3<f32>],
+    coordinate: i64,
+    fork_fraction: f32,
+    genome_len_bp: u32,
+) -> Option<(Point3<f32>, Vector3<f32>)> {
+    let fork_bp = fork_fraction * (genome_len_bp as f32 / 2.0);
+    if sister.len() < 2 || fork_bp <= 0.0 {
+        return None;
+    }
+
+    let frac = ((coordinate as f32 + fork_bp) / (2.0 * fork_bp)).clamp(0.0, 1.0);
+    let last = (sister.len() - 1) as f32;
+    let idx = (frac * last).round() as usize;
+    let idx = idx.min(sister.len() - 1);
+
+    let point = sister[idx];
+
+    // Tangent: forward segment, or backward segment at the very end.
+    let tangent = if idx + 1 < sister.len() {
+        sister[idx + 1] - sister[idx]
+    } else {
+        sister[idx] - sister[idx - 1]
+    };
+    let norm = tangent.norm();
+    let tangent = if norm > 1e-9 { tangent / norm } else { Vector3::x() };
+
+    Some((point, tangent))
+}
+
 /// Default E. coli K-12 genome length in base pairs. Used when no genome CSV
 /// is configured on the chromosome spec but explicit RNAP coordinates must
 /// be mapped onto the strand.
@@ -2050,6 +2097,27 @@ mod tests {
         assert!(p1.x > p0.x);
         // every mapped point is an actual bead-interpolated point on the strand
         assert!(strand.iter().map(|b| (b - p1).norm()).fold(f32::MAX, f32::min) < 11.0);
+    }
+
+    #[test]
+    fn bubble_point_maps_forks_to_ends_and_oric_to_middle() {
+        // sister of 101 beads along x in [-500, 500]
+        let sister: Vec<Point3<f32>> = (0..101).map(|i| Point3::new(-500.0 + i as f32 * 10.0, 0.0, 0.0)).collect();
+        let glen = 4_641_652u32;
+        let ff = 0.45_f32;
+        let fork_bp = (ff * glen as f32 / 2.0) as i64; // bubble half-width in bp
+        // oriC (coord 0) → frac 0.5 → middle (x≈0)
+        let (mid, _) = bubble_point(&sister, 0, ff, glen).unwrap();
+        assert!(mid.x.abs() < 6.0, "oriC should map near the sister middle, got {}", mid.x);
+        // +fork → frac 1.0 → last bead (x≈+500)
+        let (hi, _) = bubble_point(&sister, fork_bp, ff, glen).unwrap();
+        assert!(hi.x > 480.0, "+fork should map near the sister far end, got {}", hi.x);
+        // -fork → frac 0.0 → first bead (x≈-500)
+        let (lo, _) = bubble_point(&sister, -fork_bp, ff, glen).unwrap();
+        assert!(lo.x < -480.0, "-fork should map near the sister near end, got {}", lo.x);
+        // coordinate beyond the bubble clamps to an end (does not panic / wrap)
+        let (clamped, _) = bubble_point(&sister, glen as i64, ff, glen).unwrap();
+        assert!(clamped.x > 480.0);
     }
 
     // ---- A4 test helpers ------------------------------------------------
