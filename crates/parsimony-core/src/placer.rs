@@ -1089,8 +1089,12 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
                 chosen
             } else {
-                // Nascent: chromosome-rooted, same as before.
-                strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
+                // Nascent: root on the MAIN genome contour (strand 0) by coordinate,
+                // matching where its RNAP is placed (see the RNAP loop above — every
+                // RNAP goes on strand 0 regardless of domain). Using `root_domain`
+                // here would root daughter-domain transcripts on the sister bulge,
+                // visually disconnecting them from their polymerase.
+                strand_point(&strands, 0, rna.root_coordinate, glen)
                     .map(|(p, _)| p)
                     .unwrap_or_else(Point3::origin)
             };
@@ -2177,6 +2181,48 @@ mod tests {
         assert!(
             d_main < d_sister,
             "daughter-domain RNAP should be on the main contour (d_main={d_main}, d_sister={d_sister})"
+        );
+    }
+
+    /// A nascent RNA rooted at a daughter-domain RNAP must emanate from the MAIN
+    /// contour (where the RNAP now sits), not the sister bulge — otherwise the
+    /// transcript is visually disconnected from its polymerase.
+    #[test]
+    fn nascent_rna_roots_on_main_contour_like_its_rnap() {
+        let coord = 0_i64; // oriC
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{ "rna_segment": {{ "type": "single_sphere", "radius": 4 }} }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{ "kind": "capsule", "a": [-150,0,0], "b": [150,0,0], "radius": 80 }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                    "n_chromosomes": 1, "fork_fraction": 0.45,
+                    "rna_segment": "rna_segment", "rna_angstrom_per_nt": 2.0,
+                    "rnas": [{{"root_coordinate": {coord}, "root_domain": 2, "length_nt": 400, "is_mRNA": true}}]
+                }}
+            }}"#
+        );
+        let recipe = Recipe::from_json_str(&json).unwrap();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        let (center, _shape) = first_capsule_cell(&recipe);
+        assert_eq!(out.snapshot.rna_strands.len(), 1);
+        let root = out.snapshot.rna_strands[0].points[0];
+        let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
+        let main_world = center + strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let sister_world = center + strand_point(strands, 2, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
+        let world_root = center + root.coords;
+        let d_main = (world_root - main_world).norm();
+        let d_sister = (world_root - sister_world).norm();
+        assert!(
+            d_main < d_sister,
+            "nascent RNA must root on the main contour like its RNAP (d_main={d_main}, d_sister={d_sister})"
         );
     }
 
