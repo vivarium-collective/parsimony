@@ -104,6 +104,13 @@ struct RawChromosome {
     /// Ångströms per nucleotide for extended strand length (default 2.0 when absent).
     #[serde(default)]
     rna_angstrom_per_nt: Option<f32>,
+    /// Septum constriction depth (0 = no septum; 0.5–0.7 = visible waist).
+    /// Mirrors the Gaussian-dip depth in the constricted-capsule mesh.
+    #[serde(default)]
+    septum_depth: Option<f32>,
+    /// Gaussian σ of the septum profile in Ångströms (default 0.0).
+    #[serde(default)]
+    septum_width: Option<f32>,
     /// Explicit ribosome placements (mRNA index, position on mRNA, peptide length).
     #[serde(default)]
     ribosomes: Vec<RawRibosome>,
@@ -408,6 +415,11 @@ pub struct ChromosomeSpec {
     pub peptide_segment: Option<String>,
     /// Ångströms per amino acid for peptide contour length; default 3.0.
     pub peptide_angstrom_per_aa: f32,
+    /// Septum constriction depth (0 = no septum; >0 activates the Gaussian
+    /// taper in CellShape::Capsule::contains for Mesh compartments).
+    pub septum_depth: f32,
+    /// Gaussian σ of the septum profile in the same units as `radius` (Å).
+    pub septum_width: f32,
 }
 
 /// A single explicit RNA polymerase placement from the recipe.
@@ -862,6 +874,8 @@ fn resolve(
             rna_angstrom_per_nt: c.rna_angstrom_per_nt.unwrap_or(2.0),
             peptide_segment: c.peptide_segment,
             peptide_angstrom_per_aa: c.peptide_angstrom_per_aa.unwrap_or(3.0),
+            septum_depth: c.septum_depth.unwrap_or(0.0),
+            septum_width: c.septum_width.unwrap_or(0.0),
         }),
     })
 }

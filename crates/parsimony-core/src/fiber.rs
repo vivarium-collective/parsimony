@@ -14,6 +14,17 @@
 use nalgebra::{Matrix3, Point3, Rotation3, Unit, UnitQuaternion, Vector3};
 use rand::Rng;
 
+/// Gaussian constriction (septum) at the midplane of a dividing capsule.
+/// `depth` is the fractional radius reduction at axial=0 (e.g. 0.6 → 60%
+/// narrower waist); `width` is the Gaussian σ in the same units as the
+/// capsule's `half_len`/`radius` (Ångströms). Stored as a fraction so
+/// `inset` does not need to rescale it.
+#[derive(Debug, Clone, Copy)]
+pub struct Septum {
+    pub depth: f32,
+    pub width: f32,
+}
+
 /// The envelope the chromosome is confined to, in the origin-relative frame
 /// the fiber generators use (the caller offsets the result by the compartment
 /// centre). A sphere is centred at the origin; a capsule's medial segment runs
@@ -21,7 +32,7 @@ use rand::Rng;
 #[derive(Debug, Clone, Copy)]
 pub enum CellShape {
     Sphere { radius: f32 },
-    Capsule { half_len: f32, radius: f32, axis: Vector3<f32> },
+    Capsule { half_len: f32, radius: f32, axis: Vector3<f32>, septum: Option<Septum> },
 }
 
 impl CellShape {
@@ -37,10 +48,11 @@ impl CellShape {
     pub fn inset(&self, margin: f32) -> CellShape {
         match *self {
             CellShape::Sphere { radius } => CellShape::Sphere { radius: (radius - margin).max(0.0) },
-            CellShape::Capsule { half_len, radius, axis } => CellShape::Capsule {
+            CellShape::Capsule { half_len, radius, axis, septum } => CellShape::Capsule {
                 half_len: (half_len - margin).max(0.0),
                 radius: (radius - margin).max(0.0),
                 axis,
+                septum, // depth is a fraction → scales automatically with reduced radius
             },
         }
     }
@@ -58,9 +70,24 @@ impl CellShape {
         }
     }
 
+    /// Allowed radial distance from the medial axis at point `p`.
+    /// For a plain capsule or sphere this is the constant `cap_radius()`.
+    /// For a septum-aware capsule the cylinder region is tapered by a
+    /// Gaussian dip: `radius * (1 - depth * exp(-(axial/width)²))`;
+    /// end-caps are always at the full `radius`.
+    fn effective_radius_at(&self, p: &Point3<f32>) -> f32 {
+        if let CellShape::Capsule { half_len, radius, axis, septum: Some(sep) } = *self {
+            let axial = p.coords.dot(&axis);
+            if axial.abs() <= half_len {
+                return radius * (1.0 - sep.depth * (-(axial / sep.width).powi(2)).exp());
+            }
+        }
+        self.cap_radius()
+    }
+
     /// Is `p` (origin-relative) inside the envelope?
     pub fn contains(&self, p: &Point3<f32>) -> bool {
-        (p - self.medial(p)).norm() <= self.cap_radius()
+        (p - self.medial(p)).norm() <= self.effective_radius_at(p)
     }
 
     pub(crate) fn cap_radius(&self) -> f32 {
@@ -758,7 +785,7 @@ mod tests {
 
     #[test]
     fn rna_strand_roots_at_given_point_and_stays_inside() {
-        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x() };
+        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x(), septum: None };
         let root = Point3::new(-200.0, 50.0, 0.0);
         let mut rng = rng_from(3);
         let strand = generate_rna_strand(root, 60, 18.0, 4.0, shape, &mut rng);
@@ -781,7 +808,7 @@ mod tests {
         assert_eq!(s.inset(10.0).reach(), 90.0);
 
         // Capsule along x: half_len 700, radius 400 (the ecoli_starter cell).
-        let c = CellShape::Capsule { half_len: 700.0, radius: 400.0, axis: Vector3::x() };
+        let c = CellShape::Capsule { half_len: 700.0, radius: 400.0, axis: Vector3::x(), septum: None };
         // On-axis beyond the cylinder but within a cap:
         assert!(c.contains(&Point3::new(700.0, 0.0, 399.0)));
         assert!(!c.contains(&Point3::new(700.0, 0.0, 401.0)));
@@ -819,7 +846,7 @@ mod tests {
     fn fiber_confined_to_capsule() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
         let (half_len, radius, step, bead) = (700.0_f32, 400.0_f32, 22.0_f32, 10.0_f32);
-        let shape = CellShape::Capsule { half_len, radius, axis: Vector3::x() };
+        let shape = CellShape::Capsule { half_len, radius, axis: Vector3::x(), septum: None };
         let pts = generate_fiber(shape, 2000, step, bead, &mut rng);
         assert!(pts.len() > 1000, "placed only {} beads", pts.len());
         let inset = shape.inset(bead);
@@ -871,6 +898,7 @@ mod tests {
             half_len: 4000.0,
             radius: 2500.0,
             axis: Vector3::x(),
+            septum: None,
         };
         // Replicating: forks 40% of the way along each replichore.
         let theta = generate_theta_chromosome(shape, 1200, 0.40, 22.0, 10.0, 80.0, 100.0, &mut rng);
@@ -946,7 +974,7 @@ mod tests {
     fn nucleoid_confined_to_capsule() {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(5);
         // E. coli-ish rod: 2 µm × 0.8 µm in Å.
-        let shape = CellShape::Capsule { half_len: 7000.0, radius: 4000.0, axis: Vector3::x() };
+        let shape = CellShape::Capsule { half_len: 7000.0, radius: 4000.0, axis: Vector3::x(), septum: None };
         let (step, bead, scr, pitch) = (22.0_f32, 10.0_f32, 80.0_f32, 120.0_f32);
         let pts = generate_nucleoid(shape, &vec![300; 60], step, bead, scr, pitch, &mut rng);
         assert!(pts.len() > 6000, "placed only {} beads", pts.len());
@@ -957,6 +985,56 @@ mod tests {
         let xext = pts.iter().map(|p| p.x).fold(f32::MIN, f32::max)
             - pts.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         assert!(xext > shape.cap_radius(), "nucleoid should fill the rod, x-extent {xext}");
+    }
+
+    #[test]
+    fn capsule_with_septum_tapers_at_midcell() {
+        // Capsule along x: half_len 400, radius 120, depth 0.6, width 30.
+        // Effective radius at midcell = 120*(1-0.6*exp(0)) = 48.
+        let shape = CellShape::Capsule {
+            half_len: 400.0,
+            radius: 120.0,
+            axis: Vector3::x(),
+            septum: Some(Septum { depth: 0.6, width: 30.0 }),
+        };
+
+        // Midcell (axial=0), radial 80: 80 > 48 → outside.
+        let p_mid_80 = Point3::new(0.0, 80.0, 0.0);
+        assert!(!shape.contains(&p_mid_80),
+            "radial=80 > eff_r=48 at midcell → outside");
+
+        // Midcell, radial 40: 40 < 48 → inside.
+        let p_mid_40 = Point3::new(0.0, 40.0, 0.0);
+        assert!(shape.contains(&p_mid_40),
+            "radial=40 < eff_r=48 at midcell → inside");
+
+        // Cap region (axial=480 > half_len=400), radial 80: caps unaffected → inside.
+        let p_cap = Point3::new(480.0, 80.0, 0.0);
+        assert!(shape.contains(&p_cap),
+            "cap region unaffected by septum: radial=80 < radius=120");
+
+        // Without septum: midcell radial=80 → inside (80 < 120).
+        let no_septum = CellShape::Capsule {
+            half_len: 400.0, radius: 120.0, axis: Vector3::x(), septum: None,
+        };
+        assert!(no_septum.contains(&p_mid_80),
+            "no septum → full radius, radial=80 inside");
+
+        // inset(10) carries septum: radius→110, depth still 0.6 → eff_r=110*(1-0.6)=44.
+        let inset = shape.inset(10.0);
+        match inset {
+            CellShape::Capsule { radius, septum: Some(s), .. } => {
+                assert!((radius - 110.0).abs() < 1e-3, "inset radius should be 110");
+                assert!((s.depth - 0.6).abs() < 1e-3, "inset carries septum depth");
+            }
+            _ => panic!("inset should return Capsule with Some(Septum)"),
+        }
+        // Confirm inset midcell boundary near eff_r≈44 (110*(1-0.6)=43.999… in f32).
+        // Use values clearly inside/outside to avoid floating-point boundary ambiguity.
+        let p_mid_43 = Point3::new(0.0, 43.0, 0.0);
+        let p_mid_45 = Point3::new(0.0, 45.0, 0.0);
+        assert!(inset.contains(&p_mid_43), "inset midcell r=43 inside (eff_r≈44)");
+        assert!(!inset.contains(&p_mid_45), "inset midcell r=45 outside (eff_r≈44)");
     }
 
     #[test]

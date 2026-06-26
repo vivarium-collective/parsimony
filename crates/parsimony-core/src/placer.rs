@@ -82,7 +82,7 @@ fn subdivide(
         return (shape, nalgebra::Vector3::zeros());
     }
     match shape {
-        CellShape::Capsule { half_len, radius, axis } => {
+        CellShape::Capsule { half_len, radius, axis, .. } => {
             // n daughters: centre each chromosome's COM at its soon-to-be
             // daughter's centre — the midpoint of that half of the cell,
             // ≈ ±reach/2 along the long axis (reach = half_len + radius =
@@ -96,7 +96,8 @@ fn subdivide(
             let t = -0.5 * reach + reach * (k as f32) / ((n - 1) as f32);
             let sub_half = (0.5 * reach / n as f32).max(radius * 0.3);
             let sub_radius = radius * 0.7;
-            (CellShape::Capsule { half_len: sub_half, radius: sub_radius, axis }, axis * t)
+            // Sub-capsules cover pole regions only — no septum on daughter sub-shapes.
+            (CellShape::Capsule { half_len: sub_half, radius: sub_radius, axis, septum: None }, axis * t)
         }
         CellShape::Sphere { radius } => {
             let spread = radius * 0.55;
@@ -1591,7 +1592,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                         .try_normalize(1e-6)
                         .unwrap_or_else(nalgebra::Vector3::x);
                     let center = Point3::from((a.coords + b.coords) * 0.5);
-                    (center, CellShape::Capsule { half_len, radius: *radius, axis })
+                    (center, CellShape::Capsule { half_len, radius: *radius, axis, septum: None })
                 }
                 CompartmentKind::Box(aabb) => {
                     (aabb.center(), CellShape::Sphere { radius: aabb.half_extents().min() })
@@ -1600,6 +1601,9 @@ impl<'a> GreedyRandomPlacer<'a> {
                     // Treat an elongated mesh (e.g. a constricted-capsule cell)
                     // as a capsule along its longest axis, so chromosomes still
                     // segregate pole-to-pole instead of collapsing to a sphere.
+                    // When the recipe declares a septum (septum_depth > 0), the
+                    // capsule is made septum-aware so free-mRNA sampling and
+                    // ribosome/peptide confinement honour the real pinched waist.
                     let he = m.aabb.half_extents();
                     let ext = [he.x, he.y, he.z];
                     let long_i = (0..3)
@@ -1616,7 +1620,15 @@ impl<'a> GreedyRandomPlacer<'a> {
                         1 => nalgebra::Vector3::y(),
                         _ => nalgebra::Vector3::z(),
                     };
-                    (m.aabb.center(), CellShape::Capsule { half_len, radius, axis })
+                    let septum = if chr.septum_depth > 0.0 {
+                        Some(crate::fiber::Septum {
+                            depth: chr.septum_depth,
+                            width: chr.septum_width.max(1.0),
+                        })
+                    } else {
+                        None
+                    };
+                    (m.aabb.center(), CellShape::Capsule { half_len, radius, axis, septum })
                 }
             };
             return Some((center, shape));
@@ -2597,7 +2609,7 @@ mod tests {
                     .try_normalize(1e-6)
                     .unwrap_or_else(nalgebra::Vector3::x);
                 let center = Point3::from((a.coords + b.coords) * 0.5);
-                return (center, CellShape::Capsule { half_len, radius: *radius, axis });
+                return (center, CellShape::Capsule { half_len, radius: *radius, axis, septum: None });
             }
         }
         panic!("first_capsule_cell: no capsule compartment found in recipe");
@@ -2961,6 +2973,7 @@ mod tests {
             half_len,
             radius: 80.0,
             axis: Vector3::x(),
+            septum: None,
         };
         for p in &all_beads {
             assert!(

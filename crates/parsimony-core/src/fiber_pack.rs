@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn bound_proteins_stay_inside_the_cell_envelope() {
         use crate::fiber::CellShape;
-        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x() };
+        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x(), septum: None };
         // A fiber hugging the wall (y ~ +radius), where a naive outward offset escapes.
         let fiber: Vec<Point3<f32>> = (0..40)
             .map(|i| Point3::new(-300.0 + i as f32 * 15.0, 115.0, 0.0))
@@ -429,7 +429,7 @@ mod tests {
         // cap radius (radius - proxy) is degenerate, so confinement frequently
         // fails. The guarantee: every protein that IS placed sits inside the
         // inset envelope — none is ever placed outside (it's skipped instead).
-        let shape = CellShape::Capsule { half_len: 30.0, radius: 30.0, axis: Vector3::x() };
+        let shape = CellShape::Capsule { half_len: 30.0, radius: 30.0, axis: Vector3::x(), septum: None };
         let proxy = 28.0_f32;
         let fiber: Vec<Point3<f32>> = (0..20)
             .map(|i| Point3::new(-20.0 + i as f32 * 2.0, 29.0, 0.0))

@@ -511,7 +511,7 @@ fn chrom_cell_shape(recipe: &Recipe, compartment: Option<&str>) -> crate::fiber:
                 let axis = axis_v
                     .try_normalize(1e-6)
                     .unwrap_or_else(nalgebra::Vector3::x);
-                CellShape::Capsule { half_len, radius: *radius, axis }
+                CellShape::Capsule { half_len, radius: *radius, axis, septum: None }
             }
             _ => CellShape::Sphere { radius: 1e9 },
         };
