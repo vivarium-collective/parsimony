@@ -1179,6 +1179,36 @@ impl<'a> GreedyRandomPlacer<'a> {
                 is_mrna: rna.is_mRNA,
                 is_free: rna.is_free,
             });
+            // BF1-3: daughter-domain nascent RNA also appears on the sister
+            // (bubble) strand at its bubble-relative position. Represents the
+            // physical copy of the transcript being synthesised on the replicated
+            // arm. Free strands and domain-0 entries are NOT overlaid:
+            //   - domain-0 RNAs transcribe from the pre-replication chromosome
+            //     (one chromosome, one transcript, no sister).
+            //   - Free RNAs are placed at random interior positions and have no
+            //     genomic locus to map onto the bubble.
+            if !rna.is_free && rna.root_domain != 0 && strands.len() > 1 {
+                if let Some((bubble_root, _)) = bubble_point(
+                    &strands[strands.len() - 1],
+                    rna.root_coordinate,
+                    chr.fork_fraction,
+                    glen,
+                ) {
+                    let points = crate::fiber::generate_rna_strand(
+                        bubble_root,
+                        bead_count,
+                        rna_step,
+                        rna_bead_radius,
+                        shape,
+                        rng,
+                    );
+                    snapshot.rna_strands.push(crate::placement::RnaStrand {
+                        points,
+                        is_mrna: rna.is_mRNA,
+                        is_free: false,
+                    });
+                }
+            }
         }
         // Seat the chromosome landmark molecules: the replisome at each fork,
         // oriC at each origin, terC at the terminus — so they read as real
@@ -2308,12 +2338,14 @@ mod tests {
         assert_eq!(rnaps.len(), 1, "domain-0 RNAP must produce exactly one placement (no bubble overlay)");
     }
 
-    /// A nascent RNA rooted at a daughter-domain RNAP must emanate from the MAIN
-    /// contour (where the RNAP now sits), not the sister bulge — otherwise the
-    /// transcript is visually disconnected from its polymerase.
+    /// BF1-3: a domain-2 nascent RNA yields TWO strands — one rooted on the main
+    /// chromosome contour (strand 0) and a second on the sister (bubble) strand.
+    /// The original single-strand assertion is replaced: we now verify that one
+    /// root is ≤ 30 Å from the main locus and one is ≤ 30 Å from the bubble
+    /// locus, both computed in world space (center + center-relative coords).
     #[test]
     fn nascent_rna_roots_on_main_contour_like_its_rnap() {
-        let coord = 0_i64; // oriC
+        let coord = 0_i64; // oriC — where main and sister diverge most
         let json = format!(
             r#"{{
                 "bounding_box": [[-500,-500,-500],[500,500,500]],
@@ -2336,17 +2368,63 @@ mod tests {
         let recipe = Recipe::from_json_str(&json).unwrap();
         let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
         let (center, _shape) = first_capsule_cell(&recipe);
-        assert_eq!(out.snapshot.rna_strands.len(), 1);
-        let root = out.snapshot.rna_strands[0].points[0];
+        let rna_strands = &out.snapshot.rna_strands;
+        // BF1-3: domain-2 nascent RNA now yields TWO strands (main + bubble).
+        assert_eq!(rna_strands.len(), 2, "domain-2 nascent RNA must yield 2 strands (main + bubble overlay)");
         let strands = &out.snapshot.chromosome.as_ref().unwrap().strands;
         let main_world = center + strand_point(strands, 0, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
-        let sister_world = center + strand_point(strands, 2, coord, GENOME_BP_DEFAULT).unwrap().0.coords;
-        let world_root = center + root.coords;
-        let d_main = (world_root - main_world).norm();
-        let d_sister = (world_root - sister_world).norm();
-        assert!(
-            d_main < d_sister,
-            "nascent RNA must root on the main contour like its RNAP (d_main={d_main}, d_sister={d_sister})"
+        let bub_world = center
+            + bubble_point(strands.last().unwrap(), coord, 0.45, GENOME_BP_DEFAULT)
+                .unwrap()
+                .0
+                .coords;
+        let near_main = rna_strands
+            .iter()
+            .any(|s| (center + s.points[0].coords - main_world).norm() < 30.0);
+        let near_bub = rna_strands
+            .iter()
+            .any(|s| (center + s.points[0].coords - bub_world).norm() < 30.0);
+        assert!(near_main, "one RNA strand must root ≤ 30 Å from the main locus");
+        assert!(near_bub, "one RNA strand must root ≤ 30 Å from the bubble locus");
+    }
+
+    /// BF1-3: overlay rules — domain-2 nascent → 2 strands; domain-0 nascent
+    /// → 1 strand (no overlay); free RNA (`is_free=true`) → 1 strand (no overlay).
+    #[test]
+    fn daughter_rna_overlaid_on_bubble() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {"rna_segment": {"type": "single_sphere", "radius": 4}},
+            "composition": {
+                "space": {"regions": {"interior": ["cell"]}},
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-150,0,0], "b": [150,0,0], "radius": 80},
+                    "regions": {"interior": []}
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "n_chromosomes": 1, "fork_fraction": 0.45,
+                "rna_segment": "rna_segment", "rna_angstrom_per_nt": 2.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 2, "length_nt": 400, "is_mRNA": true},
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 400, "is_mRNA": true},
+                    {"root_coordinate": 0, "root_domain": 2, "length_nt": 400, "is_mRNA": true, "is_free": true}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(3);
+        // domain-2 nascent = 2 strands (main + bubble)
+        // domain-0 nascent = 1 strand (no overlay)
+        // free RNA         = 1 strand (no overlay, regardless of domain)
+        // Total            = 4
+        assert_eq!(
+            out.snapshot.rna_strands.len(),
+            4,
+            "expected 4 rna_strands: 2 from domain-2 nascent + 1 from domain-0 + 1 free; \
+             got {}",
+            out.snapshot.rna_strands.len()
         );
     }
 
