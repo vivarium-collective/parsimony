@@ -110,6 +110,12 @@ struct RawChromosome {
     /// Ingredient name instanced at each explicit ribosome position.
     #[serde(default)]
     ribosome_marker: Option<String>,
+    /// Ingredient name instanced as each nascent peptide coil mesh.
+    #[serde(default)]
+    peptide_segment: Option<String>,
+    /// Ångströms per amino acid for peptide contour length (default 3.0 when absent).
+    #[serde(default)]
+    peptide_angstrom_per_aa: Option<f32>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -398,6 +404,10 @@ pub struct ChromosomeSpec {
     pub rna_segment_free: Option<String>,
     /// Ångströms per nucleotide (strand contour length scale); default 2.0.
     pub rna_angstrom_per_nt: f32,
+    /// Ingredient name instanced as each nascent peptide coil mesh, if any.
+    pub peptide_segment: Option<String>,
+    /// Ångströms per amino acid for peptide contour length; default 3.0.
+    pub peptide_angstrom_per_aa: f32,
 }
 
 /// A single explicit RNA polymerase placement from the recipe.
@@ -850,6 +860,8 @@ fn resolve(
             ribosome_marker: c.ribosome_marker,
             rna_segment_free: c.rna_segment_free,
             rna_angstrom_per_nt: c.rna_angstrom_per_nt.unwrap_or(2.0),
+            peptide_segment: c.peptide_segment,
+            peptide_angstrom_per_aa: c.peptide_angstrom_per_aa.unwrap_or(3.0),
         }),
     })
 }

@@ -82,6 +82,10 @@ pub struct Snapshot {
     /// One entry per `RnaSpec`, in recipe order, center-relative.
     #[serde(default)]
     pub rna_strands: Vec<RnaStrand>,
+    /// Nascent peptide coils grown from ribosomes with `peptide_length > 0`.
+    /// One entry per such ribosome, in recipe order, center-relative.
+    #[serde(default)]
+    pub peptide_strands: Vec<Vec<Point3<f32>>>,
 }
 
 impl Snapshot {
@@ -92,6 +96,7 @@ impl Snapshot {
             placements: Vec::new(),
             chromosome: None,
             rna_strands: Vec::new(),
+            peptide_strands: Vec::new(),
         }
     }
 }

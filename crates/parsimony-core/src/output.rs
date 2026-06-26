@@ -314,6 +314,38 @@ pub fn write_pack_json(snapshot: &Snapshot, recipe: &Recipe) -> Value {
         }
     }
 
+    // Nascent-peptide coils: tile the `peptide_segment` mesh along each strand,
+    // mirroring the rna_segment block above.  Points are center-relative (same
+    // frame as rna_strands); add the chromosome center for world coordinates.
+    // seg_step = 30.0 Å (one segment per bead, matching the peptide bead spacing);
+    // twist = 0.0 (unstructured coil, no helical twist).
+    if !snapshot.peptide_strands.is_empty() {
+        let chrom = recipe.chromosome.as_ref();
+        let pep_seg = chrom
+            .and_then(|c| c.peptide_segment.as_ref())
+            .and_then(|n| recipe.ingredients.get_index_of(n));
+        if let Some(pep_seg_id) = pep_seg {
+            let center = snapshot
+                .chromosome
+                .as_ref()
+                .map(|c| c.center)
+                .unwrap_or(nalgebra::Point3::origin());
+            let seg_step = 30.0_f32;
+            for strand in &snapshot.peptide_strands {
+                let world: Vec<_> = strand.iter().map(|p| center + p.coords).collect();
+                for (pos, rot) in crate::fiber::dna_segment_transforms(&world, seg_step, 0.0) {
+                    placements.push(json!({
+                        "uid": placements.len() as u64,
+                        "ingredient": pep_seg_id as u64,
+                        "compartment": 0,
+                        "position": [pos.x, pos.y, pos.z],
+                        "rotation": [rot.w, rot.i, rot.j, rot.k],
+                    }));
+                }
+            }
+        }
+    }
+
     // Cache-busting token for the viewer's IndexedDB mesh cache: a fresh value
     // each write, so regenerating the pack/meshes invalidates cached geometry
     // (which is keyed by URL and would otherwise serve stale meshes).
@@ -694,6 +726,48 @@ mod tests {
         // Both nascent and free strands tile rna_segment (no free-specific ingredient)
         assert!(n > 20,
             "expected both strands tiled via rna_segment fallback, got {n} placements");
+    }
+
+    /// C2-1: `write_pack_json` tiles `peptide_segment` along each peptide strand
+    /// in `snapshot.peptide_strands`, emitting at least one placement per strand.
+    #[test]
+    fn emits_peptide_segment_placements_for_peptide_strands() {
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome":    { "type": "single_sphere", "radius": 120 },
+                "peptide_segment": { "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "peptide_segment": "peptide_segment",
+                "peptide_angstrom_per_aa": 3.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 200}
+                ]
+            }
+        }"#;
+        let recipe = crate::recipe::Recipe::from_json_str(json).expect("recipe parse failed");
+        let placer = GreedyRandomPlacer::new(&recipe, PlacerConfig::default());
+        let out = placer.pack(42);
+        let pack = write_pack_json(&out.snapshot, &recipe);
+        let seg_id = recipe.ingredients.get_index_of("peptide_segment").unwrap();
+        let n = pack["placements"].as_array().unwrap().iter()
+            .filter(|p| p["ingredient"].as_u64() == Some(seg_id as u64))
+            .count();
+        assert!(n > 0, "expected peptide_segment placements, got {n}");
     }
 
     #[test]

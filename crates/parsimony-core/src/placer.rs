@@ -1277,9 +1277,9 @@ impl<'a> GreedyRandomPlacer<'a> {
                         .filter(|(_, s)| s.unique_index != 0)
                         .map(|(i, s)| (s.unique_index, i))
                         .collect();
-                    // Collect ribosome world positions; count those without a strand.
+                    // Collect ribosome world positions and peptide lengths; count those without a strand.
                     let mut dropped = 0usize;
-                    let ribo_positions: Vec<Point3<f32>> = chr
+                    let ribo_positions: Vec<(Point3<f32>, i64)> = chr
                         .ribosomes
                         .iter()
                         .filter_map(|ribo| {
@@ -1320,7 +1320,7 @@ impl<'a> GreedyRandomPlacer<'a> {
                                 let m = inset.medial(&pos_raw);
                                 if inset.contains(&m) { m } else { center }
                             });
-                            Some(pos)
+                            Some((pos, ribo.peptide_length))
                         })
                         .collect();
                     if dropped > 0 {
@@ -1330,7 +1330,11 @@ impl<'a> GreedyRandomPlacer<'a> {
                         );
                     }
                     // Push placements after releasing the rna_strands borrow.
-                    for pos in ribo_positions {
+                    // C2-1: for ribosomes with peptide_length > 0, also grow a
+                    // confined coil from the ribosome world position.
+                    let pep_step: f32 = 30.0;
+                    let pep_bead_radius: f32 = 3.0;
+                    for (pos, peptide_length) in ribo_positions {
                         snapshot.placements.push(Placement {
                             instance_uid: *next_uid,
                             ingredient_id: ribo_idx as u32,
@@ -1340,6 +1344,24 @@ impl<'a> GreedyRandomPlacer<'a> {
                             rotation: UnitQuaternion::identity(),
                         });
                         *next_uid += 1;
+                        // Grow a nascent-peptide coil from this ribosome's world
+                        // position.  Root is center-relative (strands frame).
+                        if peptide_length > 0 {
+                            let bead_count = ((peptide_length as f32 * chr.peptide_angstrom_per_aa)
+                                / pep_step)
+                                .round() as usize;
+                            let bead_count = bead_count.max(2);
+                            let root_rel = Point3::from(pos.coords - center.coords);
+                            let points = crate::fiber::generate_rna_strand(
+                                root_rel,
+                                bead_count,
+                                pep_step,
+                                pep_bead_radius,
+                                shape,
+                                rng,
+                            );
+                            snapshot.peptide_strands.push(points);
+                        }
                     }
                 }
             }
@@ -3284,6 +3306,94 @@ mod tests {
             dist < 3.0 * ribo_r,
             "ribosome too far from mRNA midpoint bead: dist={:.1} Å, threshold={:.1} Å",
             dist, 3.0 * ribo_r
+        );
+    }
+
+    /// C2-1: a ribosome with `peptide_length > 0` generates one peptide_strand;
+    /// a ribosome with `peptide_length == 0` generates none.
+    #[test]
+    fn peptide_coil_grown_only_for_positive_peptide_length() {
+        let json = r#"{
+            "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+            "objects": {
+                "70S_ribosome":   { "type": "single_sphere", "radius": 120 },
+                "peptide_segment": { "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "ribosome_marker": "70S_ribosome",
+                "peptide_segment": "peptide_segment",
+                "peptide_angstrom_per_aa": 3.0,
+                "rnas": [
+                    {"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                     "is_mRNA": true, "is_free": true, "unique_index": 20}
+                ],
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": 200},
+                    {"mRNA_index": 20, "pos_on_mRNA": 0,   "peptide_length": 0}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+        assert_eq!(
+            out.snapshot.peptide_strands.len(), 1,
+            "expected exactly 1 peptide strand (only peptide_length>0), got {}",
+            out.snapshot.peptide_strands.len()
+        );
+        assert!(
+            out.snapshot.peptide_strands[0].len() >= 2,
+            "peptide strand must have at least 2 beads"
+        );
+    }
+
+    /// C2-1: a longer peptide_length yields more beads than a shorter one.
+    #[test]
+    fn longer_peptide_grows_more_beads() {
+        let make_recipe = |peptide_length: i64| -> Recipe {
+            let json = format!(r#"{{
+                "bounding_box": [[-3000,-3000,-3000],[3000,3000,3000]],
+                "objects": {{
+                    "70S_ribosome":    {{ "type": "single_sphere", "radius": 120 }},
+                    "peptide_segment": {{ "type": "single_sphere", "radius": 3.0, "color": [0.4, 0.8, 0.6] }}
+                }},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{"kind": "capsule", "a": [-1500,0,0], "b": [1500,0,0], "radius": 1000}},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                    "ribosome_marker": "70S_ribosome",
+                    "peptide_segment": "peptide_segment",
+                    "peptide_angstrom_per_aa": 3.0,
+                    "rnas": [
+                        {{"root_coordinate": 0, "root_domain": 0, "length_nt": 600,
+                          "is_mRNA": true, "is_free": true, "unique_index": 20}}
+                    ],
+                    "ribosomes": [
+                        {{"mRNA_index": 20, "pos_on_mRNA": 300, "peptide_length": {peptide_length}}}
+                    ]
+                }}
+            }}"#);
+            Recipe::from_json_str(&json).expect("parse failed")
+        };
+        let out_short = GreedyRandomPlacer::new(&make_recipe(200), PlacerConfig::default()).pack(42);
+        let out_long  = GreedyRandomPlacer::new(&make_recipe(600), PlacerConfig::default()).pack(42);
+        let beads_short = out_short.snapshot.peptide_strands.first().map_or(0, |s| s.len());
+        let beads_long  = out_long.snapshot.peptide_strands.first().map_or(0, |s| s.len());
+        assert!(
+            beads_long > beads_short,
+            "longer peptide should produce more beads: short={beads_short} long={beads_long}"
         );
     }
 }

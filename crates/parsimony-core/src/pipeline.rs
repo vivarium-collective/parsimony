@@ -326,6 +326,7 @@ impl Pipeline {
                 merged.chromosome = snap.chromosome;
             }
             merged.rna_strands.extend(snap.rna_strands);
+            merged.peptide_strands.extend(snap.peptide_strands);
         }
 
         Ok(PipelineRun {
