@@ -1216,6 +1216,8 @@ impl<'a> GreedyRandomPlacer<'a> {
                 points,
                 is_mrna: rna.is_mRNA,
                 is_free: rna.is_free,
+                unique_index: rna.unique_index,
+                length_nt: rna.length_nt,
             });
             // BF2-3: daughter-domain nascent RNA also appears on chromosome
             // rna_g's OWN sister (replication bubble) strand.  Free strands and
@@ -1242,6 +1244,8 @@ impl<'a> GreedyRandomPlacer<'a> {
                                 points,
                                 is_mrna: rna.is_mRNA,
                                 is_free: false,
+                                unique_index: rna.unique_index,
+                                length_nt: rna.length_nt,
                             });
                         }
                     }
@@ -3082,5 +3086,33 @@ mod tests {
              (threshold = {max_allowed} = max(⌈0.3 %×{n}⌉, 2)); \
              medial-axis clamping is likely still active",
         );
+    }
+
+    /// C1-2: RnaStrand carries `unique_index` and `length_nt` from the RnaSpec.
+    #[test]
+    fn rna_strand_carries_unique_index_and_length_nt() {
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {"kind": "capsule", "a": [-150, 0, 0], "b": [150, 0, 0], "radius": 80},
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 1000, "spacing": 10.0, "bead_radius": 5.0, "compartment": "cell",
+                "rnas": [{"root_coordinate": 100000, "root_domain": 0, "length_nt": 400,
+                           "is_mRNA": true, "unique_index": 20}]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).expect("parse failed");
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        assert_eq!(out.snapshot.rna_strands.len(), 1);
+        assert_eq!(out.snapshot.rna_strands[0].unique_index, 20,
+            "unique_index not carried onto RnaStrand");
+        assert_eq!(out.snapshot.rna_strands[0].length_nt, 400,
+            "length_nt not carried onto RnaStrand");
     }
 }

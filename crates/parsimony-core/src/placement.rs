@@ -19,6 +19,14 @@ pub struct RnaStrand {
     /// `true` = free (released) transcript seeded in the cytoplasm; `false` =
     /// nascent transcript rooted at its RNAP. Selects the render segment.
     pub is_free: bool,
+    /// Unique integer identity of this RNA (mirrors the simulation's `unique_index`).
+    /// 0 when absent (pre-C1-2 snapshots).
+    #[serde(default)]
+    pub unique_index: i64,
+    /// Transcript length in nucleotides (mirrors `RnaSpec::length_nt`).
+    /// 0 when absent (pre-C1-2 snapshots).
+    #[serde(default)]
+    pub length_nt: i64,
 }
 
 /// Stable handle for an ingredient variant within an ingredient family.

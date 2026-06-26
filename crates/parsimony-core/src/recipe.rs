@@ -104,6 +104,12 @@ struct RawChromosome {
     /// Ångströms per nucleotide for extended strand length (default 2.0 when absent).
     #[serde(default)]
     rna_angstrom_per_nt: Option<f32>,
+    /// Explicit ribosome placements (mRNA index, position on mRNA, peptide length).
+    #[serde(default)]
+    ribosomes: Vec<RawRibosome>,
+    /// Ingredient name instanced at each explicit ribosome position.
+    #[serde(default)]
+    ribosome_marker: Option<String>,
 }
 
 /// Superhelix parameters for a plectonemically supercoiled chromosome.
@@ -162,6 +168,22 @@ struct RawRna {
     /// Absent in pre-BF2 snapshots — defaults to `false`.
     #[serde(default)]
     is_daughter: bool,
+    /// Unique integer identity of this RNA (mirrors the simulation's `unique_index`).
+    /// 0 when absent (backward compat).
+    #[serde(default)]
+    unique_index: i64,
+}
+
+/// Raw explicit ribosome placement from the recipe (mirrors [`RibosomeSpec`]).
+#[allow(non_snake_case)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRibosome {
+    /// `unique_index` of the mRNA this ribosome is translating.
+    mRNA_index: i64,
+    /// Position of the ribosome along the mRNA in nucleotides (from 5' end).
+    pos_on_mRNA: i64,
+    /// Nascent peptide length in amino acids.
+    peptide_length: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +389,10 @@ pub struct ChromosomeSpec {
     pub rnas: Vec<RnaSpec>,
     /// Ingredient name instanced as each RNA strand mesh, if any.
     pub rna_segment: Option<String>,
+    /// Explicit ribosome placements derived from recipe `ribosomes` list.
+    pub ribosomes: Vec<RibosomeSpec>,
+    /// Ingredient name instanced at each explicit ribosome position, if any.
+    pub ribosome_marker: Option<String>,
     /// Ingredient name for free (released) mRNA strands; falls back to
     /// `rna_segment` when absent.
     pub rna_segment_free: Option<String>,
@@ -411,6 +437,21 @@ pub struct RnaSpec {
     /// `true` when the transcribing RNAP is on a replicated (daughter) copy.
     /// `false` by default (absent from pre-BF2 recipes).
     pub is_daughter: bool,
+    /// Unique integer identity of this RNA (mirrors the simulation's `unique_index`).
+    /// 0 when absent from the recipe (backward compat).
+    pub unique_index: i64,
+}
+
+/// A single explicit ribosome placement from the recipe.
+#[allow(non_snake_case)]
+#[derive(Debug, Clone)]
+pub struct RibosomeSpec {
+    /// `unique_index` of the mRNA strand this ribosome is translating.
+    pub mRNA_index: i64,
+    /// Position along the mRNA in nucleotides (from 5' end of the transcript).
+    pub pos_on_mRNA: i64,
+    /// Nascent peptide length in amino acids.
+    pub peptide_length: i64,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -793,9 +834,20 @@ fn resolve(
                     is_free: r.is_free,
                     chromosome_index: r.chromosome_index,
                     is_daughter: r.is_daughter,
+                    unique_index: r.unique_index,
                 })
                 .collect(),
             rna_segment: c.rna_segment,
+            ribosomes: c
+                .ribosomes
+                .into_iter()
+                .map(|r| RibosomeSpec {
+                    mRNA_index: r.mRNA_index,
+                    pos_on_mRNA: r.pos_on_mRNA,
+                    peptide_length: r.peptide_length,
+                })
+                .collect(),
+            ribosome_marker: c.ribosome_marker,
             rna_segment_free: c.rna_segment_free,
             rna_angstrom_per_nt: c.rna_angstrom_per_nt.unwrap_or(2.0),
         }),
@@ -1621,5 +1673,56 @@ mod tests {
         // Second entry: absent keys → defaults.
         assert_eq!(chr.rnas[1].chromosome_index, 0);
         assert!(!chr.rnas[1].is_daughter);
+    }
+
+    #[test]
+    fn rna_unique_index_parsed_from_recipe_json() {
+        // unique_index field on an rna entry is resolved onto RnaSpec.
+        // Absent unique_index defaults to 0 (backward compat).
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {"space": {"regions": {"interior": []}}},
+            "chromosome": {
+                "beads": 1000, "spacing": 135, "bead_radius": 12, "compartment": "space",
+                "rna_segment": "rna_segment",
+                "rnas": [
+                    {"root_coordinate": 100000, "root_domain": 0, "length_nt": 850,
+                     "is_mRNA": true, "unique_index": 20},
+                    {"root_coordinate": 200000, "root_domain": 0, "length_nt": 400,
+                     "is_mRNA": false}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let chr = recipe.chromosome.as_ref().unwrap();
+        assert_eq!(chr.rnas.len(), 2);
+        assert_eq!(chr.rnas[0].unique_index, 20);
+        // Absent unique_index → default 0.
+        assert_eq!(chr.rnas[1].unique_index, 0);
+    }
+
+    #[test]
+    fn ribosomes_parsed_from_recipe_json() {
+        // ribosome_marker + ribosomes block resolve onto ChromosomeSpec.
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {"space": {"regions": {"interior": []}}},
+            "chromosome": {
+                "beads": 1000, "spacing": 135, "bead_radius": 12, "compartment": "space",
+                "ribosome_marker": "70S_ribosome",
+                "ribosomes": [
+                    {"mRNA_index": 20, "pos_on_mRNA": 0, "peptide_length": 0}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let chr = recipe.chromosome.as_ref().unwrap();
+        assert_eq!(chr.ribosome_marker.as_deref(), Some("70S_ribosome"));
+        assert_eq!(chr.ribosomes.len(), 1);
+        assert_eq!(chr.ribosomes[0].mRNA_index, 20);
+        assert_eq!(chr.ribosomes[0].pos_on_mRNA, 0);
+        assert_eq!(chr.ribosomes[0].peptide_length, 0);
     }
 }
