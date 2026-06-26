@@ -1042,40 +1042,38 @@ impl<'a> GreedyRandomPlacer<'a> {
         // Constants:
         //   rna_step        = 40.0 Å  — fixed coarse-grain step for nascent RNA beads
         //   rna_bead_radius =  4.0 Å  — thin bead (smaller than DNA to reduce steric load)
-        if !chr.rnas.is_empty() {
-            let glen = genome
-                .as_ref()
-                .map(|g| g.length_bp)
-                .filter(|&l| l > 0)
-                .unwrap_or(GENOME_BP_DEFAULT);
-            // Fixed constants (documented above).
-            let rna_step: f32 = 40.0;
-            let rna_bead_radius: f32 = 4.0;
-            for rna in &chr.rnas {
-                // Bead count: extended contour length / step, clamped to ≥ 2.
-                let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
-                    .round() as usize;
-                let bead_count = bead_count.max(2);
-                // Root: strand_point returns a center-relative point on the chromosome.
-                // Fall back to the center-relative origin (Point3::origin) on degenerate
-                // inputs so we NEVER drop a spec (1:1 true-abundance constraint).
-                let root = strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
-                    .map(|(p, _)| p)
-                    .unwrap_or_else(Point3::origin);
-                // Grow a confined self-avoiding walk from the root inside `shape`.
-                let points = crate::fiber::generate_rna_strand(
-                    root,
-                    bead_count,
-                    rna_step,
-                    rna_bead_radius,
-                    shape,
-                    rng,
-                );
-                snapshot.rna_strands.push(crate::placement::RnaStrand {
-                    points,
-                    is_mrna: rna.is_mRNA,
-                });
-            }
+        let glen = genome
+            .as_ref()
+            .map(|g| g.length_bp)
+            .filter(|&l| l > 0)
+            .unwrap_or(GENOME_BP_DEFAULT);
+        // Fixed constants (documented above).
+        let rna_step: f32 = 40.0;
+        let rna_bead_radius: f32 = 4.0;
+        for rna in &chr.rnas {
+            // Bead count: extended contour length / step, clamped to ≥ 2.
+            let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
+                .round() as usize;
+            let bead_count = bead_count.max(2);
+            // Root: strand_point returns a center-relative point on the chromosome.
+            // Fall back to the center-relative origin (Point3::origin) on degenerate
+            // inputs so we NEVER drop a spec (1:1 true-abundance constraint).
+            let root = strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
+                .map(|(p, _)| p)
+                .unwrap_or_else(Point3::origin);
+            // Grow a confined self-avoiding walk from the root inside `shape`.
+            let points = crate::fiber::generate_rna_strand(
+                root,
+                bead_count,
+                rna_step,
+                rna_bead_radius,
+                shape,
+                rng,
+            );
+            snapshot.rna_strands.push(crate::placement::RnaStrand {
+                points,
+                is_mrna: rna.is_mRNA,
+            });
         }
         // Seat the chromosome landmark molecules: the replisome at each fork,
         // oriC at each origin, terC at the terminus — so they read as real
@@ -2249,7 +2247,7 @@ mod tests {
             // Root proximity: strand[0] within 30 Å of the strand_point locus.
             // Strands and rna_strands are both center-relative; center=[0,0,0]
             // for this cell so world == center-relative.
-            let (root, _t) = strand_point(strands, 0, coord, 4_641_652)
+            let (root, _t) = strand_point(strands, 0, coord, GENOME_BP_DEFAULT)
                 .expect("strand_point should map every coordinate");
             assert!(
                 (rs.points[0] - root).norm() < 30.0,

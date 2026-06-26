@@ -10,7 +10,7 @@ use crate::ingredient::IngredientId;
 
 /// A single confined nascent-RNA strand produced by `place_chromosome`.
 /// Points are in the same center-relative frame as `Chromosome::strands`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RnaStrand {
     /// Bead positions, center-relative.
     pub points: Vec<Point3<f32>>,
