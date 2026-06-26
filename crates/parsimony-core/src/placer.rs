@@ -906,6 +906,22 @@ impl<'a> GreedyRandomPlacer<'a> {
                 chrom_groups.push(group);
             }
         }
+        // Map chromosome k → (main_strand_idx, sister_strand_idx) in the flat list.
+        // Built before flattening so both the RNAP loop and RNA loop can share it.
+        // For chromosome k, main = its first strand's flat index; sister = the
+        // second strand's index if the group has ≥ 2 strands (theta/replicating),
+        // else None (unreplicated). This avoids hardcoding "2k" — a chromosome
+        // without a sister has only 1 strand in its group.
+        let mut chrom_strand_idx: Vec<(usize, Option<usize>)> = Vec::new();
+        {
+            let mut flat = 0usize;
+            for g in &chrom_groups {
+                let main = flat;
+                let sister = if g.len() >= 2 { Some(flat + 1) } else { None };
+                chrom_strand_idx.push((main, sister));
+                flat += g.len();
+            }
+        }
         // Flat list of every strand, for the rendered chromosome.
         for g in &chrom_groups {
             for s in g {
@@ -1026,17 +1042,25 @@ impl<'a> GreedyRandomPlacer<'a> {
                     let er = ing.shape.enclosing_radius();
                     let inset = shape.inset(er);
                     for rnap in &chr.rnaps {
-                        // Map genomic coordinate → cell-centre-relative position + tangent.
-                        // EVERY RNAP is placed on the MAIN genome contour (strand 0) by
-                        // its coordinate, regardless of `domain_index` — matching the
-                        // v2ecoli `_draw_chromosome` reference ("rim RNAPs: ALL of them,
-                        // regardless of domain"). Additionally, daughter-domain RNAPs
-                        // (`domain_index != 0`) also receive a SECOND placement on the
-                        // sister (replication bubble) strand — the two copies represent
-                        // the biologically distinct positions on each replicated arm.
-                        let Some((strand_pt, tangent)) =
-                            strand_point(&strands, 0, rnap.coordinates, glen)
-                        else {
+                        // BF2-3: route to chromosome_index's OWN main strand, not always 0.
+                        // Clamp to valid range (single-chromosome recipes default to 0).
+                        let g = (rnap.chromosome_index as usize)
+                            .min(chrom_strand_idx.len().saturating_sub(1));
+                        let (main_idx, sister_idx_opt) =
+                            chrom_strand_idx.get(g).copied().unwrap_or((0, None));
+                        // Map genomic coordinate → cell-centre-relative position + tangent
+                        // on chromosome g's main strand.  We pass a 1-element slice so that
+                        // `strand_point` (which selects domain 0 → strand[0]) operates on
+                        // exactly the desired strand — DRY without changing its signature.
+                        let Some(main_strand) = strands.get(main_idx) else {
+                            continue;
+                        };
+                        let Some((strand_pt, tangent)) = strand_point(
+                            std::slice::from_ref(main_strand),
+                            0,
+                            rnap.coordinates,
+                            glen,
+                        ) else {
                             continue;
                         };
                         // Convert to world space (strands are cell-centre-relative).
@@ -1088,17 +1112,24 @@ impl<'a> GreedyRandomPlacer<'a> {
                         place_at(world_pt, tangent);
 
                         // Bubble overlay: daughter RNAPs also appear on the sister
-                        // strand at their bubble-relative position.  Domain 0 = no
-                        // overlay (those RNAPs are on the pre-replication chromosome).
-                        if rnap.domain_index != 0 && strands.len() > 1 {
-                            if let Some((bub_pt, bub_tan)) = bubble_point(
-                                &strands[strands.len() - 1],
-                                rnap.coordinates,
-                                chr.fork_fraction,
-                                glen,
-                            ) {
-                                let bub_world = center + bub_pt.coords;
-                                place_at(bub_world, bub_tan);
+                        // strand at their bubble-relative position.  BF2-3: the
+                        // sister is chromosome g's OWN sister (sister_idx_opt),
+                        // not always the last strand.  Backward-compat: honour
+                        // domain_index != 0 as a pre-BF2 daughter signal alongside
+                        // the new is_daughter flag so existing BF1 tests pass.
+                        if rnap.is_daughter || rnap.domain_index != 0 {
+                            if let Some(sister_idx) = sister_idx_opt {
+                                if let Some(sister) = strands.get(sister_idx) {
+                                    if let Some((bub_pt, bub_tan)) = bubble_point(
+                                        sister,
+                                        rnap.coordinates,
+                                        chr.fork_fraction,
+                                        glen,
+                                    ) {
+                                        let bub_world = center + bub_pt.coords;
+                                        place_at(bub_world, bub_tan);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1130,6 +1161,12 @@ impl<'a> GreedyRandomPlacer<'a> {
             let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
                 .round() as usize;
             let bead_count = bead_count.max(2);
+            // BF2-3: per-chromosome routing — map chromosome_index to its own
+            // main/sister strands (same clamped-index logic as the RNAP loop).
+            let rna_g = (rna.chromosome_index as usize)
+                .min(chrom_strand_idx.len().saturating_sub(1));
+            let (rna_main_idx, rna_sister_idx_opt) =
+                chrom_strand_idx.get(rna_g).copied().unwrap_or((0, None));
             // Root: for nascent (is_free=false), strand_point gives a center-relative
             // point on the chromosome; for free (is_free=true), rejection-sample a
             // random interior point inside shape.inset(rna_bead_radius).
@@ -1156,12 +1193,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                 }
                 chosen
             } else {
-                // Nascent: root on the MAIN genome contour (strand 0) by coordinate,
-                // matching where its RNAP is placed (see the RNAP loop above — every
-                // RNAP goes on strand 0 regardless of domain). Using `root_domain`
-                // here would root daughter-domain transcripts on the sister bulge,
-                // visually disconnecting them from their polymerase.
-                strand_point(&strands, 0, rna.root_coordinate, glen)
+                // Nascent: root on chromosome rna_g's MAIN genome contour, matching
+                // where its RNAP is placed (BF2-3 per-chromosome routing).
+                strands.get(rna_main_idx)
+                    .and_then(|s| strand_point(std::slice::from_ref(s), 0, rna.root_coordinate, glen))
                     .map(|(p, _)| p)
                     .unwrap_or_else(Point3::origin)
             };
@@ -1179,34 +1214,34 @@ impl<'a> GreedyRandomPlacer<'a> {
                 is_mrna: rna.is_mRNA,
                 is_free: rna.is_free,
             });
-            // BF1-3: daughter-domain nascent RNA also appears on the sister
-            // (bubble) strand at its bubble-relative position. Represents the
-            // physical copy of the transcript being synthesised on the replicated
-            // arm. Free strands and domain-0 entries are NOT overlaid:
-            //   - domain-0 RNAs transcribe from the pre-replication chromosome
-            //     (one chromosome, one transcript, no sister).
-            //   - Free RNAs are placed at random interior positions and have no
-            //     genomic locus to map onto the bubble.
-            if !rna.is_free && rna.root_domain != 0 && strands.len() > 1 {
-                if let Some((bubble_root, _)) = bubble_point(
-                    &strands[strands.len() - 1],
-                    rna.root_coordinate,
-                    chr.fork_fraction,
-                    glen,
-                ) {
-                    let points = crate::fiber::generate_rna_strand(
-                        bubble_root,
-                        bead_count,
-                        rna_step,
-                        rna_bead_radius,
-                        shape,
-                        rng,
-                    );
-                    snapshot.rna_strands.push(crate::placement::RnaStrand {
-                        points,
-                        is_mrna: rna.is_mRNA,
-                        is_free: false,
-                    });
+            // BF2-3: daughter-domain nascent RNA also appears on chromosome
+            // rna_g's OWN sister (replication bubble) strand.  Free strands and
+            // domain-0 entries are NOT overlaid.  Backward-compat: honour
+            // root_domain != 0 as a pre-BF2 daughter signal alongside is_daughter.
+            if !rna.is_free && (rna.is_daughter || rna.root_domain != 0) {
+                if let Some(sister_idx) = rna_sister_idx_opt {
+                    if let Some(sister) = strands.get(sister_idx) {
+                        if let Some((bubble_root, _)) = bubble_point(
+                            sister,
+                            rna.root_coordinate,
+                            chr.fork_fraction,
+                            glen,
+                        ) {
+                            let points = crate::fiber::generate_rna_strand(
+                                bubble_root,
+                                bead_count,
+                                rna_step,
+                                rna_bead_radius,
+                                shape,
+                                rng,
+                            );
+                            snapshot.rna_strands.push(crate::placement::RnaStrand {
+                                points,
+                                is_mrna: rna.is_mRNA,
+                                is_free: false,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2856,6 +2891,114 @@ mod tests {
              |Δx| = {:.1} (need > {:.1})",
             (cx1 - cx0).abs(),
             0.3 * half_len,
+        );
+    }
+
+    // ---- BF2-3 tests: per-chromosome RNAP/RNA routing ----------------------
+
+    /// Build a 2-chromosome replicating recipe with two explicit RNAPs:
+    /// one on chromosome_index 0 and one on chromosome_index 1.  The cell is
+    /// long enough (±500 Å) that the two chromosome groups segregate to
+    /// clearly opposite poles — allowing a centroid-proximity assertion.
+    fn recipe_two_chromosomes_two_rnaps() -> Recipe {
+        let json = r#"{
+            "bounding_box": [[-600,-200,-200],[600,200,200]],
+            "objects": {
+                "rna_polymerase": { "type": "single_sphere", "radius": 20 }
+            },
+            "composition": {
+                "space": { "regions": { "interior": ["cell"] } },
+                "cell": {
+                    "compartment": {
+                        "kind": "capsule",
+                        "a": [-500, 0, 0],
+                        "b": [500, 0, 0],
+                        "radius": 80
+                    },
+                    "regions": { "interior": [] }
+                }
+            },
+            "chromosome": {
+                "beads": 500,
+                "spacing": 10.0,
+                "bead_radius": 5.0,
+                "compartment": "cell",
+                "n_chromosomes": 2,
+                "fork_fraction": 0.45,
+                "rnap_marker": "rna_polymerase",
+                "rnaps": [
+                    {"coordinates": 0, "domain_index": 0, "is_forward": true, "chromosome_index": 0},
+                    {"coordinates": 0, "domain_index": 0, "is_forward": true, "chromosome_index": 1}
+                ]
+            }
+        }"#;
+        Recipe::from_json_str(json).expect("recipe_two_chromosomes_two_rnaps: parse failed")
+    }
+
+    /// BF2-3: each RNAP must land near its OWN chromosome's strand group, not
+    /// always chromosome 0.  Before the fix both RNAPs route to strand 0
+    /// (chromosome 0's main), so the chromosome-1 RNAP fails the proximity
+    /// check for chromosome 1's centroid.
+    #[test]
+    fn rnap_routes_to_own_chromosome() {
+        let recipe = recipe_two_chromosomes_two_rnaps();
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(42);
+
+        let rnap_id = recipe.ingredients.get_full("rna_polymerase").unwrap().0 as u32;
+        let rnaps: Vec<_> = out
+            .snapshot
+            .placements
+            .iter()
+            .filter(|p| p.ingredient_id == rnap_id)
+            .collect();
+
+        // Two non-daughter RNAPs → exactly 2 placements (no bubble overlay).
+        assert_eq!(rnaps.len(), 2, "expected 2 RNAP placements, got {}", rnaps.len());
+
+        let chr = out.snapshot.chromosome.as_ref().expect("chromosome missing");
+        // 2 replicating chromosomes × 2 strands each = 4 strands total.
+        assert_eq!(
+            chr.strands.len(),
+            4,
+            "expected 4 strands (2 chrom × 2 each), got {}",
+            chr.strands.len()
+        );
+
+        // Per-chromosome strand-group centroids (cell-relative; center = origin).
+        let c0_beads: Vec<&Point3<f32>> = chr.strands[0..2].iter().flatten().collect();
+        let c1_beads: Vec<&Point3<f32>> = chr.strands[2..4].iter().flatten().collect();
+        let centroid = |beads: &[&Point3<f32>]| {
+            let n = beads.len() as f32;
+            Point3::new(
+                beads.iter().map(|p| p.x).sum::<f32>() / n,
+                beads.iter().map(|p| p.y).sum::<f32>() / n,
+                beads.iter().map(|p| p.z).sum::<f32>() / n,
+            )
+        };
+        let c0 = centroid(&c0_beads);
+        let c1 = centroid(&c1_beads);
+
+        // Chromosomes must be on opposite x sides (segregated).
+        assert!(
+            c0.x * c1.x < 0.0,
+            "chromosomes not segregated: c0.x={:.1} c1.x={:.1}",
+            c0.x, c1.x
+        );
+
+        // Recipe order: rnaps[0] = chromosome_index 0, rnaps[1] = chromosome_index 1.
+        // After the fix: rnap 0 closer to c0, rnap 1 closer to c1.
+        let d0_c0 = (rnaps[0].position - c0).norm();
+        let d0_c1 = (rnaps[0].position - c1).norm();
+        let d1_c0 = (rnaps[1].position - c0).norm();
+        let d1_c1 = (rnaps[1].position - c1).norm();
+
+        assert!(
+            d0_c0 < d0_c1,
+            "RNAP 0 (chromosome_index=0) not near c0: d_c0={d0_c0:.1} d_c1={d0_c1:.1}"
+        );
+        assert!(
+            d1_c1 < d1_c0,
+            "RNAP 1 (chromosome_index=1) not near c1: d_c1={d1_c1:.1} d_c0={d1_c0:.1}"
         );
     }
 
