@@ -133,6 +133,14 @@ struct RawRnap {
     coordinates: i64,
     domain_index: i32,
     is_forward: bool,
+    /// Which chromosome copy this RNAP belongs to (0-based). Absent in
+    /// single-chromosome snapshots — defaults to 0 for backward compat.
+    #[serde(default)]
+    chromosome_index: i32,
+    /// `true` when this RNAP is on a replicated (daughter) copy of the
+    /// chromosome. Absent in pre-BF2 snapshots — defaults to `false`.
+    #[serde(default)]
+    is_daughter: bool,
 }
 
 /// Raw explicit nascent RNA placement from the recipe (mirrors [`RnaSpec`]).
@@ -146,6 +154,14 @@ struct RawRna {
     /// `true` = free strand (random interior root); `false` = nascent (chromosome-rooted).
     #[serde(default)]
     is_free: bool,
+    /// Which chromosome copy the transcribing RNAP belongs to (0-based).
+    /// Absent in single-chromosome snapshots — defaults to 0.
+    #[serde(default)]
+    chromosome_index: i32,
+    /// `true` when the transcribing RNAP is on a replicated (daughter) copy.
+    /// Absent in pre-BF2 snapshots — defaults to `false`.
+    #[serde(default)]
+    is_daughter: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +383,12 @@ pub struct RnapPlacement {
     pub domain_index: i32,
     /// `true` = leading strand; `false` = lagging strand.
     pub is_forward: bool,
+    /// Which chromosome copy this RNAP belongs to (0-based; 0 in
+    /// single-chromosome cells or when absent from the recipe).
+    pub chromosome_index: i32,
+    /// `true` when this RNAP is on a replicated (daughter) copy of its
+    /// chromosome. `false` by default (absent from pre-BF2 recipes).
+    pub is_daughter: bool,
 }
 
 /// A single explicit nascent RNA from the recipe.
@@ -383,6 +405,12 @@ pub struct RnaSpec {
     pub is_mRNA: bool,
     /// `true` = free strand rooted at a random interior point; `false` = nascent (chromosome-rooted).
     pub is_free: bool,
+    /// Which chromosome copy the transcribing RNAP belongs to (0-based; 0
+    /// in single-chromosome cells or when absent from the recipe).
+    pub chromosome_index: i32,
+    /// `true` when the transcribing RNAP is on a replicated (daughter) copy.
+    /// `false` by default (absent from pre-BF2 recipes).
+    pub is_daughter: bool,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -749,6 +777,8 @@ fn resolve(
                     coordinates: r.coordinates,
                     domain_index: r.domain_index,
                     is_forward: r.is_forward,
+                    chromosome_index: r.chromosome_index,
+                    is_daughter: r.is_daughter,
                 })
                 .collect(),
             rnap_marker: c.rnap_marker,
@@ -761,6 +791,8 @@ fn resolve(
                     length_nt: r.length_nt,
                     is_mRNA: r.is_mRNA,
                     is_free: r.is_free,
+                    chromosome_index: r.chromosome_index,
+                    is_daughter: r.is_daughter,
                 })
                 .collect(),
             rna_segment: c.rna_segment,
@@ -1529,5 +1561,65 @@ mod tests {
         assert_eq!(chr.rnaps[0].coordinates, 100000);
         assert!(!chr.rnaps[1].is_forward);
         assert_eq!(chr.rnap_marker.as_deref(), Some("rna_polymerase"));
+    }
+
+    #[test]
+    fn rnap_carries_chromosome_index_and_is_daughter() {
+        // Explicit chromosome_index + is_daughter are resolved onto RnapPlacement.
+        // The second entry omits both fields → defaults 0 / false (backward compat).
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {"space": {"regions": {"interior": []}}},
+            "chromosome": {
+                "beads": 1000, "spacing": 135, "bead_radius": 12, "compartment": "space",
+                "rnap_marker": "rna_polymerase",
+                "rnaps": [
+                    {"coordinates": 100000, "domain_index": 0, "is_forward": true,
+                     "chromosome_index": 1, "is_daughter": true},
+                    {"coordinates": -50000, "domain_index": 0, "is_forward": false}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let chr = recipe.chromosome.as_ref().unwrap();
+        assert_eq!(chr.rnaps.len(), 2);
+        // First entry: explicit values survive the round-trip.
+        assert_eq!(chr.rnaps[0].chromosome_index, 1);
+        assert!(chr.rnaps[0].is_daughter);
+        // Second entry: absent keys → defaults.
+        assert_eq!(chr.rnaps[1].chromosome_index, 0);
+        assert!(!chr.rnaps[1].is_daughter);
+    }
+
+    #[test]
+    fn rna_carries_chromosome_index_and_is_daughter() {
+        // Explicit chromosome_index + is_daughter are resolved onto RnaSpec.
+        // The second entry omits both fields → defaults 0 / false (backward compat).
+        let json = r#"{
+            "bounding_box": [[-500,-500,-500],[500,500,500]],
+            "objects": {},
+            "composition": {"space": {"regions": {"interior": []}}},
+            "chromosome": {
+                "beads": 1000, "spacing": 135, "bead_radius": 12, "compartment": "space",
+                "rna_segment": "rna_segment",
+                "rna_angstrom_per_nt": 2.0,
+                "rnas": [
+                    {"root_coordinate": 100000, "root_domain": 0, "length_nt": 850,
+                     "is_mRNA": true, "chromosome_index": 1, "is_daughter": true},
+                    {"root_coordinate": 200000, "root_domain": 0, "length_nt": 400,
+                     "is_mRNA": false}
+                ]
+            }
+        }"#;
+        let recipe = Recipe::from_json_str(json).unwrap();
+        let chr = recipe.chromosome.as_ref().unwrap();
+        assert_eq!(chr.rnas.len(), 2);
+        // First entry: explicit values survive.
+        assert_eq!(chr.rnas[0].chromosome_index, 1);
+        assert!(chr.rnas[0].is_daughter);
+        // Second entry: absent keys → defaults.
+        assert_eq!(chr.rnas[1].chromosome_index, 0);
+        assert!(!chr.rnas[1].is_daughter);
     }
 }
