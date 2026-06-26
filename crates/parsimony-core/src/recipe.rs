@@ -139,6 +139,9 @@ struct RawRna {
     root_domain: i32,
     length_nt: i64,
     is_mRNA: bool,
+    /// `true` = free strand (random interior root); `false` = nascent (chromosome-rooted).
+    #[serde(default)]
+    is_free: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +374,8 @@ pub struct RnaSpec {
     pub length_nt: i64,
     /// `true` = mRNA; `false` = other RNA class (rRNA, tRNA, …).
     pub is_mRNA: bool,
+    /// `true` = free strand rooted at a random interior point; `false` = nascent (chromosome-rooted).
+    pub is_free: bool,
 }
 
 /// Resolved superhelix parameters (see [`RawSupercoil`]).
@@ -748,6 +753,7 @@ fn resolve(
                     root_domain: r.root_domain,
                     length_nt: r.length_nt,
                     is_mRNA: r.is_mRNA,
+                    is_free: r.is_free,
                 })
                 .collect(),
             rna_segment: c.rna_segment,

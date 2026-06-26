@@ -1055,12 +1055,37 @@ impl<'a> GreedyRandomPlacer<'a> {
             let bead_count = ((rna.length_nt as f32 * chr.rna_angstrom_per_nt) / rna_step)
                 .round() as usize;
             let bead_count = bead_count.max(2);
-            // Root: strand_point returns a center-relative point on the chromosome.
-            // Fall back to the center-relative origin (Point3::origin) on degenerate
-            // inputs so we NEVER drop a spec (1:1 true-abundance constraint).
-            let root = strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
-                .map(|(p, _)| p)
-                .unwrap_or_else(Point3::origin);
+            // Root: for nascent (is_free=false), strand_point gives a center-relative
+            // point on the chromosome; for free (is_free=true), rejection-sample a
+            // random interior point inside shape.inset(rna_bead_radius).
+            let root = if rna.is_free {
+                // Rejection-sample a uniformly random point inside the inset envelope.
+                // We sample within the axis-aligned bounding box of the inset (a cube of
+                // side 2*reach) and accept when the point is inside the capsule/sphere.
+                // Up to 64 tries; fall back to Point3::origin() (cell centre) if none
+                // accepted — this satisfies the 1:1 abundance constraint even in
+                // degenerate cells where the inset collapses to zero volume.
+                let inset = shape.inset(rna_bead_radius);
+                let reach = inset.reach();
+                let mut chosen = Point3::origin();
+                for _ in 0..64 {
+                    let candidate = Point3::new(
+                        rng.gen_range(-reach..=reach),
+                        rng.gen_range(-reach..=reach),
+                        rng.gen_range(-reach..=reach),
+                    );
+                    if inset.contains(&candidate) {
+                        chosen = candidate;
+                        break;
+                    }
+                }
+                chosen
+            } else {
+                // Nascent: chromosome-rooted, same as before.
+                strand_point(&strands, rna.root_domain, rna.root_coordinate, glen)
+                    .map(|(p, _)| p)
+                    .unwrap_or_else(Point3::origin)
+            };
             // Grow a confined self-avoiding walk from the root inside `shape`.
             let points = crate::fiber::generate_rna_strand(
                 root,
@@ -2213,6 +2238,77 @@ mod tests {
             }}"#
         );
         Recipe::from_json_str(&json).expect("recipe_with_chromosome_and_rnas: parse failed")
+    }
+
+    /// Build a capsule recipe with a 1000-bead chromosome and N explicit RNA
+    /// strands at the given (root_coordinate, length_nt, is_free) triples.
+    /// Mirrors `recipe_with_chromosome_and_rnas` but emits the `is_free` key.
+    fn recipe_with_chromosome_and_rnas_freeflag(specs: &[(i64, i64, bool)]) -> Recipe {
+        let rna_entries: String = specs
+            .iter()
+            .map(|&(coord, len, free)| {
+                format!(
+                    r#"{{"root_coordinate": {coord}, "root_domain": 0, "length_nt": {len}, "is_mRNA": true, "is_free": {free}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "bounding_box": [[-500,-500,-500],[500,500,500]],
+                "objects": {{}},
+                "composition": {{
+                    "space": {{ "regions": {{ "interior": ["cell"] }} }},
+                    "cell": {{
+                        "compartment": {{
+                            "kind": "capsule",
+                            "a": [-150, 0, 0],
+                            "b": [150, 0, 0],
+                            "radius": 80
+                        }},
+                        "regions": {{ "interior": [] }}
+                    }}
+                }},
+                "chromosome": {{
+                    "beads": 1000,
+                    "spacing": 10.0,
+                    "bead_radius": 5.0,
+                    "compartment": "cell",
+                    "rnas": [{rna_entries}]
+                }}
+            }}"#
+        );
+        Recipe::from_json_str(&json)
+            .expect("recipe_with_chromosome_and_rnas_freeflag: parse failed")
+    }
+
+    /// B2-1: free RNA (`is_free=true`) seeds at a random interior point, NOT
+    /// at the chromosome-rooted strand_point, while still confined.
+    #[test]
+    fn free_rna_seeds_in_interior_not_at_strand_point() {
+        // one nascent (is_free=false) at a coordinate, one free (is_free=true)
+        let recipe = recipe_with_chromosome_and_rnas_freeflag(
+            &[(100000_i64, 600_i64, false), (0, 600, true)],
+        );
+        let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
+        assert_eq!(out.snapshot.rna_strands.len(), 2);
+        let (center, shape) = first_capsule_cell(&recipe);
+        let inset = shape.inset(4.0);
+        for rs in &out.snapshot.rna_strands {
+            for p in &rs.points {
+                assert!(
+                    inset.contains(&(center + p.coords)) || inset.contains(p),
+                    "RNA bead outside envelope"
+                );
+            }
+        }
+        // the free strand's root must NOT coincide with the nascent strand's chromosome-rooted start
+        let nascent_root = out.snapshot.rna_strands[0].points[0];
+        let free_root = out.snapshot.rna_strands[1].points[0];
+        assert!(
+            (nascent_root - free_root).norm() > 1.0,
+            "free strand should not root at the same chromosome point"
+        );
     }
 
     /// B1-3: one confined nascent-RNA strand per RnaSpec, rooted near its
