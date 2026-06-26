@@ -119,27 +119,24 @@ fn random_unit<R: Rng>(rng: &mut R) -> Vector3<f32> {
     }
 }
 
-/// Generate a coarse-grained chromosome path inside a sphere of
-/// `cell_radius` centred at the origin: a self-avoiding random walk of up
-/// to `bead_count` beads spaced `step` apart, kept inside the cell
-/// (allowing for `bead_radius`) and ≥ ~1.5·`bead_radius` from any
-/// non-adjacent bead, with worm-like-chain persistence. Points are
-/// origin-relative (the caller places the fiber at the compartment
-/// centre). Returns however many beads it placed — if the walk traps
-/// itself in the confined volume it stops early rather than spinning.
-pub fn generate_fiber<R: Rng>(
-    shape: CellShape,
+/// Internal: self-avoiding worm-like-chain walk starting from `start`,
+/// placing up to `bead_count` beads spaced `step` apart, kept inside
+/// `inset`. `bead_radius` controls the min-separation exclusion zone.
+/// Stops early if the walk traps itself. Shared by [`generate_fiber`] and
+/// [`generate_rna_strand`].
+fn walk_from<R: Rng>(
+    start: Point3<f32>,
+    inset: CellShape,
     bead_count: usize,
     step: f32,
     bead_radius: f32,
     rng: &mut R,
 ) -> Vec<Point3<f32>> {
-    let inset = shape.inset(bead_radius);
     let min_sep = 1.5 * bead_radius;
     let min_sep2 = min_sep * min_sep;
 
     let mut pts: Vec<Point3<f32>> = Vec::with_capacity(bead_count);
-    pts.push(Point3::origin());
+    pts.push(start);
     let mut dir = random_unit(rng);
     let mut stuck_runs = 0usize;
 
@@ -185,6 +182,60 @@ pub fn generate_fiber<R: Rng>(
         }
     }
     pts
+}
+
+/// Generate a coarse-grained chromosome path inside a sphere of
+/// `cell_radius` centred at the origin: a self-avoiding random walk of up
+/// to `bead_count` beads spaced `step` apart, kept inside the cell
+/// (allowing for `bead_radius`) and ≥ ~1.5·`bead_radius` from any
+/// non-adjacent bead, with worm-like-chain persistence. Points are
+/// origin-relative (the caller places the fiber at the compartment
+/// centre). Returns however many beads it placed — if the walk traps
+/// itself in the confined volume it stops early rather than spinning.
+pub fn generate_fiber<R: Rng>(
+    shape: CellShape,
+    bead_count: usize,
+    step: f32,
+    bead_radius: f32,
+    rng: &mut R,
+) -> Vec<Point3<f32>> {
+    walk_from(Point3::origin(), shape.inset(bead_radius), bead_count, step, bead_radius, rng)
+}
+
+/// Generate a confined self-avoiding RNA strand grown from a given `root`
+/// (the RNAP attachment point). Behaves identically to [`generate_fiber`]
+/// but seeds the walk at `root` rather than the origin, making it suitable
+/// for every nascent transcript in the cell.
+///
+/// If `root` is marginally outside `shape.inset(bead_radius)` it is
+/// surface-pulled just inside along the inward-radial normal (never
+/// collapsed to the medial axis). When a step cannot find an in-bounds
+/// candidate within the retry budget the walk stops early and returns
+/// however many beads were placed (≥ 1). Deterministic for a fixed `rng`
+/// seed.
+pub fn generate_rna_strand<R: Rng>(
+    root: Point3<f32>,
+    bead_count: usize,
+    step: f32,
+    bead_radius: f32,
+    shape: CellShape,
+    rng: &mut R,
+) -> Vec<Point3<f32>> {
+    let inset = shape.inset(bead_radius);
+    // Clamp root to just inside the inset via surface-pull if needed. We
+    // move along the inward-radial direction (outward from medial axis) —
+    // never to the medial axis — preserving the azimuthal location of the
+    // RNAP attachment point.
+    let root_clamped = if inset.contains(&root) {
+        root
+    } else {
+        let m = inset.medial(&root);
+        let rad = root.coords - m.coords;
+        let r = rad.norm();
+        let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
+        m + dir * (inset.cap_radius() * 0.999)
+    };
+    walk_from(root_clamped, inset, bead_count, step, bead_radius, rng)
 }
 
 /// Generate a *plectonemically supercoiled* chromosome inside a sphere of
@@ -699,6 +750,28 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_xoshiro::Xoshiro256PlusPlus;
+
+    /// Convenience: seed an RNG from a u64 (used by multiple tests below).
+    fn rng_from(seed: u64) -> Xoshiro256PlusPlus {
+        Xoshiro256PlusPlus::seed_from_u64(seed)
+    }
+
+    #[test]
+    fn rna_strand_roots_at_given_point_and_stays_inside() {
+        let shape = CellShape::Capsule { half_len: 400.0, radius: 120.0, axis: Vector3::x() };
+        let root = Point3::new(-200.0, 50.0, 0.0);
+        let mut rng = rng_from(3);
+        let strand = generate_rna_strand(root, 60, 18.0, 4.0, shape, &mut rng);
+        assert!(strand.len() >= 30, "expected a substantial strand, got {}", strand.len());
+        assert!((strand[0] - root).norm() < 8.0, "strand must root at the RNAP point");
+        let inset = shape.inset(4.0);
+        for p in &strand {
+            assert!(inset.contains(p), "RNA bead outside envelope: {:?}", p);
+        }
+        // longer request → longer strand (monotone in bead_count)
+        let longer = generate_rna_strand(root, 120, 18.0, 4.0, shape, &mut rng_from(3));
+        assert!(longer.len() >= strand.len());
+    }
 
     #[test]
     fn cellshape_sphere_and_capsule_contain_and_inset() {
