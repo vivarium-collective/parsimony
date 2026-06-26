@@ -2286,9 +2286,13 @@ mod tests {
     /// at the chromosome-rooted strand_point, while still confined.
     #[test]
     fn free_rna_seeds_in_interior_not_at_strand_point() {
-        // one nascent (is_free=false) at a coordinate, one free (is_free=true)
+        // one nascent (is_free=false) and one free (is_free=true) at the SAME
+        // root_coordinate: if `is_free` routing were ignored, both would root at
+        // the same chromosome strand_point (norm ≈ 0) and the `> 1.0` assertion
+        // below would FAIL — so this gates the actual is_free behavior, not just
+        // a coordinate difference.
         let recipe = recipe_with_chromosome_and_rnas_freeflag(
-            &[(100000_i64, 600_i64, false), (0, 600, true)],
+            &[(100000_i64, 600_i64, false), (100000, 600, true)],
         );
         let out = GreedyRandomPlacer::new(&recipe, PlacerConfig::default()).pack(7);
         assert_eq!(out.snapshot.rna_strands.len(), 2);
