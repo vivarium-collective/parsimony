@@ -506,7 +506,23 @@ pub fn generate_theta_chromosome<R: Rng>(
         }
         sister.push(cand);
     }
-    let forks = vec![main[lo], main[hi]];
+    // Fork markers (replisomes) sit at the bubble's two pinch points, main[lo]
+    // and main[hi]. On a space-filling self-avoiding walk those two beads can
+    // land close together even though they are far apart on the genome, which
+    // collapses the two replisome markers into a single visible blob. Guarantee
+    // a minimum separation: if the endpoints are nearer than a marker-visible
+    // gap, spread them symmetrically about their midpoint along a stable axis
+    // (the fork-to-fork chord when well-defined, else the sister-bulge `off`).
+    let mut fork_lo = main[lo];
+    let mut fork_hi = main[hi];
+    let min_fork_sep = (shape.cap_radius() * 0.12).max(250.0);
+    if (fork_hi - fork_lo).norm() < min_fork_sep {
+        let mid = Point3::from((fork_lo.coords + fork_hi.coords) * 0.5);
+        let dir = (fork_hi - fork_lo).try_normalize(1e-6).unwrap_or(off);
+        fork_lo = mid - dir * (0.5 * min_fork_sep);
+        fork_hi = mid + dir * (0.5 * min_fork_sep);
+    }
+    let forks = vec![fork_lo, fork_hi];
     // Two oriCs (the bubble has duplicated the origin): one on the main strand,
     // one on the sister, both at the bubble's centre. terC is opposite oriC, at
     // the strand end (the genome was cut there for this open-strand layout).
@@ -911,10 +927,20 @@ mod tests {
             sister_len > main_len / 6 && sister_len < main_len,
             "sister bubble size {sister_len} vs main {main_len}"
         );
-        // Each fork sits where the sister rejoins the main strand.
+        // The two fork markers (replisomes) must be visibly separated, never
+        // collapsed onto each other — the bubble's pinch points can land close
+        // together on the space-filling walk, so we enforce a minimum gap.
+        let min_fork_sep = (shape.cap_radius() * 0.12).max(250.0);
+        let fork_gap = (theta.forks[1] - theta.forks[0]).norm();
+        assert!(
+            fork_gap >= min_fork_sep - 1.0,
+            "the two replisome forks must be at least {min_fork_sep:.0} Å apart, got {fork_gap:.0}"
+        );
+        // Forks stay near the bubble: within the cell, close to the main strand
+        // (on it when not displaced for separation).
         for fk in &theta.forks {
-            let near_main = theta.strands[0].iter().any(|p| (p - fk).norm() < 1.0);
-            assert!(near_main, "fork should lie on the main strand");
+            let d = theta.strands[0].iter().map(|p| (p - fk).norm()).fold(f32::INFINITY, f32::min);
+            assert!(d <= min_fork_sep, "fork should stay near the main strand (got {d:.0} Å)");
         }
         // Unreplicated → a single strand, no forks.
         let mut r2 = Xoshiro256PlusPlus::seed_from_u64(7);
