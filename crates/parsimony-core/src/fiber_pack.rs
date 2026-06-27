@@ -366,6 +366,7 @@ mod tests {
             jitter_attempts: 20,
             packing_mode: PackingMode::Random,
             principal_vector: Vector3::z(),
+            surface_offset: 0.0,
             mesh_lods: vec![],
             segment: None,
         }

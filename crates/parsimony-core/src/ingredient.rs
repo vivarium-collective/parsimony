@@ -328,6 +328,11 @@ pub struct Ingredient {
     /// the surface normal when this ingredient is placed in a Surface
     /// region. Default `(0, 0, 1)`. cellPACK convention.
     pub principal_vector: Vector3<f32>,
+    /// Offset (Å) along the outward surface normal applied to Surface
+    /// placements. Lets one membrane surface carry two lipid leaflets (outer at
+    /// `+δ`, inner at `−δ`) and seat membrane proteins at a chosen depth in the
+    /// bilayer. Default `0.0` (on the surface).
+    pub surface_offset: f32,
     /// For `IngredientShape::Mesh` ingredients: the LOD pyramid
     /// (sorted coarse → fine) that downstream renderers can fetch.
     /// Empty for non-mesh shapes. A single-LOD recipe lands here as

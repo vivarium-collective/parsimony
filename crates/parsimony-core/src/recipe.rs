@@ -223,6 +223,10 @@ struct RawObject {
     /// Surface-alignment axis for membrane-anchored ingredients.
     #[serde(default)]
     principal_vector: Option<[f32; 3]>,
+    /// Offset (Å) along the outward surface normal for Surface placements
+    /// (two-leaflet bilayers; membrane-protein depth). Default 0.
+    #[serde(default)]
+    surface_offset: Option<f32>,
     /// `single_cube`: full side lengths along each axis (cellPACK
     /// stores `edges`; we accept `size` for clarity).
     #[serde(default)]
@@ -751,6 +755,7 @@ fn resolve(
                     .principal_vector
                     .map(|v| nalgebra::Vector3::new(v[0], v[1], v[2]))
                     .unwrap_or_else(|| nalgebra::Vector3::new(0.0, 0.0, 1.0)),
+                surface_offset: obj.surface_offset.unwrap_or(0.0),
                 mesh_lods,
                 segment: obj.segment.clone(),
             },
@@ -931,6 +936,7 @@ fn merge_object(parent: RawObject, child: RawObject) -> RawObject {
         radius: child.radius.or(parent.radius),
         jitter_attempts: child.jitter_attempts.or(parent.jitter_attempts),
         packing_mode: child.packing_mode.or(parent.packing_mode),
+        surface_offset: child.surface_offset.or(parent.surface_offset),
         positions: child.positions.or(parent.positions),
         radii: child.radii.or(parent.radii),
         principal_vector: child.principal_vector.or(parent.principal_vector),
