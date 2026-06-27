@@ -466,9 +466,12 @@ pub fn generate_theta_chromosome<R: Rng>(
     // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
     let r = ((f * n as f32 / 2.0).round() as usize).min(n / 2);
     if r < 2 || n < 8 {
-        // Unreplicated: one oriC at the strand midpoint, terC at the far end.
+        // Unreplicated: one oriC at the strand midpoint (the hairpin fold),
+        // terC where the two arms rejoin. Close the loop into a true circle.
         let mid = main[n / 2];
         let end = main[0];
+        let first = main[0];
+        main.push(first);
         return ThetaChromosome {
             strands: vec![main],
             forks: Vec::new(),
@@ -528,6 +531,15 @@ pub fn generate_theta_chromosome<R: Rng>(
     // the strand end (the genome was cut there for this open-strand layout).
     let oric = vec![main[oric], sister[sister.len() / 2]];
     let ter = vec![main[0]];
+    // Close the genome into a TRUE circle. The supercoiled main strand is a
+    // hairpin: it winds out to the far pole (the fold = oriC) and back, so its
+    // two ends both sit at the near pole (a=0). Joining them (append the first
+    // bead) makes the backbone a continuous closed loop with no free ends —
+    // oriC at the fold pole, terC where the two replichore arms rejoin. The
+    // replicated bubble (sister) stays an open arc, so the whole structure is a
+    // proper θ: one circle with a replication bubble.
+    let first = main[0];
+    main.push(first);
     ThetaChromosome { strands: vec![main, sister], forks, oric, ter }
 }
 
@@ -927,6 +939,13 @@ mod tests {
             sister_len > main_len / 6 && sister_len < main_len,
             "sister bubble size {sister_len} vs main {main_len}"
         );
+        // The genome is a TRUE circle: the main strand is a closed loop, so its
+        // last bead coincides with its first (the seam joining the two arms).
+        let main_s = &theta.strands[0];
+        assert_eq!(
+            *main_s.last().unwrap(), main_s[0],
+            "main strand must be a closed loop (last bead == first)"
+        );
         // The two fork markers (replisomes) must be visibly separated, never
         // collapsed onto each other — the bubble's pinch points can land close
         // together on the space-filling walk, so we enforce a minimum gap.
@@ -947,6 +966,9 @@ mod tests {
         let flat = generate_theta_chromosome(shape, 1200, 0.0, 22.0, 10.0, 80.0, 100.0, &mut r2);
         assert_eq!(flat.strands.len(), 1);
         assert!(flat.forks.is_empty());
+        // Unreplicated genome is still a closed circle.
+        let fs = &flat.strands[0];
+        assert_eq!(*fs.last().unwrap(), fs[0], "unreplicated strand must be a closed loop");
     }
 
     #[test]
