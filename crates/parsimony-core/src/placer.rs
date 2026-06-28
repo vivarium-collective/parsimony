@@ -583,6 +583,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                     if matches!(ingredient.packing_mode, PackingMode::Tiled) {
                         rot = random_roll(rot, n, &mut rng);
                     }
+                    // Shift along the outward surface normal: separates the two
+                    // lipid leaflets of a bilayer (outer +δ / inner −δ) and sets
+                    // membrane-protein depth. `n` is a unit normal.
+                    let p = p + n.normalize() * ingredient.surface_offset;
                     (p, rot)
                 }
             };
@@ -1492,6 +1496,10 @@ impl<'a> GreedyRandomPlacer<'a> {
                     if tiled {
                         rot = random_roll(rot, n, &mut rng);
                     }
+                    // Shift along the outward surface normal: separates the two
+                    // bilayer leaflets (outer +δ / inner −δ) and sets membrane-
+                    // protein depth. (Mirrors the legacy-backend path.)
+                    let p = p + n.normalize() * ingredient.surface_offset;
                     (p, rot)
                 }
             };
@@ -2129,6 +2137,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    const BILAYER: &str = r#"{
+        "bounding_box": [[-100,-100,-100],[100,100,100]],
+        "objects": {
+            "lipid_out": { "type": "single_sphere", "radius": 1, "principal_vector": [0,0,1],  "packing_mode": "tiled", "surface_offset": 5 },
+            "lipid_in":  { "type": "single_sphere", "radius": 1, "principal_vector": [0,0,-1], "packing_mode": "tiled", "surface_offset": -5 }
+        },
+        "composition": {
+            "space": { "regions": { "interior": ["cell"] } },
+            "cell": {
+                "compartment": { "kind": "capsule", "a": [-40,0,0], "b": [40,0,0], "radius": 25 },
+                "regions": { "surface": [
+                    { "object": "lipid_out", "count": 40 },
+                    { "object": "lipid_in",  "count": 40 }
+                ] }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn surface_offset_places_two_leaflets() {
+        // Cover BOTH backends — the pipeline uses Octree, the CLI `pack` default
+        // is Legacy; the offset must apply in each.
+        for backend in [PlacementBackend::Legacy, PlacementBackend::Octree] {
+            check_two_leaflets(backend);
+        }
+    }
+
+    fn check_two_leaflets(backend: PlacementBackend) {
+        let recipe = Recipe::from_json_str(BILAYER).unwrap();
+        let cfg = PlacerConfig { backend, ..PlacerConfig::default() };
+        let out = GreedyRandomPlacer::new(&recipe, cfg).pack(0xB1);
+        let signed_dist = |pos: Point3<f32>| match &recipe.compartments["cell"].kind {
+            crate::compartment::CompartmentKind::Capsule { a, b, radius } => {
+                let ab = b - a;
+                let h = (ab.dot(&(pos - a)) / ab.norm_squared()).clamp(0.0, 1.0);
+                (pos - (a + ab * h)).norm() - radius
+            }
+            _ => unreachable!(),
+        };
+        let (mut n_out, mut n_in) = (0, 0);
+        for p in &out.snapshot.placements {
+            let ing = recipe.ingredients.get_index(p.ingredient_id as usize).unwrap().1;
+            let sd = signed_dist(p.position);
+            if ing.name == "lipid_out" {
+                assert!((sd - 5.0).abs() < 1e-2, "outer leaflet not at +5: sd={sd}");
+                n_out += 1;
+            } else if ing.name == "lipid_in" {
+                assert!((sd + 5.0).abs() < 1e-2, "inner leaflet not at -5: sd={sd}");
+                n_in += 1;
+            }
+        }
+        assert!(n_out > 20 && n_in > 20, "both leaflets should place: out={n_out} in={n_in}");
     }
 
     #[test]

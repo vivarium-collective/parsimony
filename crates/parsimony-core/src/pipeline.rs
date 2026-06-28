@@ -816,6 +816,7 @@ fn hash_ingredient(h: &mut Fnv, ing: &Ingredient) {
     h.f32(ing.principal_vector.x);
     h.f32(ing.principal_vector.y);
     h.f32(ing.principal_vector.z);
+    h.f32(ing.surface_offset);
     h.u32(ing.jitter_attempts);
 }
 
