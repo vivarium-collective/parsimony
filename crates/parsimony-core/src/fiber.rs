@@ -229,6 +229,35 @@ pub fn generate_fiber<R: Rng>(
     walk_from(Point3::origin(), shape.inset(bead_radius), bead_count, step, bead_radius, rng)
 }
 
+/// Seat a diffuse nucleoid at mid-cell, off the membrane. A confined
+/// self-avoiding walk starts at the origin and drifts its *mass* toward one
+/// pole; recentre by the **centroid** (mass centre) so the bulk sits at the cell
+/// centre — spread through the centre of the cytosol — then pull any bead that
+/// falls outside `confine` back onto its surface (radially, never the medial
+/// axis). Pass `confine` a margin inside the inner membrane so the nucleoid
+/// keeps a clear gap and never crosses the membrane.
+pub fn recenter_and_confine(pts: &mut [Point3<f32>], confine: &CellShape) {
+    if pts.is_empty() {
+        return;
+    }
+    let n = pts.len() as f32;
+    let c = pts.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / n;
+    for p in pts.iter_mut() {
+        p.coords -= c;
+    }
+    let cr = confine.cap_radius();
+    let axis = confine.long_axis();
+    for p in pts.iter_mut() {
+        if !confine.contains(p) {
+            let m = confine.medial(p);
+            let rad = p.coords - m.coords;
+            let r = rad.norm();
+            let dir = if r > 1e-6 { rad / r } else { perp(axis) };
+            *p = m + dir * (cr * 0.999);
+        }
+    }
+}
+
 /// Generate a confined self-avoiding RNA strand grown from a given `root`
 /// (the RNAP attachment point). Behaves identically to [`generate_fiber`]
 /// but seeds the walk at `root` rather than the origin, making it suitable
@@ -442,8 +471,19 @@ pub fn generate_theta_chromosome<R: Rng>(
     let inset = shape.inset(bead_radius);
     let mut main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
     if !main.is_empty() {
-        let nm = main.len() as f32;
-        let c = main.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / nm;
+        // Recenter by the BOUNDING-BOX centre, not the centroid. A supercoiled
+        // self-avoiding walk piles its mass lopsidedly to one pole, so a centroid
+        // shift still leaves the nucleoid blob off-centre (dense at one end, sparse
+        // at the other). Centering the bbox seats the nucleoid at mid-cell —
+        // spread through the centre of the cytosol — and the surface-pull below
+        // then keeps every bead inside the inset (off the membrane).
+        let mut lo = main[0].coords;
+        let mut hi = main[0].coords;
+        for p in &main {
+            lo = lo.inf(&p.coords);
+            hi = hi.sup(&p.coords);
+        }
+        let c = (lo + hi) * 0.5;
         for p in &mut main {
             p.coords -= c;
         }
@@ -671,6 +711,35 @@ pub fn generate_nucleoid<R: Rng>(
         }
         smooth_polyline(&mut axis, 8);
         out.extend(wind_plectoneme(&axis, domain_beads[d].max(2), step, sc_radius, sc_pitch));
+    }
+    // Recenter the whole nucleoid by its BOUNDING-BOX centre. The anchor walk
+    // (`generate_fiber`) starts at the origin and drifts toward one pole, so the
+    // raw rosette sits lopsidedly in one half of the cell. Centering the bbox
+    // seats the nucleoid at mid-cell — spread through the centre of the cytosol —
+    // then surface-pull any bead that ends up outside the inset back onto the
+    // surface (radially, never the medial axis) so it stays off the membrane.
+    if !out.is_empty() {
+        let mut lo = out[0].coords;
+        let mut hi = out[0].coords;
+        for p in &out {
+            lo = lo.inf(&p.coords);
+            hi = hi.sup(&p.coords);
+        }
+        let c = (lo + hi) * 0.5;
+        for p in &mut out {
+            p.coords -= c;
+        }
+        let inset = shape.inset(bead_radius);
+        let cr = inset.cap_radius();
+        for p in &mut out {
+            if !inset.contains(p) {
+                let m = inset.medial(p);
+                let rad = p.coords - m.coords;
+                let r = rad.norm();
+                let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
+                *p = m + dir * (cr * 0.999);
+            }
+        }
     }
     out
 }

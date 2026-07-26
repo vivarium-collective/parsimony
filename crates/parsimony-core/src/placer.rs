@@ -852,7 +852,19 @@ impl<'a> GreedyRandomPlacer<'a> {
                         shape, &alloc, chr.spacing, chr.bead_radius, sc.radius, sc.pitch, rng,
                     )
                 }
-                None => crate::fiber::generate_fiber(shape, beads, chr.spacing, chr.bead_radius, rng),
+                None => {
+                    // Diffuse nucleoid: a space-filling self-avoiding walk confined
+                    // a MARGIN inside the inner membrane, then mass-centred so it
+                    // fills the cell centre symmetrically instead of drifting to one
+                    // pole — and keeps a clear gap off the membrane.
+                    let margin = chr.bead_radius + shape.cap_radius() * 0.10;
+                    let confine = shape.inset(margin);
+                    let mut pts = crate::fiber::generate_fiber(
+                        confine, beads, chr.spacing, chr.bead_radius, rng,
+                    );
+                    crate::fiber::recenter_and_confine(&mut pts, &confine);
+                    pts
+                }
             };
             chrom_groups.push(vec![pts]);
         } else {
