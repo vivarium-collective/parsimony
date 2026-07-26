@@ -468,39 +468,15 @@ pub fn generate_theta_chromosome<R: Rng>(
     // axis in cap regions).  We fix it here, at the source: translate the main
     // strand so its centroid is at the shape origin, then surface-pull any bead
     // that falls outside the inset (inward-radial direction only, never medial).
-    let inset = shape.inset(bead_radius);
+    // Confine each replicating chromosome a MARGIN inside the inner membrane (a
+    // clear gap off it), matching the diffuse newborn nucleoid. With sc_radius = 0
+    // `generate_supercoiled_fiber` falls back to a diffuse `generate_fiber` walk;
+    // `recenter_and_confine` then mass-centres it at mid-cell and keeps every bead
+    // within the margin inset — so a replicated (theta) chromosome is the SAME
+    // spread, centred, off-membrane form as the unreplicated one, not a coil.
+    let inset = shape.inset(bead_radius + shape.cap_radius() * 0.10);
     let mut main = generate_supercoiled_fiber(shape, genome_beads, step, bead_radius, sc_radius, sc_pitch, rng);
-    if !main.is_empty() {
-        // Recenter by the BOUNDING-BOX centre, not the centroid. A supercoiled
-        // self-avoiding walk piles its mass lopsidedly to one pole, so a centroid
-        // shift still leaves the nucleoid blob off-centre (dense at one end, sparse
-        // at the other). Centering the bbox seats the nucleoid at mid-cell —
-        // spread through the centre of the cytosol — and the surface-pull below
-        // then keeps every bead inside the inset (off the membrane).
-        let mut lo = main[0].coords;
-        let mut hi = main[0].coords;
-        for p in &main {
-            lo = lo.inf(&p.coords);
-            hi = hi.sup(&p.coords);
-        }
-        let c = (lo + hi) * 0.5;
-        for p in &mut main {
-            p.coords -= c;
-        }
-        // Surface-pull: beads that fell outside the inset after recentering are
-        // moved to the inset surface at their own azimuthal angle — NOT to the
-        // medial axis (which would create the centerline convergence we are fixing).
-        let cr = inset.cap_radius();
-        for p in &mut main {
-            if !inset.contains(p) {
-                let m = inset.medial(p);
-                let rad = p.coords - m.coords;
-                let r = rad.norm();
-                let dir = if r > 1e-6 { rad / r } else { perp(shape.long_axis()) };
-                *p = m + dir * (cr * 0.999);
-            }
-        }
-    }
+    recenter_and_confine(&mut main, &inset);
     let n = main.len();
     let f = fork_fraction.clamp(0.0, 0.95);
     // Replicated beads per replichore; the bubble spans 2·r beads around oriC.
