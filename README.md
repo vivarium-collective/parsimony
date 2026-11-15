@@ -1,5 +1,8 @@
 # parsimony
 
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
+
 A Rust library for packing molecular contents into cellular volumes —
 a next-generation rewrite of [cellPACK](https://github.com/mesoscope/cellpack).
 
@@ -143,3 +146,8 @@ architectural blueprint, roadmap, and open questions.
 [`docs/ROADMAP.md`](docs/ROADMAP.md) is the living backlog for forward
 work (gradients, partner packing, realtime animation, …) — what's
 shipped, what's partial, and what's next.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). parsimony is a fork of
+[prismofeverything/parsimony](https://github.com/prismofeverything/parsimony).
